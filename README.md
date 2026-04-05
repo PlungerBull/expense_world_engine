@@ -1,3 +1,3 @@
-# expense_world
+# expense_world_engine
 
-An expense tracker.
+Backend services, sync engine, business logic, and CRUD operations for expense_world.
