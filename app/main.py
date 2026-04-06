@@ -1,9 +1,11 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 
 from app import db
-from app.routers import health
+from app.errors import AppError, app_error_handler, validation_error_handler
+from app.routers import auth, health
 
 
 @asynccontextmanager
@@ -19,4 +21,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_exception_handler(AppError, app_error_handler)
+app.add_exception_handler(RequestValidationError, validation_error_handler)
+
 app.include_router(health.router)
+app.include_router(auth.router, prefix="/v1")
