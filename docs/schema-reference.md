@@ -52,8 +52,8 @@ users
   - email           text
   - display_name    text, nullable
   - last_login_at   timestamptz, nullable           — updated on every successful authentication
-  - created_at      timestamptz, default now()
-  - updated_at      timestamptz, default now()
+  - created_at      timestamptz, NOT NULL, default now()
+  - updated_at      timestamptz, NOT NULL, default now()
 ```
 
 **Active user:** Derived at query time — not stored. A user is considered active if `last_login_at > now() - interval '30 days'`.
@@ -79,8 +79,8 @@ user_settings
   - sidebar_show_bank_accounts     boolean, NOT NULL, default true
   - sidebar_show_people            boolean, NOT NULL, default true
   - sidebar_show_categories        boolean, NOT NULL, default true
-  - created_at                     timestamptz, default now()
-  - updated_at                     timestamptz, default now()
+  - created_at                     timestamptz, NOT NULL, default now()
+  - updated_at                     timestamptz, NOT NULL, default now()
 ```
 
 **Timezone architecture:** All timestamps stored in UTC. `display_timezone` is the IANA string used for all "today" calculations, date boundaries, and overdue detection. Set to device timezone on first launch. Conversion to local time always happens at the presentation layer.
@@ -112,7 +112,7 @@ exchange_rates
   - rate             numeric, NOT NULL
                      — units of target_currency per 1 USD (e.g. 3.75 = 1 USD = 3.75 PEN)
   - rate_date        date, NOT NULL
-  - created_at       timestamptz, default now()
+  - created_at       timestamptz, NOT NULL, default now()
   - UNIQUE (base_currency, target_currency, rate_date)
 ```
 
@@ -139,8 +139,8 @@ sync_checkpoints
   - last_sync_token  text, NOT NULL
                      — opaque token returned by the last sync response
   - last_sync_at     timestamptz, NOT NULL
-  - created_at       timestamptz, default now()
-  - updated_at       timestamptz, default now()
+  - created_at       timestamptz, NOT NULL, default now()
+  - updated_at       timestamptz, NOT NULL, default now()
   - UNIQUE (user_id, client_id)
 ```
 
@@ -162,7 +162,7 @@ idempotency_keys
                        — stored response returned verbatim on duplicate requests
   - expires_at         timestamptz, NOT NULL
                        — processed_at + 24 hours
-  - created_at         timestamptz, default now()
+  - created_at         timestamptz, NOT NULL, default now()
   - UNIQUE (user_id, key)
 ```
 
@@ -188,7 +188,7 @@ activity_log
   - after_snapshot   jsonb, nullable
                      — full row state after the change. null on deletes.
   - changed_by       UUID, NOT NULL, FK → users
-  - created_at       timestamptz, default now()
+  - created_at       timestamptz, NOT NULL, default now()
 ```
 
 ---
@@ -222,8 +222,8 @@ expense_bank_accounts
                            — hides from pickers and entry flows but preserves all historical records
                            — accounts with transactions can be archived; they cannot be hard-deleted
   - sort_order             integer, NOT NULL, default 0
-  - created_at             timestamptz, default now()
-  - updated_at             timestamptz, default now()
+  - created_at             timestamptz, NOT NULL, default now()
+  - updated_at             timestamptz, NOT NULL, default now()
   - version                integer, NOT NULL, default 1
   - deleted_at             timestamptz, nullable
   - UNIQUE (user_id, name, currency_code)
@@ -244,8 +244,8 @@ expense_categories
   - is_system   boolean, NOT NULL, default false
                 — true for @Transfer and @Debt. System categories cannot be deleted or renamed.
   - sort_order  integer, NOT NULL, default 0
-  - created_at  timestamptz, default now()
-  - updated_at  timestamptz, default now()
+  - created_at  timestamptz, NOT NULL, default now()
+  - updated_at  timestamptz, NOT NULL, default now()
   - version     integer, NOT NULL, default 1
   - deleted_at  timestamptz, nullable
   - UNIQUE (user_id, name)
@@ -284,8 +284,8 @@ expense_transaction_inbox
                   — 2=promoted (moved to ledger; row is soft-deleted)
                   — 3=dismissed (rejected without promoting; row is soft-deleted)
                   — status distinguishes why a row was soft-deleted
-  - created_at    timestamptz, default now()
-  - updated_at    timestamptz, default now()
+  - created_at    timestamptz, NOT NULL, default now()
+  - updated_at    timestamptz, NOT NULL, default now()
   - version       integer, NOT NULL, default 1
   - deleted_at    timestamptz, nullable
 ```
@@ -352,8 +352,8 @@ expense_transactions
   - inbox_id                  UUID, nullable, FK → expense_transaction_inbox
                               — lineage back to the inbox item this was promoted from
   - reconciliation_id         UUID, nullable, FK → expense_reconciliations
-  - created_at                timestamptz, default now()
-  - updated_at                timestamptz, default now()
+  - created_at                timestamptz, NOT NULL, default now()
+  - updated_at                timestamptz, NOT NULL, default now()
   - version                   integer, NOT NULL, default 1
   - deleted_at                timestamptz, nullable
 ```
@@ -376,8 +376,8 @@ expense_hashtags
   - user_id     UUID, NOT NULL, FK → users
   - name        text, NOT NULL
   - sort_order  integer, NOT NULL, default 0
-  - created_at  timestamptz, default now()
-  - updated_at  timestamptz, default now()
+  - created_at  timestamptz, NOT NULL, default now()
+  - updated_at  timestamptz, NOT NULL, default now()
   - version     integer, NOT NULL, default 1
   - deleted_at  timestamptz, nullable
   - UNIQUE (user_id, name)
@@ -400,8 +400,8 @@ expense_transaction_hashtags
                         — 1=inbox, 2=ledger
   - hashtag_id          UUID, NOT NULL, FK → expense_hashtags
   - user_id             UUID, NOT NULL, FK → users
-  - created_at          timestamptz, default now()
-  - updated_at          timestamptz, default now()
+  - created_at          timestamptz, NOT NULL, default now()
+  - updated_at          timestamptz, NOT NULL, default now()
   - version             integer, NOT NULL, default 1
   - deleted_at          timestamptz, nullable
   - UNIQUE (transaction_id, hashtag_id)
@@ -429,8 +429,8 @@ expense_reconciliations
                              — always user-editable in case of discrepancy.
   - ending_balance_cents     bigint, NOT NULL, default 0
                              — user-entered from the bank statement. Always editable.
-  - created_at               timestamptz, default now()
-  - updated_at               timestamptz, default now()
+  - created_at               timestamptz, NOT NULL, default now()
+  - updated_at               timestamptz, NOT NULL, default now()
   - version                  integer, NOT NULL, default 1
   - deleted_at               timestamptz, nullable
 ```
