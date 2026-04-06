@@ -37,6 +37,8 @@
 
 **Soft-deleted records:** Excluded from all list responses by default. Pass `?include_deleted=true` to include them.
 
+**Optimistic locking:** All mutable resources include a `version` field in responses, incremented on every update. Clients can use this for conflict detection.
+
 ---
 
 ## Build Phases (Engine)
@@ -58,6 +60,8 @@ Each phase is verified via Swagger UI before any CLI or iOS code is written.
 ### `GET /health`
 Infrastructure endpoint. Returns `200` if the engine is running. No authentication required. Not versioned under `/v1`.
 
+**Response:** `{"status": "ok"}`
+
 ---
 
 ## Auth & User Bootstrap
@@ -75,6 +79,10 @@ Called by any client immediately after a successful Supabase sign-in, on every n
 
 **Response:** `user` object + `user_settings` object.
 
+`user` fields: `id`, `email`, `display_name`, `last_login_at`, `created_at`, `updated_at`.
+
+`user_settings` fields: `user_id`, `theme`, `start_of_week`, `main_currency`, `transaction_sort_preference`, `display_timezone`, `sidebar_show_bank_accounts`, `sidebar_show_people`, `sidebar_show_categories`, `created_at`, `updated_at`.
+
 **Business logic:**
 - If `users` row already exists for this `user_id`, skip creation but update `last_login_at` and `updated_at` to `now()`.
 - If `user_settings` row already exists, skip creation.
@@ -83,10 +91,10 @@ Called by any client immediately after a successful Supabase sign-in, on every n
 ---
 
 ### `GET /auth/me`
-Returns the authenticated user's profile and settings in a single response.
+Returns the authenticated user's profile and settings in a single response. Returns `404` if the user or settings row does not exist (edge case — should not occur after bootstrap).
 
 ### `PUT /auth/settings`
-Updates `user_settings`. Partial update — only supplied fields are changed.
+Updates `user_settings`. Partial update — only supplied fields are changed. If no fields are supplied, returns current settings without making changes.
 
 **Special case — `main_currency` change:** If `main_currency` changes, the engine enqueues an async job to recalculate `amount_home_cents` on all the user's `expense_transactions` using historical rates for each transaction's date. The response returns immediately; the recalculation runs in the background. The client receives a `recalculation_job_id` it can poll.
 
@@ -95,7 +103,7 @@ Updates `user_settings`. Partial update — only supplied fields are changed.
 ## Bank Accounts
 
 ### `GET /accounts`
-Returns all active bank accounts. Includes `is_person = false` accounts only. Use `?include_people=true` to include person virtual accounts. Use `?include_archived=true` to include archived accounts.
+Returns all active bank accounts. Includes `is_person = false` accounts only. Use `?include_people=true` to include person virtual accounts. Use `?include_archived=true` to include archived accounts. Use `?include_deleted=true` to include soft-deleted accounts.
 
 Each account response includes `current_balance_cents` and `current_balance_home_cents` (balance converted to `main_currency`).
 
@@ -128,10 +136,11 @@ Sets `is_archived = true`. The account disappears from all pickers and entry flo
 ## Categories
 
 ### `GET /categories`
-Returns all active categories, sorted by `sort_order`. System categories (`is_system = true`) are always included and always appear first.
+Returns all active categories, sorted by `sort_order`. System categories (`is_system = true`) are always included and always appear first. Supports standard pagination. Use `?include_deleted=true` to include soft-deleted categories.
 
 ### `POST /categories`
 **Required:** `name`, `color`
+**Optional:** `sort_order`
 
 Categories carry no type restriction. The same category can be used on expenses, income, and transfers — including refunds (same category as the original expense, positive amount).
 
@@ -151,10 +160,11 @@ Soft-delete. Returns `409` if the category is referenced by any non-deleted tran
 ## Hashtags
 
 ### `GET /hashtags`
-Returns all active hashtags, sorted by `sort_order`.
+Returns all active hashtags, sorted by `sort_order`. Supports standard pagination. Use `?include_deleted=true` to include soft-deleted hashtags.
 
 ### `POST /hashtags`
 **Required:** `name`
+**Optional:** `sort_order`
 
 ### `PUT /hashtags/{id}`
 ### `DELETE /hashtags/{id}`
