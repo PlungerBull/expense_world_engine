@@ -57,6 +57,9 @@ Whenever a transaction is created, updated, or deleted, `current_balance_cents` 
 **Batch = all or nothing**
 Any batch endpoint wraps all operations in a single DB transaction. All succeed or all fail. Partial success is never acceptable for financial data.
 
+**Reuse before writing**
+Before writing a new helper, utility, or service function, check if one already exists in the codebase that does the same thing. Duplicate logic is a bug waiting to happen.
+
 ## Build phases (current status)
 
 | Phase | Scope | Status |

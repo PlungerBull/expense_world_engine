@@ -65,5 +65,9 @@ def validation_error(message: str, fields: Optional[dict] = None) -> AppError:
     return AppError(422, "VALIDATION_ERROR", message, fields)
 
 
+def forbidden(message: str) -> AppError:
+    return AppError(403, "FORBIDDEN", message)
+
+
 def conflict(message: str) -> AppError:
     return AppError(409, "CONFLICT", message)
