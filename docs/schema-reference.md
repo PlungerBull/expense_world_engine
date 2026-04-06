@@ -24,6 +24,7 @@ These rules apply to all mutable tables unless explicitly noted as an exception.
 | Field | Table | Mapping |
 |---|---|---|
 | `transaction_type` | `expense_transactions` | 1 = expense, 2 = income, 3 = transfer |
+| `transaction_type` | `expense_transaction_inbox` | 1 = expense, 2 = income, 3 = transfer |
 | `transfer_direction` | `expense_transactions` | 1 = debit (balance decreases), 2 = credit (balance increases) |
 | `status` | `expense_transaction_inbox` | 1 = pending, 2 = promoted, 3 = dismissed |
 | `status` | `expense_reconciliations` | 1 = draft, 2 = completed |
@@ -272,6 +273,11 @@ expense_transaction_inbox
   - title         text, nullable
   - description   text, nullable
   - amount_cents  bigint, nullable             — always positive when set
+  - transaction_type smallint, nullable
+                  — 1=expense, 2=income, 3=transfer (same enum as expense_transactions)
+                  — inferred by engine from signed amount_cents in request (negative→expense, positive→income)
+                  — set to 3 when a `transfer` field is present in the request
+                  — nullable because inbox items may not have an amount yet
   - date          timestamptz, nullable
   - account_id    UUID, nullable, FK → expense_bank_accounts
   - category_id   UUID, nullable, FK → expense_categories
@@ -291,11 +297,11 @@ expense_transaction_inbox
 ```
 
 **Promotion flow:** User-initiated. When `title`, `amount_cents`, `date`, `account_id`, and `category_id` are all present and `date ≤ now()`, the item is eligible. Promoting atomically:
-1. Creates a new row in `expense_transactions` with all validated data.
+1. Creates a new row in `expense_transactions` with all validated data. `transaction_type` is copied directly from the inbox row (was inferred from the signed `amount_cents` at inbox creation time). `amount_home_cents` is computed as `amount_cents × exchange_rate`.
 2. Sets `inbox_id` on the new transaction row to link back to this item.
 3. Sets `status = 2` (promoted) on this inbox row.
 4. Sets `deleted_at` on this inbox row (soft delete).
-5. Updates `current_balance_cents` on the account.
+5. Updates `current_balance_cents` on the account (decrements for expenses, increments for income).
 
 `exchange_rate` is never a blocking field — it auto-populates from the reference table and does not prevent promotion.
 

@@ -172,6 +172,8 @@ Optional filters: `?ready=true` (only items ready to promote — all required fi
 ### `POST /inbox`
 Creates a new inbox item. All fields optional except `user_id` (from JWT). Missing required promotion fields are fine — the item is just not ready to promote yet.
 
+`amount_cents` follows the standard sign convention: negative = expense, positive = income. The engine infers `transaction_type` from the sign and stores `amount_cents` as positive (same as the ledger). `transaction_type` is stored on the inbox row so direction is preserved through to promotion.
+
 Auto-populates `exchange_rate` from `exchange_rates` table for the transaction's `date` and `account_id.currency_code` if both are present. Falls back to most recent available rate for that pair if no exact date match.
 
 ### `GET /inbox/{id}`
@@ -194,10 +196,10 @@ Promotes a ready inbox item to the ledger.
 If any condition fails, returns `422` with the specific failing fields.
 
 **On success (atomic):**
-1. Creates `expense_transactions` row with `inbox_id` pointing back to this inbox item.
+1. Creates `expense_transactions` row with `inbox_id` pointing back to this inbox item. Copies `transaction_type` from the inbox row. Computes `amount_home_cents` from `amount_cents × exchange_rate`.
 2. Sets `status = 2` (promoted) on the inbox row.
 3. Sets `deleted_at` on the inbox row (soft delete).
-4. Updates `current_balance_cents` on the account.
+4. Updates `current_balance_cents` on the account (decrements for expenses, increments for income).
 5. Writes `activity_log` entry (action=1 created) for the new transaction.
 6. Writes `activity_log` entry (action=3 deleted) for the inbox item.
 

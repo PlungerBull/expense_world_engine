@@ -49,7 +49,7 @@ async def _get_home_balance(conn, currency_code: str, balance_cents: int, user_i
         """
         SELECT rate FROM exchange_rates
         WHERE base_currency = $1 AND target_currency = $2
-        ORDER BY date DESC LIMIT 1
+        ORDER BY rate_date DESC LIMIT 1
         """,
         currency_code,
         main_currency,
