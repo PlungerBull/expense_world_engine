@@ -40,7 +40,6 @@ Everything you need before writing a single line of code.
 3. Seed `global_currencies` with: USD, PEN (additional currencies deferred)
 4. Enable Row-Level Security on every table and add the policy: `auth.uid() = user_id`
 5. Write the trigger that auto-creates a `public.users` row whenever Supabase Auth creates a new `auth.users` row
-6. Configure Supabase Auth: enable Apple sign-in and Google sign-in providers
 
 **Verify:** All tables visible in Supabase table editor. RLS policies active. Trigger fires when a test auth user is created.
 
@@ -259,6 +258,8 @@ Phase 1 and 2 of the engine are done and deployed. Now write the `expense_world_
 ## Web Dashboard — Expand Later
 
 Once the CLI is stable and you've used the system for a while, the web dashboard can be expanded incrementally — add entry, add editing, add more views. By that point you'll know exactly what you actually want. Spec in `ios-spec.md` (serves as design reference for both web and iOS).
+
+**Before any client UI ships:** Configure Supabase Auth providers (Apple sign-in, Google sign-in) in the Supabase dashboard. Not needed during engine development — only when real users log in via a UI.
 
 ## iOS (Maybe)
 
