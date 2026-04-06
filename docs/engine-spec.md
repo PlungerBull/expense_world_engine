@@ -53,6 +53,13 @@ Each phase is verified via Swagger UI before any CLI or iOS code is written.
 
 ---
 
+## Health Check
+
+### `GET /health`
+Infrastructure endpoint. Returns `200` if the engine is running. No authentication required. Not versioned under `/v1`.
+
+---
+
 ## Auth & User Bootstrap
 
 ### `POST /auth/bootstrap`
@@ -69,7 +76,7 @@ Called by any client immediately after a successful Supabase sign-in, on every n
 **Response:** `user` object + `user_settings` object.
 
 **Business logic:**
-- If `users` row already exists for this `user_id`, skip creation.
+- If `users` row already exists for this `user_id`, skip creation but update `last_login_at` and `updated_at` to `now()`.
 - If `user_settings` row already exists, skip creation.
 - Always returns current state regardless of whether rows were created.
 
