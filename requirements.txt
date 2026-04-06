@@ -16,8 +16,10 @@ mdurl==0.1.2
 pyasn1==0.6.3
 pycparser==2.23
 pydantic==2.12.5
+pydantic-settings==2.11.0
 pydantic_core==2.41.5
 Pygments==2.20.0
+python-dotenv==1.2.1
 python-jose==3.5.0
 rich==14.3.3
 rsa==4.9.1

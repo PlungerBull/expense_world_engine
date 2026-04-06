@@ -51,16 +51,14 @@ Everything you need before writing a single line of code.
 
 *Deliverable: a FastAPI app running locally, connected to Supabase, with a health check endpoint.*
 
-1. Create a Koyeb account (koyeb.com) — needed for deployment
-2. Initialize the FastAPI project structure inside `expense_world_engine`
-3. Add `.env` file (gitignored) with `SUPABASE_URL`, `SUPABASE_DB_URL`, `SUPABASE_JWT_SECRET`
-4. Connect to Supabase via the Postgres connection string
-5. Create one endpoint: `GET /health` → returns `{"status": "ok"}`
-6. Deploy to Koyeb. Set env variables in the hosting dashboard.
+1. Initialize the FastAPI project structure inside `expense_world_engine`
+2. Add `.env` file (gitignored) with `SUPABASE_URL`, `SUPABASE_DB_URL`, `SUPABASE_JWT_SECRET`
+3. Connect to Supabase via the Postgres connection string
+4. Create one endpoint: `GET /health` → returns `{"status": "ok"}`
 
-**Verify:** `GET /health` returns 200 locally and in production.
+**Verify:** `GET /health` returns 200 locally.
 
-**Commit:** `feat: engine skeleton — FastAPI + Supabase connection, health check, Koyeb deploy`
+**Commit:** `feat: engine skeleton — FastAPI + Supabase connection, health check`
 
 ---
 
@@ -179,6 +177,11 @@ Build each resource group completely before starting the next. For each: list, c
 ## Phase 1 Complete ✓
 
 At this point you have a fully working headless expense logger. Verify the entire Phase 1 surface via Swagger end-to-end before moving on.
+
+**Deploy to production:**
+1. Create a Koyeb account (koyeb.com)
+2. Deploy the engine to Koyeb. Set env variables in the hosting dashboard.
+3. Verify `GET /health` returns 200 in production.
 
 ---
 
