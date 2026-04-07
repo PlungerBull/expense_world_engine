@@ -296,7 +296,7 @@ Include a `transfer` object on any transaction create request:
 3. Links both via `transfer_transaction_id` (each row points to the other).
 4. Auto-assigns categories: if either account `is_person = true`, that side gets `@Debt`; both real accounts get `@Transfer`. These override any `category_id` passed in the request.
 5. Auto-creates `@Debt` or `@Transfer` system categories if they don't exist yet.
-6. **Zero-sum validation:** The engine does not enforce that the two `amount_cents` values are equal in raw number — they may be in different currencies. It does enforce that the two transactions are directionally opposite (one negative, one positive). Returns `422` if both are the same sign.
+6. **Zero-sum validation:** The engine does not enforce that the two `amount_cents` values are equal in raw number — they may be in different currencies. It does enforce that the two transactions are directionally opposite (one negative, one positive). Returns `422` if both are the same sign. **Explicit decision:** No magnitude equality check is performed even when both accounts share the same currency. This keeps the logic simple and allows users to record unequal amounts intentionally (e.g., fees absorbed during transfer).
 7. Updates `current_balance_cents` on both accounts.
 8. Writes `activity_log` entries for both transactions.
 

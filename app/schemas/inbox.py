@@ -3,6 +3,8 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from app.schemas.transactions import TransferField
+
 
 class InboxCreateRequest(BaseModel):
     title: Optional[str] = None
@@ -12,6 +14,7 @@ class InboxCreateRequest(BaseModel):
     account_id: Optional[str] = None
     category_id: Optional[str] = None
     exchange_rate: Optional[float] = None
+    transfer: Optional[TransferField] = None
 
 
 class InboxUpdateRequest(BaseModel):
@@ -22,6 +25,7 @@ class InboxUpdateRequest(BaseModel):
     account_id: Optional[str] = None
     category_id: Optional[str] = None
     exchange_rate: Optional[float] = None
+    transfer: Optional[TransferField] = None
 
 
 class InboxResponse(BaseModel):
@@ -36,6 +40,8 @@ class InboxResponse(BaseModel):
     category_id: Optional[str] = None
     exchange_rate: float
     status: int
+    transfer_account_id: Optional[str] = None
+    transfer_amount_cents: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     version: int

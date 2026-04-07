@@ -66,9 +66,9 @@ Optional fields with no value are returned as `null` in API responses, never omi
 
 Phase 1 responses may include hydrated names alongside IDs (e.g. `category_name` next to `category_id`) for development convenience. The intended direction as the system matures is IDs-only, with clients maintaining local caches of lookup objects. No client code should treat hydrated names as guaranteed — always use the ID as the authoritative value. See `lessons-lunchmoney.md §7`.
 
-### 12. Zero-Sum Invariant on Transfers
+### 12. Directional Invariant on Transfers
 
-Any paired transfer (two `expense_transactions` linked via `transfer_transaction_id`) must net to zero: the debit and credit must be equal and opposite after conversion. The engine validates this before committing. It is not left to the client to enforce. See `lessons-splitwise.md §8`.
+Any paired transfer (two `expense_transactions` linked via `transfer_transaction_id`) must be directionally opposite: one side negative (outflow), the other positive (inflow). The engine validates this before committing — returns `422` if both have the same sign. **No magnitude equality check** is performed, even when both accounts share the same currency. Amounts may differ because accounts use different currencies, or because the user intentionally records a different value (e.g., fees absorbed during transfer). See `lessons-splitwise.md §8`.
 
 ---
 

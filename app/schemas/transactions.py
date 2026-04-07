@@ -4,6 +4,11 @@ from typing import Optional
 from pydantic import BaseModel
 
 
+class TransferField(BaseModel):
+    account_id: str
+    amount_cents: int  # signed: negative=outflow, positive=inflow
+
+
 class TransactionCreateRequest(BaseModel):
     title: str
     amount_cents: int  # signed: negative=expense, positive=income
@@ -14,6 +19,7 @@ class TransactionCreateRequest(BaseModel):
     exchange_rate: Optional[float] = None
     cleared: Optional[bool] = None
     hashtag_ids: Optional[list[str]] = None
+    transfer: Optional[TransferField] = None
 
 
 class TransactionUpdateRequest(BaseModel):

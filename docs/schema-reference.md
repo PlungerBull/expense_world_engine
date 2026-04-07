@@ -290,6 +290,12 @@ expense_transaction_inbox
                   — 2=promoted (moved to ledger; row is soft-deleted)
                   — 3=dismissed (rejected without promoting; row is soft-deleted)
                   — status distinguishes why a row was soft-deleted
+  - transfer_account_id  UUID, nullable, FK → expense_bank_accounts
+                  — destination account for the paired transfer transaction
+                  — only set when the inbox item represents a transfer
+  - transfer_amount_cents bigint, nullable
+                  — signed amount for the paired transfer transaction
+                  — sign preserved from request for zero-sum validation on promote
   - created_at    timestamptz, NOT NULL, default now()
   - updated_at    timestamptz, NOT NULL, default now()
   - version       integer, NOT NULL, default 1
@@ -302,6 +308,8 @@ expense_transaction_inbox
 3. Sets `status = 2` (promoted) on this inbox row.
 4. Sets `deleted_at` on this inbox row (soft delete).
 5. Updates `current_balance_cents` on the account (decrements for expenses, increments for income).
+
+**Transfer promotion:** When `transfer_account_id` and `transfer_amount_cents` are both set, promoting creates a paired transfer instead of a single transaction. The `category_id` requirement is waived — categories are auto-assigned (`@Transfer` for real accounts, `@Debt` for person accounts). The primary's signed amount is reconstructed from the sign of `transfer_amount_cents` (opposite signs required).
 
 `exchange_rate` is never a blocking field — it auto-populates from the reference table and does not prevent promotion.
 

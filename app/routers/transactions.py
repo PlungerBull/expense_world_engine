@@ -38,12 +38,19 @@ def _apply_debit_as_negative(data: dict) -> dict:
     return data
 
 
-async def _update_account_balance(conn, account_id, user_id, amount_cents, transaction_type):
+async def _update_account_balance(conn, account_id, user_id, amount_cents, transaction_type, transfer_direction=None):
     """Apply a transaction's balance contribution to its account."""
     if transaction_type == 1:  # expense — subtract
         delta = -amount_cents
     elif transaction_type == 2:  # income — add
         delta = amount_cents
+    elif transaction_type == 3:  # transfer — direction from transfer_direction
+        if transfer_direction == 1:  # debit — subtract
+            delta = -amount_cents
+        elif transfer_direction == 2:  # credit — add
+            delta = amount_cents
+        else:
+            return
     else:
         return
     await conn.execute(
@@ -59,12 +66,19 @@ async def _update_account_balance(conn, account_id, user_id, amount_cents, trans
     )
 
 
-async def _reverse_account_balance(conn, account_id, user_id, amount_cents, transaction_type):
+async def _reverse_account_balance(conn, account_id, user_id, amount_cents, transaction_type, transfer_direction=None):
     """Reverse a transaction's balance contribution (for delete/update corrections)."""
     if transaction_type == 1:  # was expense — add back
         delta = amount_cents
     elif transaction_type == 2:  # was income — subtract
         delta = -amount_cents
+    elif transaction_type == 3:  # was transfer — reverse direction
+        if transfer_direction == 1:  # was debit — add back
+            delta = amount_cents
+        elif transfer_direction == 2:  # was credit — subtract
+            delta = -amount_cents
+        else:
+            return
     else:
         return
     await conn.execute(
@@ -246,7 +260,7 @@ async def create_transaction(
             return JSONResponse(content=cached, status_code=201)
 
         async with conn.transaction():
-            # Validate all required fields — collect all failures
+            # Validate shared fields — collect all failures
             errors: dict = {}
 
             if not body.title or not body.title.strip():
@@ -260,6 +274,40 @@ async def create_transaction(
             if body.date > now:
                 errors["date"] = "Must not be in the future."
 
+            if errors:
+                raise validation_error("Transaction validation failed.", errors)
+
+            # ----- Transfer branch -----
+            if body.transfer is not None:
+                from app.helpers.transfers import create_transfer_pair
+
+                primary_response, _sibling = await create_transfer_pair(
+                    conn=conn,
+                    user_id=auth_user.id,
+                    primary_title=body.title.strip(),
+                    primary_description=body.description,
+                    primary_amount_cents=body.amount_cents,
+                    primary_account_id=body.account_id,
+                    primary_date=body.date,
+                    primary_exchange_rate=body.exchange_rate,
+                    primary_cleared=body.cleared if body.cleared is not None else False,
+                    transfer_account_id=body.transfer.account_id,
+                    transfer_amount_cents=body.transfer.amount_cents,
+                )
+
+                # Hashtags on primary only
+                if body.hashtag_ids:
+                    await _sync_hashtags(
+                        conn, primary_response["id"], auth_user.id, body.hashtag_ids,
+                    )
+
+                response = primary_response
+
+                await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
+                return JSONResponse(content=response, status_code=201)
+
+            # ----- Normal (non-transfer) branch -----
+
             # Validate account_id — active, non-archived
             account = await conn.fetchrow(
                 """
@@ -270,7 +318,10 @@ async def create_transaction(
                 auth_user.id,
             )
             if account is None:
-                errors["account_id"] = "Must reference an active, non-archived account."
+                raise validation_error(
+                    "Transaction validation failed.",
+                    {"account_id": "Must reference an active, non-archived account."},
+                )
 
             # Validate category_id — active
             category = await conn.fetchrow(
@@ -279,10 +330,10 @@ async def create_transaction(
                 auth_user.id,
             )
             if category is None:
-                errors["category_id"] = "Must reference an active category."
-
-            if errors:
-                raise validation_error("Transaction validation failed.", errors)
+                raise validation_error(
+                    "Transaction validation failed.",
+                    {"category_id": "Must reference an active category."},
+                )
 
             # Infer transaction_type and normalize amount
             transaction_type = infer_transaction_type(body.amount_cents)
@@ -392,6 +443,15 @@ async def update_transaction(
                             {f: "Locked by completed reconciliation." for f in attempted},
                         )
 
+            # Transfer edit guard — reject amount/account changes on transfers
+            if before_row["transfer_transaction_id"] is not None:
+                blocked = {"amount_cents", "account_id"} & fields.keys()
+                if blocked:
+                    raise validation_error(
+                        "Transfer edits not yet supported.",
+                        {f: "Cannot modify on a transfer transaction." for f in blocked},
+                    )
+
             # Track whether balance needs updating
             needs_balance_update = False
 
@@ -471,6 +531,7 @@ async def update_transaction(
                 await _reverse_account_balance(
                     conn, str(before_row["account_id"]), auth_user.id,
                     before_row["amount_cents"], before_row["transaction_type"],
+                    transfer_direction=before_row["transfer_direction"],
                 )
                 effective_account_id = fields.get("account_id") or str(before_row["account_id"])
                 effective_amount = fields.get("amount_cents", before_row["amount_cents"])
@@ -478,6 +539,7 @@ async def update_transaction(
                 await _update_account_balance(
                     conn, effective_account_id, auth_user.id,
                     effective_amount, effective_type,
+                    transfer_direction=before_row["transfer_direction"],
                 )
 
             # Build dynamic UPDATE
@@ -573,6 +635,7 @@ async def delete_transaction(
             await _reverse_account_balance(
                 conn, str(row["account_id"]), auth_user.id,
                 row["amount_cents"], row["transaction_type"],
+                transfer_direction=row["transfer_direction"],
             )
 
             # Soft-delete junction rows
@@ -612,6 +675,7 @@ async def delete_transaction(
                     await _reverse_account_balance(
                         conn, str(sibling_row["account_id"]), auth_user.id,
                         sibling_row["amount_cents"], sibling_row["transaction_type"],
+                        transfer_direction=sibling_row["transfer_direction"],
                     )
 
                     await conn.execute(
@@ -665,6 +729,14 @@ async def batch_create_transactions(
             "Batch must contain at least one transaction.",
             {"transactions": "Must not be empty."},
         )
+
+    # Transfers are not supported in batch creates
+    for i, item in enumerate(body.transactions):
+        if item.transfer is not None:
+            raise validation_error(
+                "Transfers are not supported in batch creates.",
+                {f"transactions[{i}].transfer": "Must not be present in batch."},
+            )
 
     async with db.pool.acquire() as conn:
         cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)

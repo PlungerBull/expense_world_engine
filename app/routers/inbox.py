@@ -29,6 +29,8 @@ def _inbox_from_row(row) -> dict:
         category_id=str(row["category_id"]) if row["category_id"] else None,
         exchange_rate=float(row["exchange_rate"]),
         status=row["status"],
+        transfer_account_id=str(row["transfer_account_id"]) if row["transfer_account_id"] else None,
+        transfer_amount_cents=row["transfer_amount_cents"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         version=row["version"],
@@ -131,6 +133,19 @@ async def create_inbox_item(
             transaction_type = infer_transaction_type(amount_cents)
             amount_cents = abs(amount_cents)
 
+        # Transfer fields
+        transfer_account_id = None
+        transfer_amount_cents = None
+        if body.transfer is not None:
+            if body.transfer.amount_cents == 0:
+                raise validation_error(
+                    "transfer.amount_cents must not be zero.",
+                    {"transfer.amount_cents": "Must not be zero."},
+                )
+            transfer_account_id = body.transfer.account_id
+            transfer_amount_cents = body.transfer.amount_cents  # stored signed
+            transaction_type = 3  # override to transfer
+
         # Auto-populate exchange_rate if both account_id and date are present
         exchange_rate = body.exchange_rate
         if exchange_rate is None and body.account_id and body.date:
@@ -141,8 +156,10 @@ async def create_inbox_item(
                 """
                 INSERT INTO expense_transaction_inbox
                     (user_id, title, description, amount_cents, transaction_type,
-                     date, account_id, category_id, exchange_rate, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 1.0), now(), now())
+                     date, account_id, category_id, exchange_rate,
+                     transfer_account_id, transfer_amount_cents,
+                     created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 1.0), $10, $11, now(), now())
                 RETURNING *
                 """,
                 auth_user.id,
@@ -154,6 +171,8 @@ async def create_inbox_item(
                 body.account_id,
                 body.category_id,
                 exchange_rate,
+                transfer_account_id,
+                transfer_amount_cents,
             )
 
             response = _inbox_from_row(row)
@@ -194,6 +213,18 @@ async def update_inbox_item(
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
     fields = body.model_dump(exclude_none=True)
+
+    # Extract transfer before passing to dynamic UPDATE builder
+    transfer = fields.pop("transfer", None)
+    if transfer is not None:
+        if transfer["amount_cents"] == 0:
+            raise validation_error(
+                "transfer.amount_cents must not be zero.",
+                {"transfer.amount_cents": "Must not be zero."},
+            )
+        fields["transfer_account_id"] = transfer["account_id"]
+        fields["transfer_amount_cents"] = transfer["amount_cents"]  # stored signed
+        fields["transaction_type"] = 3
 
     async with db.pool.acquire() as conn:
         cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
@@ -350,7 +381,13 @@ async def promote_inbox_item(
 
             inbox_before = _inbox_from_row(inbox_row)
 
-            # 2. Validate all required fields — collect all failures
+            # 2. Detect transfer promotion
+            is_transfer = (
+                inbox_row["transfer_account_id"] is not None
+                and inbox_row["transfer_amount_cents"] is not None
+            )
+
+            # 3. Validate shared required fields — collect all failures
             errors: dict = {}
 
             if not inbox_row["title"] or inbox_row["title"] == "UNTITLED":
@@ -378,53 +415,113 @@ async def promote_inbox_item(
                 if account is None:
                     errors["account_id"] = "Must reference an active, non-archived account."
 
-            if inbox_row["category_id"] is None:
-                errors["category_id"] = "Must reference an active category."
-            else:
-                category = await conn.fetchrow(
-                    "SELECT id FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-                    inbox_row["category_id"],
-                    auth_user.id,
-                )
-                if category is None:
+            # Category validation only for non-transfers (transfers auto-assign)
+            if not is_transfer:
+                if inbox_row["category_id"] is None:
                     errors["category_id"] = "Must reference an active category."
+                else:
+                    category = await conn.fetchrow(
+                        "SELECT id FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+                        inbox_row["category_id"],
+                        auth_user.id,
+                    )
+                    if category is None:
+                        errors["category_id"] = "Must reference an active category."
 
             if errors:
                 raise validation_error("Inbox item is not ready to promote.", errors)
 
-            # 3. Determine transaction_type — use stored value, or default to expense
-            transaction_type = inbox_row["transaction_type"] or 1
+            # ----- Transfer promotion branch -----
+            if is_transfer:
+                from app.helpers.transfers import create_transfer_pair
 
-            # 4. Compute amount_home_cents
-            exchange_rate = float(inbox_row["exchange_rate"])
-            amount_home_cents = round(inbox_row["amount_cents"] * exchange_rate)
+                # Reconstruct signed primary amount from transfer_amount_cents sign:
+                # if transfer side is positive, primary must be negative, and vice versa.
+                transfer_amt = inbox_row["transfer_amount_cents"]
+                primary_signed = -inbox_row["amount_cents"] if transfer_amt > 0 else inbox_row["amount_cents"]
 
-            # 5. Create expense_transactions row
-            txn_row = await conn.fetchrow(
-                """
-                INSERT INTO expense_transactions
-                    (user_id, title, description, amount_cents, amount_home_cents,
-                     transaction_type, date, account_id, category_id, exchange_rate,
-                     inbox_id, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
-                RETURNING *
-                """,
-                auth_user.id,
-                inbox_row["title"],
-                inbox_row["description"],
-                inbox_row["amount_cents"],
-                amount_home_cents,
-                transaction_type,
-                inbox_row["date"],
-                inbox_row["account_id"],
-                inbox_row["category_id"],
-                inbox_row["exchange_rate"],
-                inbox_row["id"],
-            )
+                txn_response, _sibling = await create_transfer_pair(
+                    conn=conn,
+                    user_id=auth_user.id,
+                    primary_title=inbox_row["title"],
+                    primary_description=inbox_row["description"],
+                    primary_amount_cents=primary_signed,
+                    primary_account_id=str(inbox_row["account_id"]),
+                    primary_date=inbox_row["date"],
+                    primary_exchange_rate=float(inbox_row["exchange_rate"]),
+                    primary_cleared=False,
+                    transfer_account_id=str(inbox_row["transfer_account_id"]),
+                    transfer_amount_cents=transfer_amt,
+                    inbox_id=str(inbox_row["id"]),
+                )
 
-            txn_response = transaction_from_row(txn_row)
+            # ----- Normal (non-transfer) promotion branch -----
+            else:
+                # Determine transaction_type — use stored value, or default to expense
+                transaction_type = inbox_row["transaction_type"] or 1
 
-            # 6. Update inbox row: status=2 (promoted), soft-delete
+                # Compute amount_home_cents
+                exchange_rate = float(inbox_row["exchange_rate"])
+                amount_home_cents = round(inbox_row["amount_cents"] * exchange_rate)
+
+                # Create expense_transactions row
+                txn_row = await conn.fetchrow(
+                    """
+                    INSERT INTO expense_transactions
+                        (user_id, title, description, amount_cents, amount_home_cents,
+                         transaction_type, date, account_id, category_id, exchange_rate,
+                         inbox_id, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
+                    RETURNING *
+                    """,
+                    auth_user.id,
+                    inbox_row["title"],
+                    inbox_row["description"],
+                    inbox_row["amount_cents"],
+                    amount_home_cents,
+                    transaction_type,
+                    inbox_row["date"],
+                    inbox_row["account_id"],
+                    inbox_row["category_id"],
+                    inbox_row["exchange_rate"],
+                    inbox_row["id"],
+                )
+
+                txn_response = transaction_from_row(txn_row)
+
+                # Update account balance
+                if transaction_type == 1:  # expense
+                    await conn.execute(
+                        """
+                        UPDATE expense_bank_accounts
+                        SET current_balance_cents = current_balance_cents - $1,
+                            updated_at = now(), version = version + 1
+                        WHERE id = $2 AND user_id = $3
+                        """,
+                        inbox_row["amount_cents"],
+                        inbox_row["account_id"],
+                        auth_user.id,
+                    )
+                elif transaction_type == 2:  # income
+                    await conn.execute(
+                        """
+                        UPDATE expense_bank_accounts
+                        SET current_balance_cents = current_balance_cents + $1,
+                            updated_at = now(), version = version + 1
+                        WHERE id = $2 AND user_id = $3
+                        """,
+                        inbox_row["amount_cents"],
+                        inbox_row["account_id"],
+                        auth_user.id,
+                    )
+
+                # Activity log: transaction created
+                await write_activity_log(
+                    conn, auth_user.id, "transaction", str(txn_row["id"]), 1,
+                    after_snapshot=txn_response,
+                )
+
+            # Shared: soft-delete inbox row + activity log
             inbox_after_row = await conn.fetchrow(
                 """
                 UPDATE expense_transaction_inbox
@@ -437,39 +534,6 @@ async def promote_inbox_item(
             )
             inbox_after = _inbox_from_row(inbox_after_row)
 
-            # 7. Update account balance based on transaction_type
-            if transaction_type == 1:  # expense
-                await conn.execute(
-                    """
-                    UPDATE expense_bank_accounts
-                    SET current_balance_cents = current_balance_cents - $1,
-                        updated_at = now(), version = version + 1
-                    WHERE id = $2 AND user_id = $3
-                    """,
-                    inbox_row["amount_cents"],
-                    inbox_row["account_id"],
-                    auth_user.id,
-                )
-            elif transaction_type == 2:  # income
-                await conn.execute(
-                    """
-                    UPDATE expense_bank_accounts
-                    SET current_balance_cents = current_balance_cents + $1,
-                        updated_at = now(), version = version + 1
-                    WHERE id = $2 AND user_id = $3
-                    """,
-                    inbox_row["amount_cents"],
-                    inbox_row["account_id"],
-                    auth_user.id,
-                )
-
-            # 8. Activity log: transaction created
-            await write_activity_log(
-                conn, auth_user.id, "transaction", str(txn_row["id"]), 1,
-                after_snapshot=txn_response,
-            )
-
-            # 9. Activity log: inbox item deleted
             await write_activity_log(
                 conn, auth_user.id, "inbox", inbox_id, 3,
                 before_snapshot=inbox_before,
