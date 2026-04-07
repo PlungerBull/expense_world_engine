@@ -5,7 +5,7 @@ from fastapi.exceptions import RequestValidationError
 
 from app import db
 from app.errors import AppError, app_error_handler, validation_error_handler
-from app.routers import accounts, auth, categories, hashtags, health, inbox
+from app.routers import accounts, auth, categories, hashtags, health, inbox, transactions
 
 
 @asynccontextmanager
@@ -30,3 +30,4 @@ app.include_router(accounts.router, prefix="/v1")
 app.include_router(categories.router, prefix="/v1")
 app.include_router(hashtags.router, prefix="/v1")
 app.include_router(inbox.router, prefix="/v1")
+app.include_router(transactions.router, prefix="/v1")

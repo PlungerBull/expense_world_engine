@@ -42,25 +42,3 @@ class InboxResponse(BaseModel):
     deleted_at: Optional[datetime] = None
 
 
-class TransactionResponse(BaseModel):
-    id: str
-    user_id: str
-    title: str
-    description: Optional[str] = None
-    amount_cents: int
-    amount_home_cents: Optional[int] = None
-    transaction_type: int
-    transfer_direction: Optional[int] = None
-    date: datetime
-    account_id: str
-    category_id: str
-    exchange_rate: float
-    cleared: bool
-    transfer_transaction_id: Optional[str] = None
-    parent_transaction_id: Optional[str] = None
-    inbox_id: Optional[str] = None
-    reconciliation_id: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-    version: int
-    deleted_at: Optional[datetime] = None

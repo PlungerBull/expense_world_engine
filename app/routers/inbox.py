@@ -10,7 +10,8 @@ from app.helpers.activity_log import write_activity_log
 from app.helpers.exchange_rate import lookup_exchange_rate
 from app.helpers.idempotency import check_idempotency, store_idempotency
 from app.helpers.pagination import clamp_limit, paginated_response
-from app.schemas.inbox import InboxCreateRequest, InboxResponse, InboxUpdateRequest, TransactionResponse
+from app.schemas.inbox import InboxCreateRequest, InboxResponse, InboxUpdateRequest
+from app.schemas.transactions import transaction_from_row, infer_transaction_type
 
 router = APIRouter(prefix="/inbox", tags=["inbox"])
 
@@ -35,35 +36,6 @@ def _inbox_from_row(row) -> dict:
     ).model_dump(mode="json")
 
 
-def _transaction_from_row(row) -> dict:
-    return TransactionResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
-        title=row["title"],
-        description=row["description"],
-        amount_cents=row["amount_cents"],
-        amount_home_cents=row["amount_home_cents"],
-        transaction_type=row["transaction_type"],
-        transfer_direction=row["transfer_direction"],
-        date=row["date"],
-        account_id=str(row["account_id"]),
-        category_id=str(row["category_id"]),
-        exchange_rate=float(row["exchange_rate"]),
-        cleared=row["cleared"],
-        transfer_transaction_id=str(row["transfer_transaction_id"]) if row["transfer_transaction_id"] else None,
-        parent_transaction_id=str(row["parent_transaction_id"]) if row["parent_transaction_id"] else None,
-        inbox_id=str(row["inbox_id"]) if row["inbox_id"] else None,
-        reconciliation_id=str(row["reconciliation_id"]) if row["reconciliation_id"] else None,
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        version=row["version"],
-        deleted_at=row["deleted_at"],
-    ).model_dump(mode="json")
-
-
-def _infer_transaction_type(amount_cents: int) -> int:
-    """Infer transaction_type from signed amount. Negative=expense(1), positive=income(2)."""
-    return 1 if amount_cents < 0 else 2
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +128,7 @@ async def create_inbox_item(
                     "amount_cents must not be zero.",
                     {"amount_cents": "Must not be zero."},
                 )
-            transaction_type = _infer_transaction_type(amount_cents)
+            transaction_type = infer_transaction_type(amount_cents)
             amount_cents = abs(amount_cents)
 
         # Auto-populate exchange_rate if both account_id and date are present
@@ -246,7 +218,7 @@ async def update_inbox_item(
                     "amount_cents must not be zero.",
                     {"amount_cents": "Must not be zero."},
                 )
-            fields["transaction_type"] = _infer_transaction_type(fields["amount_cents"])
+            fields["transaction_type"] = infer_transaction_type(fields["amount_cents"])
             fields["amount_cents"] = abs(fields["amount_cents"])
 
         async with conn.transaction():
@@ -450,7 +422,7 @@ async def promote_inbox_item(
                 inbox_row["id"],
             )
 
-            txn_response = _transaction_from_row(txn_row)
+            txn_response = transaction_from_row(txn_row)
 
             # 6. Update inbox row: status=2 (promoted), soft-delete
             inbox_after_row = await conn.fetchrow(
