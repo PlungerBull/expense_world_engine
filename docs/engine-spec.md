@@ -96,7 +96,7 @@ Returns the authenticated user's profile and settings in a single response. Retu
 ### `PUT /auth/settings`
 Updates `user_settings`. Partial update — only supplied fields are changed. If no fields are supplied, returns current settings without making changes.
 
-**Special case — `main_currency` change:** If `main_currency` changes, the engine enqueues an async job to recalculate `amount_home_cents` on all the user's `expense_transactions` using historical rates for each transaction's date. The response returns immediately; the recalculation runs in the background. The client receives a `recalculation_job_id` it can poll.
+**Special case — `main_currency` change:** If `main_currency` changes, the engine recalculates `amount_home_cents` on all the user's `expense_transactions` using historical rates for each transaction's date, updates `current_balance_home_cents` on all accounts, and updates `exchange_rate` on pending inbox items. A single `activity_log` entry records the currency change (individual transaction updates are not logged). The client receives a mechanism to know when recalculation is complete. *(Deferred to Step 9.1 — requires historical exchange rates and transaction endpoints to exist first. Until then, `main_currency` changes apply to new transactions only; existing `amount_home_cents` values are not retroactively recalculated.)*
 
 ---
 

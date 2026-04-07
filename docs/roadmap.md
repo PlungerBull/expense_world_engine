@@ -207,6 +207,26 @@ All reconciliation endpoints. Complete/revert logic. Field locking enforcement i
 
 ---
 
+## Step 9.1 — Home Currency Recalculation
+
+*Deliverable: changing `main_currency` in settings recalculates all home-currency amounts and the client knows when it's done.*
+
+Depends on: Step 6 (transactions exist), Step 9 (historical exchange rates seeded, background job infrastructure in place).
+
+When `PUT /auth/settings` detects that `main_currency` changed (compare old value to new), trigger a recalculation:
+
+1. **`amount_home_cents` on all `expense_transactions`** — batch UPDATE joining `exchange_rates` for per-date rate lookup. If `account.currency_code == new main_currency`, set `amount_home_cents = amount_cents`. Otherwise, convert using the historical rate for that transaction's `date`.
+2. **`current_balance_home_cents` on all `expense_bank_accounts`** — recompute using today's rate against the new home currency.
+3. **`exchange_rate` on pending inbox items** (`status = 1`) — update to reflect conversion to the new home currency so future promotions compute correctly.
+4. **Single `activity_log` entry** — resource_type `user_settings`, action `updated`, recording `main_currency` changed from X to Y. Individual transaction updates are not logged (bulk recalculation, not user edits).
+5. **Completion tracking** — the response must include a mechanism for the client to know when recalculation is finished. Design decision needed: a `recalculation_jobs` table with polling, a simpler `recalculation_pending` flag on `user_settings`, or a synchronous approach if transaction volume is reliably low (two currencies, single user).
+
+**Verify:** Set `main_currency` to USD. Create transactions on a PEN account. Switch `main_currency` to PEN. Confirm all `amount_home_cents` values are recalculated. Confirm `current_balance_home_cents` on accounts updated. Confirm pending inbox items have updated `exchange_rate`. Confirm a single activity log entry was written.
+
+**Commit:** `feat: home currency recalculation on main_currency change`
+
+---
+
 ## Step 9.5 — Web Dashboard (Read-Only)
 
 *Deliverable: a lightweight Next.js dashboard on Vercel that reads from the engine and shows you if you're on track.*
