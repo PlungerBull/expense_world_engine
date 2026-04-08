@@ -179,9 +179,11 @@ Build each resource group completely before starting the next. For each: list, c
 At this point you have a fully working headless expense logger. Verify the entire Phase 1 surface via Swagger end-to-end before moving on.
 
 **Deploy to production:**
-1. Create a Render account (render.com)
-2. Deploy the engine to Render. Set env variables in the hosting dashboard.
-3. Verify `GET /health` returns 200 in production.
+1. Create a Render account (render.com) ✅
+2. Deploy the engine to Render. Set env variables in the hosting dashboard. ✅
+3. Verify `GET /health` returns 200 in production. ✅
+
+**Production URL:** `https://expense-world-engine.onrender.com`
 
 ---
 
