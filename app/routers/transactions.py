@@ -400,13 +400,20 @@ async def update_transaction(
     fields = body.model_dump(exclude_none=True)
     hashtag_ids = fields.pop("hashtag_ids", None)
 
+    # reconciliation_id needs special handling: model_dump(exclude_none=True) drops
+    # null values, but we need to distinguish "omitted" from "explicitly set to null"
+    # so clients can unassign by sending reconciliation_id: null.
+    recon_id_provided = "reconciliation_id" in body.model_fields_set
+    recon_id_value = body.reconciliation_id
+    fields.pop("reconciliation_id", None)
+
     async with db.pool.acquire() as conn:
         cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
         if cached is not None:
             return JSONResponse(content=cached)
 
         # Empty update — return current
-        if not fields and hashtag_ids is None:
+        if not fields and hashtag_ids is None and not recon_id_provided:
             row = await conn.fetchrow(
                 "SELECT * FROM expense_transactions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
                 transaction_id,
@@ -442,6 +449,33 @@ async def update_transaction(
                             "Transaction belongs to a completed reconciliation. These fields are locked.",
                             {f: "Locked by completed reconciliation." for f in attempted},
                         )
+
+            # Validate reconciliation_id assignment
+            if recon_id_provided and recon_id_value is not None:
+                recon = await conn.fetchrow(
+                    """
+                    SELECT id, account_id, status FROM expense_reconciliations
+                    WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+                    """,
+                    recon_id_value,
+                    auth_user.id,
+                )
+                if recon is None:
+                    raise validation_error(
+                        "Reconciliation validation failed.",
+                        {"reconciliation_id": "Must reference an active reconciliation."},
+                    )
+                effective_account_id = fields.get("account_id") or str(before_row["account_id"])
+                if str(recon["account_id"]) != effective_account_id:
+                    raise validation_error(
+                        "Reconciliation validation failed.",
+                        {"reconciliation_id": "Reconciliation account does not match transaction account."},
+                    )
+                if recon["status"] == 2:
+                    raise validation_error(
+                        "Reconciliation validation failed.",
+                        {"reconciliation_id": "Cannot assign transactions to a completed reconciliation."},
+                    )
 
             # Transfer edit guard — reject amount/account changes on transfers
             if before_row["transfer_transaction_id"] is not None:
@@ -579,6 +613,20 @@ async def update_transaction(
             # Sync hashtags if provided
             if hashtag_ids is not None:
                 await _sync_hashtags(conn, transaction_id, auth_user.id, hashtag_ids)
+
+            # Apply reconciliation_id change
+            if recon_id_provided:
+                after_row = await conn.fetchrow(
+                    """
+                    UPDATE expense_transactions
+                    SET reconciliation_id = $1, updated_at = now(), version = version + 1
+                    WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL
+                    RETURNING *
+                    """,
+                    recon_id_value,
+                    transaction_id,
+                    auth_user.id,
+                )
 
             after = transaction_from_row(after_row)
 

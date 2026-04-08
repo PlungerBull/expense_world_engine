@@ -32,6 +32,7 @@ class TransactionUpdateRequest(BaseModel):
     exchange_rate: Optional[float] = None
     cleared: Optional[bool] = None
     hashtag_ids: Optional[list[str]] = None
+    reconciliation_id: Optional[str] = None
 
 
 class TransactionBatchRequest(BaseModel):
