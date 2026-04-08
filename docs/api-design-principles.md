@@ -89,7 +89,7 @@ The goal is a high-performance, minimalist expense tracker with a headless archi
 Four repositories, one managed database. Each has a single, clear role.
 
 **`expense_world_engine` — The Brain**
-Python (FastAPI) + Supabase. Single source of truth. Handles all database connections, all business logic (categorisation, balance updates, sync processing), and exposes the API that all clients consume. Hosted on Koyeb. Never replaced — only evolved.
+Python (FastAPI) + Supabase. Single source of truth. Handles all database connections, all business logic (categorisation, balance updates, sync processing), and exposes the API that all clients consume. Hosted on Render. Never replaced — only evolved.
 
 **`expense_world_cli` — The Hands**
 Python (Typer). Developer-facing terminal interface. Talks to the engine via the API. Logs expenses, checks sync state, runs bulk imports. The primary tool for verifying backend behaviour during development. Built before the web dashboard.
@@ -108,7 +108,7 @@ Swift / SwiftUI. Minimalist mobile interface. Has no knowledge of the database o
 
 **Database:** Supabase (managed Postgres). Single source of truth for all persistent data. Row-Level Security (RLS) enabled on all tables: `auth.uid() = user_id`. Even if someone bypasses the engine, they can only access their own rows.
 
-**Engine:** Python FastAPI on Koyeb. Stateless — all state lives in Supabase. Deployment, restarts, and scaling are straightforward.
+**Engine:** Python FastAPI on Render. Stateless — all state lives in Supabase. Deployment, restarts, and scaling are straightforward.
 
 **Configuration:** All credentials via environment variables. No hardcoded secrets. Same codebase points to local, staging, or production by swapping one variable.
 

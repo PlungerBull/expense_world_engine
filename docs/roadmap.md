@@ -179,8 +179,8 @@ Build each resource group completely before starting the next. For each: list, c
 At this point you have a fully working headless expense logger. Verify the entire Phase 1 surface via Swagger end-to-end before moving on.
 
 **Deploy to production:**
-1. Create a Koyeb account (koyeb.com)
-2. Deploy the engine to Koyeb. Set env variables in the hosting dashboard.
+1. Create a Render account (render.com)
+2. Deploy the engine to Render. Set env variables in the hosting dashboard.
 3. Verify `GET /health` returns 200 in production.
 
 ---
@@ -199,7 +199,7 @@ All reconciliation endpoints. Complete/revert logic. Field locking enforcement i
 2. `GET /dashboard` — monthly summary, all amounts in both native and home currency
 3. `GET /reports/monthly` — same structure for historical months
 4. `GET /activity` — activity log reads
-5. **Exchange rate daily fetch job** — implement the background job that calls Frankfurter.app (`https://api.frankfurter.app/latest?from=USD&to=PEN`) once per day and inserts a row into `exchange_rates`. Run on Koyeb as a scheduled task. Seed historical rates for the past 12 months on first run (Frankfurter supports historical queries via `https://api.frankfurter.app/{date}?from=USD&to=PEN`). Wire up `GET /exchange-rates` endpoint.
+5. **Exchange rate daily fetch job** — implement the background job that calls Frankfurter.app (`https://api.frankfurter.app/latest?from=USD&to=PEN`) once per day and inserts a row into `exchange_rates`. Run on Render as a scheduled task. Seed historical rates for the past 12 months on first run (Frankfurter supports historical queries via `https://api.frankfurter.app/{date}?from=USD&to=PEN`). Wire up `GET /exchange-rates` endpoint.
 
 **Verify:** Trigger the fetch job manually, confirm a row appears in `exchange_rates`. Call `GET /exchange-rates?base=USD&target=PEN` and confirm it returns the correct rate.
 
@@ -237,7 +237,7 @@ When `PUT /auth/settings` detects that `main_currency` changed (compare old valu
 
 **Stack:**
 ```
-expense_world_engine   → Koyeb (Python FastAPI, always-on)
+expense_world_engine   → Render (Python FastAPI, always-on)
 expense_world_db       → Supabase (Postgres)
 expense_world_web      → Vercel (Next.js, read-only client)
 expense_world_cli      → local machine (Python Typer)

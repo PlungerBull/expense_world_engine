@@ -8,7 +8,7 @@
 
 ## Base Conventions
 
-**Base URL:** `https://expense-world-engine.koyeb.app/v1` (production) / `http://localhost:8000/v1` (local)
+**Base URL:** `https://expense-world-engine.onrender.com/v1` (production) / `http://localhost:8000/v1` (local)
 
 **Authentication:** Every request requires `Authorization: Bearer <token>`. The engine validates the Supabase JWT, extracts `user_id`, and passes it to all downstream logic. Unauthenticated requests return `401`.
 

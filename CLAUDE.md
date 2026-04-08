@@ -2,7 +2,7 @@
 
 ## What this repo is
 
-The Brain. A Python (FastAPI) backend hosted on Koyeb, backed by Supabase (Postgres). It is the single source of truth for all business logic, validation, and data. The iOS app, CLI, and web dashboard are all equal clients — none of them implement logic. If it isn't in the engine, it doesn't exist.
+The Brain. A Python (FastAPI) backend hosted on Render, backed by Supabase (Postgres). It is the single source of truth for all business logic, validation, and data. The iOS app, CLI, and web dashboard are all equal clients — none of them implement logic. If it isn't in the engine, it doesn't exist.
 
 ## Key documentation
 
@@ -19,7 +19,7 @@ The Brain. A Python (FastAPI) backend hosted on Koyeb, backed by Supabase (Postg
 - **Framework:** FastAPI
 - **Database:** Supabase (managed Postgres). RLS enabled on all tables: `auth.uid() = user_id`.
 - **Auth:** Supabase Auth. Engine validates JWT, extracts `user_id`, never stores passwords.
-- **Hosting:** Koyeb (stateless — all state lives in Supabase).
+- **Hosting:** Render (stateless — all state lives in Supabase).
 
 ## Non-negotiable conventions
 
