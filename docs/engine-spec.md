@@ -297,8 +297,9 @@ Include a `transfer` object on any transaction create request:
 4. Auto-assigns categories: if either account `is_person = true`, that side gets `@Debt`; both real accounts get `@Transfer`. These override any `category_id` passed in the request.
 5. Auto-creates `@Debt` or `@Transfer` system categories if they don't exist yet.
 6. **Zero-sum validation:** The engine does not enforce that the two `amount_cents` values are equal in raw number — they may be in different currencies. It does enforce that the two transactions are directionally opposite (one negative, one positive). Returns `422` if both are the same sign. **Explicit decision:** No magnitude equality check is performed even when both accounts share the same currency. This keeps the logic simple and allows users to record unequal amounts intentionally (e.g., fees absorbed during transfer).
-7. Updates `current_balance_cents` on both accounts.
-8. Writes `activity_log` entries for both transactions.
+7. **Home currency zero-sum (cross-currency transfers):** For transfers between accounts in different currencies, the engine uses the **implied rate from the entered amounts** (the rate the user actually got), not the market rate, when computing `amount_home_cents`. The side whose currency matches `main_currency` is dominant — its home value equals its native amount. The other side's `amount_home_cents` is forced to equal the dominant side's by direct assignment, and its `exchange_rate` is derived from that (stored for audit/display). This guarantees the pair nets to zero in home currency by construction, matching how production fintech systems (Stripe, Wise, QuickBooks Online) treat the execution rate as the historical spot rate for the transaction. No separate FX gain/loss is recognized at transaction time — that's a period-end remeasurement concern handled elsewhere (if ever).
+8. Updates `current_balance_cents` on both accounts.
+9. Writes `activity_log` entries for both transactions.
 
 ---
 

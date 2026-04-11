@@ -107,18 +107,64 @@ async def create_transfer_pair(
     sibling_direction = 1 if transfer_amount_cents < 0 else 2
 
     # ------------------------------------------------------------------
-    # 6. Exchange rates and amount_home_cents
+    # 6. Exchange rates and amount_home_cents (dominant-side rule)
     # ------------------------------------------------------------------
-    if primary_exchange_rate is None:
-        primary_exchange_rate = await lookup_exchange_rate(
-            conn, primary_account_id, primary_date, user_id,
-        )
-    primary_home = round(primary_abs * primary_exchange_rate)
+    # Cross-currency transfers must net to zero in home currency. We achieve
+    # this by forcing the sibling's home value to equal the primary's, and
+    # deriving the sibling's rate from that. The "dominant" side (the one
+    # whose home value is computed independently) is picked in this order:
+    #
+    #   1. If the caller supplied a primary_exchange_rate, the primary wins.
+    #   2. If the primary's currency == main currency, the primary wins (rate 1.0).
+    #   3. If the sibling's currency  == main currency, the sibling wins (rate 1.0).
+    #   4. Otherwise (3-currency edge case, neither side matches main), the
+    #      debit side wins via market rate lookup.
+    #
+    # In every case the non-dominant side's amount_home_cents is forced to
+    # equal the dominant side's by direct assignment — never recomputed via
+    # rate — so integer rounding can't introduce a net leak. Per-row
+    # exchange_rate is still stored for audit/display, derived from the
+    # forced home value.
+    primary_currency = primary_account["currency_code"]
+    sibling_currency = transfer_account["currency_code"]
 
-    sibling_exchange_rate = await lookup_exchange_rate(
-        conn, transfer_account_id, primary_date, user_id,
+    settings_row = await conn.fetchrow(
+        "SELECT main_currency FROM user_settings WHERE user_id = $1", user_id,
     )
-    sibling_home = round(sibling_abs * sibling_exchange_rate)
+    main_currency = settings_row["main_currency"] if settings_row else None
+
+    if primary_exchange_rate is not None:
+        # Caller override: primary dominant with the given rate
+        primary_home = round(primary_abs * primary_exchange_rate)
+        sibling_home = primary_home
+        sibling_exchange_rate = sibling_home / sibling_abs
+    elif primary_currency == main_currency:
+        primary_exchange_rate = 1.0
+        primary_home = primary_abs
+        sibling_home = primary_home
+        sibling_exchange_rate = sibling_home / sibling_abs
+    elif sibling_currency == main_currency:
+        sibling_exchange_rate = 1.0
+        sibling_home = sibling_abs
+        primary_home = sibling_home
+        primary_exchange_rate = primary_home / primary_abs
+    else:
+        # Neither side is main currency — rare 3-currency case.
+        # Use market rate on the debit side, force the credit side to match.
+        if primary_direction == 1:  # primary is the debit side
+            primary_exchange_rate = await lookup_exchange_rate(
+                conn, primary_account_id, primary_date, user_id,
+            )
+            primary_home = round(primary_abs * primary_exchange_rate)
+            sibling_home = primary_home
+            sibling_exchange_rate = sibling_home / sibling_abs
+        else:  # sibling is the debit side
+            sibling_exchange_rate = await lookup_exchange_rate(
+                conn, transfer_account_id, primary_date, user_id,
+            )
+            sibling_home = round(sibling_abs * sibling_exchange_rate)
+            primary_home = sibling_home
+            primary_exchange_rate = primary_home / primary_abs
 
     # ------------------------------------------------------------------
     # 7. Insert primary transaction
