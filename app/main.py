@@ -10,6 +10,7 @@ from app.routers import (
     activity,
     auth,
     categories,
+    dashboard,
     exchange_rates,
     hashtags,
     health,
@@ -40,6 +41,7 @@ app.include_router(auth.router, prefix="/v1")
 app.include_router(accounts.router, prefix="/v1")
 app.include_router(activity.router, prefix="/v1")
 app.include_router(categories.router, prefix="/v1")
+app.include_router(dashboard.router, prefix="/v1")
 app.include_router(exchange_rates.router, prefix="/v1")
 app.include_router(hashtags.router, prefix="/v1")
 app.include_router(inbox.router, prefix="/v1")
