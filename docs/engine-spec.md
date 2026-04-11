@@ -361,19 +361,127 @@ Deleted records are included with `deleted_at` set (tombstones). The client remo
 ## Dashboard & Reporting
 
 ### `GET /dashboard`
-Returns a summary for the current calendar month. Single endpoint, one call, everything needed to render an overview.
 
-**Response includes:**
-- All accounts with `current_balance_cents` and `current_balance_home_cents`
-- Category totals for the current month (`spent_cents`, `spent_home_cents`)
-- Total inflow and outflow for the current month, in `main_currency`
+Returns the current calendar month overview. Single endpoint, one call, everything needed to render the main dashboard view.
 
-All amounts include both native and home-currency versions (`_home_cents` suffix). The client never computes currency conversions.
+**Response shape:**
+
+```json
+{
+  "month": { "year": 2026, "month": 4 },
+  "bank_accounts": [
+    {
+      "id": "...",
+      "name": "BCP Soles",
+      "currency_code": "PEN",
+      "current_balance_cents": 125000,
+      "current_balance_home_cents": 125000
+    }
+  ],
+  "people": [
+    {
+      "id": "...",
+      "name": "Alex",
+      "currency_code": "PEN",
+      "current_balance_cents": -4500,
+      "current_balance_home_cents": -4500
+    }
+  ],
+  "categories": [
+    {
+      "id": "...",
+      "name": "Food",
+      "spent_cents": 50000,
+      "spent_home_cents": 50000,
+      "hashtag_breakdown": [
+        {
+          "hashtag_combination": ["<lunch_id>", "<work_id>"],
+          "spent_cents": 30000,
+          "spent_home_cents": 30000
+        },
+        {
+          "hashtag_combination": ["<groceries_id>"],
+          "spent_cents": 15000,
+          "spent_home_cents": 15000
+        },
+        {
+          "hashtag_combination": [],
+          "spent_cents": 5000,
+          "spent_home_cents": 5000
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inflow_cents": 800000,
+    "inflow_home_cents": 800000,
+    "outflow_cents": 320000,
+    "outflow_home_cents": 320000,
+    "net_cents": 480000,
+    "net_home_cents": 480000
+  }
+}
+```
+
+**Field rules:**
+
+- `bank_accounts` includes only `is_person = false`, `is_archived = false`, `deleted_at IS NULL`. Sorted by `sort_order`.
+- `people` includes only `is_person = true`, `deleted_at IS NULL`. Same shape as `bank_accounts`, separated for client convenience.
+- `categories` includes every non-deleted category, even if `spent_cents = 0` (so the client can render the full category list without a second call). Sorted by `sort_order`.
+- **`hashtag_breakdown`** — array of `{ hashtag_combination, spent_cents, spent_home_cents }` rows. Aggregation is `GROUP BY (category_id, sorted_array_of_hashtag_ids)`. The hashtag set is sorted by `id` before grouping so `[#a, #b]` and `[#b, #a]` collapse to the same row. Transactions with no hashtags appear as a row with `hashtag_combination: []`. **The sum of all `hashtag_breakdown` rows under a category equals that category's `spent_cents` exactly** — no double-counting, no orphaned amounts.
+- `totals.inflow_cents` / `outflow_cents` are the sum of all positive and negative transactions in the current month, expressed in `main_currency`. Native-currency totals are not meaningful when accounts span currencies, so only `_home_cents` is authoritative; the non-home fields are provided for single-currency users.
+- All `*_home_cents` fields are pre-converted by the engine. Clients never compute currency conversions.
+- "Current month" means `[first_day_of_month, last_day_of_month]` in the user's `display_timezone`.
 
 ### `GET /reports/monthly`
-**Query params:** `year`, `month`
 
-Returns the same structure as `/dashboard` but for any historical month.
+Returns flow data (what happened) for any historical month or month range. **Does not return balances** — balances are a "now" concept and live on `/dashboard` only. If you ever need point-in-time historical balances, that's a separate endpoint.
+
+**Response shape (single month):**
+
+```json
+{
+  "month": { "year": 2026, "month": 3 },
+  "categories": [
+    {
+      "id": "...",
+      "name": "Food",
+      "spent_cents": 50000,
+      "spent_home_cents": 50000,
+      "hashtag_breakdown": [
+        { "hashtag_combination": ["<lunch_id>", "<work_id>"], "spent_cents": 30000, "spent_home_cents": 30000 },
+        { "hashtag_combination": ["<groceries_id>"], "spent_cents": 15000, "spent_home_cents": 15000 },
+        { "hashtag_combination": [], "spent_cents": 5000, "spent_home_cents": 5000 }
+      ]
+    }
+  ],
+  "totals": {
+    "inflow_cents": 800000,
+    "inflow_home_cents": 800000,
+    "outflow_cents": 320000,
+    "outflow_home_cents": 320000,
+    "net_cents": 480000,
+    "net_home_cents": 480000
+  }
+}
+```
+
+`categories` and `hashtag_breakdown` follow the exact same rules as `/dashboard` (every non-deleted category included, breakdown rows sum to the parent category total, `hashtag_combination: []` for transactions with no hashtags). `totals` uses the same inflow/outflow/net structure.
+
+**Query params:**
+- `year`, `month` — single month. Returns the shape above.
+- `from_year`, `from_month`, `to_year`, `to_month` — multi-month range (inclusive on both ends). Response wraps per-month payloads in a `months` array, oldest first:
+
+```json
+{
+  "months": [
+    { "month": { "year": 2025, "month": 11 }, "categories": [...], "totals": {...} },
+    { "month": { "year": 2025, "month": 12 }, "categories": [...], "totals": {...} }
+  ]
+}
+```
+
+The two query forms are mutually exclusive. Passing both → `422`. Passing neither → `422`. Range queries are capped at 24 months → `422` if exceeded.
 
 ---
 

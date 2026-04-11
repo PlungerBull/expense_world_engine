@@ -198,12 +198,23 @@ All reconciliation endpoints. Complete/revert logic. Field locking enforcement i
 ## Step 9 — Sync + Dashboard + Exchange Rates (Phase 2)
 
 1. `GET /sync` — delta sync with sync token pattern. Reads `sync_checkpoints`, returns records with `version` higher than checkpoint, includes tombstones.
-2. `GET /dashboard` — monthly summary, all amounts in both native and home currency
-3. `GET /reports/monthly` — same structure for historical months
+2. **`GET /dashboard`** — current calendar month summary. Single call, everything needed for the main view. Response includes:
+   - **`bank_accounts`** — all real accounts (`is_person = false`) with `current_balance_cents` + `current_balance_home_cents`
+   - **`people`** — all person accounts (`is_person = true`) with outstanding balances in both currencies. Same shape as `bank_accounts`, separated for client convenience.
+   - **`categories`** — every category with `spent_cents` (in `main_currency`, since multiple accounts may contribute) and `spent_home_cents` for the current month. Also returns `hashtag_breakdown`: an array of `{ hashtag_combination: [hashtag_id, ...], spent_cents, spent_home_cents }` rows that sum cleanly to the parent category total. The combination is the *exact set* of hashtags on a transaction — `[#lunch, #work]` and `[#lunch]` are different rows. Transactions with no hashtags appear as a row with `hashtag_combination: []`.
+   - **`totals`** — current month inflow, outflow, and net, in both currencies.
+3. **`GET /reports/monthly`** — historical month data. Same response shape as `/dashboard`. Query params:
+   - `?year=&month=` — single month (existing behavior)
+   - `?from_year=&from_month=&to_year=&to_month=` — multi-month range. Response wraps the per-month payloads in a `months` array, oldest first. Used by the 6-month trend table.
 4. `GET /activity` — activity log reads
 5. **Exchange rate daily fetch job** — implement the background job that calls Frankfurter.app (`https://api.frankfurter.app/latest?from=USD&to=PEN`) once per day and inserts a row into `exchange_rates`. Run on Render as a scheduled task. Seed historical rates for the past 12 months on first run (Frankfurter supports historical queries via `https://api.frankfurter.app/{date}?from=USD&to=PEN`). Wire up `GET /exchange-rates` endpoint.
 
-**Verify:** Trigger the fetch job manually, confirm a row appears in `exchange_rates`. Call `GET /exchange-rates?base=USD&target=PEN` and confirm it returns the correct rate.
+**Hashtag-combination grouping rule:** Aggregation is `GROUP BY (category_id, sorted_array_of_hashtag_ids)`. The hashtag set is sorted by `id` before grouping so `[#a, #b]` and `[#b, #a]` are the same group. The sum of all `hashtag_breakdown` rows under a category equals the category's `spent_cents` exactly — no double-counting, no orphaned amounts.
+
+**Verify:**
+- Trigger the fetch job manually, confirm a row appears in `exchange_rates`. Call `GET /exchange-rates?base=USD&target=PEN`.
+- Call `GET /dashboard`. Confirm `bank_accounts`, `people`, `categories` (with `hashtag_breakdown`), and `totals` are all populated. Sum of `hashtag_breakdown` rows equals each category's `spent_cents`.
+- Call `GET /reports/monthly?from_year=2025&from_month=11&to_year=2026&to_month=4` and confirm 6 months returned in order.
 
 **Commit:** `feat: sync endpoint, dashboard, monthly reports, activity log reads, exchange rate fetch job`
 
@@ -246,18 +257,21 @@ expense_world_cli      → local machine (Python Typer)
 expense_world_ios      → later, maybe never needed
 ```
 
-**Three engine calls, nothing else:**
-- `GET /dashboard` → account balances + current month category totals
-- `GET /transactions?limit=20` → recent transactions list
-- `GET /reports/monthly` → last 3 months for trend context
+**Engine calls:**
+- `GET /dashboard` → bank accounts, people, categories (with hashtag breakdown), current month totals
+- `GET /reports/monthly?from_year=...&to_year=...` → last 6 months for the trend table
+- `GET /transactions` with filters (`account_id`, `category_id`, `hashtag_id`, date range, search) → the transactions browser
 
-**What it shows:**
-- Current balance per account
-- This month's spending by category
-- Am I spending more or less than last month?
-- Last 20 transactions
+**Must-have views:**
+1. **Bank accounts panel** — every real account with its current outstanding balance (native + home currency).
+2. **People panel** — every person account with its outstanding balance. Same shape as bank accounts; visually separated.
+3. **Categories — current month** — flat list of categories with this month's total spend.
+4. **Categories → hashtag breakdown — current month** — each category expandable to show its `hashtag_breakdown` rows. Hashtag-combination rows sum cleanly to the parent category total.
+5. **6-month trend table — categories** — rows are categories, columns are the last 6 months, cells are `spent_home_cents`. Powered by a single multi-month `/reports/monthly` call.
+6. **6-month trend table — categories + hashtag combinations** — same shape as #5 but rows include the hashtag-combination breakdown beneath each category.
+7. **Transaction browser** — paginated list of all transactions with filters for hashtag, category, and bank account (and date range / search as bonus).
 
-**What it does not do:** no entry, no editing, no forms. Read-only. If you're tempted to add more, don't — keep it to what you'd check over morning coffee.
+**What it does not do:** no entry, no editing, no forms. Read-only. Anything beyond the seven views above waits for a later iteration.
 
 **Commit:** `feat: read-only dashboard — balances, category totals, recent transactions`
 

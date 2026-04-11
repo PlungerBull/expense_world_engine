@@ -32,7 +32,7 @@ Track what you spend, who owes whom, and where your money goes.
 ### Core Tracking
 
 - **Inbox/ledger structure:** Log any expense fast — incomplete entries go to the inbox. When all mandatory fields are present and the date is today or past, the item shows a "ready" indicator and a Promote button. The user taps Promote to move it to the ledger. This lets users add optional fields (hashtags, description, receipt photo) before confirming. The ledger enforces completeness — nothing lives there without all required fields. Items already in the ledger can still be edited.
-- **Flat categories** — no hierarchy. Every category is directly assignable. Two system categories exist: `@Debt` (for person accounts) and `@Other` (for inter-account transfers).
+- **Flat categories** — no hierarchy. Every category is directly assignable. Two system categories exist: `@Debt` (auto-assigned to person account transactions) and `@Transfer` (auto-assigned to both legs of a transfer between real accounts). Both are created automatically on first use and cannot be renamed or deleted.
 - **Hashtags** — multiple per expense, freeform, available on both inbox and ledger items.
 - **Description** — optional free text directly on any transaction (inbox or ledger).
 - **Multiple bank accounts** — each account has a single currency. A real-world multi-currency card is modeled as separate accounts, one per currency.
