@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Header, Query
@@ -7,6 +8,7 @@ from app import db
 from app.deps import CurrentUser
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
+from app.helpers.exchange_rate import get_rate
 from app.helpers.idempotency import check_idempotency, store_idempotency
 from app.helpers.pagination import clamp_limit, paginated_response
 from app.schemas.accounts import AccountCreateRequest, AccountResponse, AccountUpdateRequest
@@ -41,23 +43,16 @@ async def _get_home_balance(conn, currency_code: str, balance_cents: int, user_i
     if settings is None:
         return None
 
-    main_currency = settings["main_currency"]
-    if currency_code == main_currency:
-        return balance_cents
-
-    rate_row = await conn.fetchrow(
-        """
-        SELECT rate FROM exchange_rates
-        WHERE base_currency = $1 AND target_currency = $2
-        ORDER BY rate_date DESC LIMIT 1
-        """,
-        currency_code,
-        main_currency,
+    result = await get_rate(
+        conn,
+        from_currency=currency_code,
+        to_currency=settings["main_currency"],
+        as_of=datetime.now(timezone.utc).date(),
     )
-    if rate_row is None:
+    if result is None:
         return None
 
-    return round(balance_cents * float(rate_row["rate"]))
+    return round(balance_cents * result[0])
 
 
 @router.get("")
