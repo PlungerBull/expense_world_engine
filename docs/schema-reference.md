@@ -508,10 +508,23 @@ Each rate was locked when the transaction was entered. The total reflects what y
 ### Exchange rate lifecycle
 
 1. Daily job fetches the closing rate from Frankfurter.app and inserts a row into `exchange_rates`.
-2. When a transaction is created, the engine looks up the rate for that transaction's date. If no rate exists for that exact date, it falls back to the most recent available rate.
+2. When a single-account transaction is created, the engine looks up the rate for that transaction's date. If no rate exists for that exact date, it falls back to the most recent available rate.
 3. The rate is written to `exchange_rate` on the transaction and `amount_home_cents` is computed and cached.
 4. The rate is now **locked**. It never changes unless the transaction date changes.
 5. If the transaction date is edited, the engine fetches the historical rate for the new date and recalculates `amount_home_cents`.
+
+### Cross-currency transfers
+
+Cross-currency transfers deliberately do **not** follow the single-account flow above. When the two legs of a transfer are in different currencies, the engine uses the **implied rate from the entered amounts** — the rate the user actually got at their bank — instead of doing two independent market-rate lookups. This guarantees the pair nets to zero in home currency by construction, which the naive "look up each leg's own rate" approach does not.
+
+The rule is dominant-side:
+
+1. The side whose currency matches `main_currency` is dominant. Its `amount_home_cents` equals its native amount, with `exchange_rate = 1.0`.
+2. The other side's `amount_home_cents` is **forced by direct assignment** to equal the dominant side's. Its `exchange_rate` is derived from that (`forced_home / native_amount`) and stored for audit/display.
+3. If neither side matches `main_currency` (a rare 3-currency case), the debit side falls back to a market-rate lookup, and the credit side is still forced to match.
+4. If the caller explicitly passes an `exchange_rate` on the primary leg, that overrides everything — the primary becomes dominant with the supplied rate, and the sibling is forced to match.
+
+The rationale is that the "execution rate" (what the user actually got) is the correct historical rate for that specific transaction — the ECB mid-market rate is a reference point, not the transaction's rate. This matches how Stripe, Wise, Xero, and QuickBooks Online all handle transaction-time FX: the rate stored on the row is the rate used for the conversion, not a delta against some market reference. FX gain/loss as a separate accounting event is a period-end remeasurement concern (IAS 21.23, QBO's "Home Currency Adjustment" pattern) and is out of scope for Phase 1.
 
 ### User-overridable rate
 

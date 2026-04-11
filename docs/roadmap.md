@@ -197,44 +197,75 @@ All reconciliation endpoints. Complete/revert logic. Field locking enforcement i
 
 ## Step 9 — Sync + Dashboard + Exchange Rates (Phase 2)
 
-1. `GET /sync` — delta sync with sync token pattern. Reads `sync_checkpoints`, returns records with `version` higher than checkpoint, includes tombstones.
-2. **`GET /dashboard`** — current calendar month summary. Single call, everything needed for the main view. Response includes:
-   - **`bank_accounts`** — all real accounts (`is_person = false`) with `current_balance_cents` + `current_balance_home_cents`
-   - **`people`** — all person accounts (`is_person = true`) with outstanding balances in both currencies. Same shape as `bank_accounts`, separated for client convenience.
-   - **`categories`** — every category with `spent_cents` (in `main_currency`, since multiple accounts may contribute) and `spent_home_cents` for the current month. Also returns `hashtag_breakdown`: an array of `{ hashtag_combination: [hashtag_id, ...], spent_cents, spent_home_cents }` rows that sum cleanly to the parent category total. The combination is the *exact set* of hashtags on a transaction — `[#lunch, #work]` and `[#lunch]` are different rows. Transactions with no hashtags appear as a row with `hashtag_combination: []`.
-   - **`totals`** — current month inflow, outflow, and net, in both currencies.
-3. **`GET /reports/monthly`** — historical month data. Same response shape as `/dashboard`. Query params:
-   - `?year=&month=` — single month (existing behavior)
-   - `?from_year=&from_month=&to_year=&to_month=` — multi-month range. Response wraps the per-month payloads in a `months` array, oldest first. Used by the 6-month trend table.
-4. `GET /activity` — activity log reads
-5. **Exchange rate daily fetch job** — implement the background job that calls Frankfurter.app (`https://api.frankfurter.app/latest?from=USD&to=PEN`) once per day and inserts a row into `exchange_rates`. Run on Render as a scheduled task. Seed historical rates for the past 12 months on first run (Frankfurter supports historical queries via `https://api.frankfurter.app/{date}?from=USD&to=PEN`). Wire up `GET /exchange-rates` endpoint.
+Split into **Part A** (read-side endpoints + exchange rates) and **Part B** (sync), with sync pulled out so it can be designed and executed in isolation. See `plans/` for detailed execution plans.
 
-**Hashtag-combination grouping rule:** Aggregation is `GROUP BY (category_id, sorted_array_of_hashtag_ids)`. The hashtag set is sorted by `id` before grouping so `[#a, #b]` and `[#b, #a]` are the same group. The sum of all `hashtag_breakdown` rows under a category equals the category's `spent_cents` exactly — no double-counting, no orphaned amounts.
+### Step 9 Part A — Activity, Exchange Rates, Dashboard, Reports ✅ Shipped
 
-**Verify:**
-- Trigger the fetch job manually, confirm a row appears in `exchange_rates`. Call `GET /exchange-rates?base=USD&target=PEN`.
-- Call `GET /dashboard`. Confirm `bank_accounts`, `people`, `categories` (with `hashtag_breakdown`), and `totals` are all populated. Sum of `hashtag_breakdown` rows equals each category's `spent_cents`.
-- Call `GET /reports/monthly?from_year=2025&from_month=11&to_year=2026&to_month=4` and confirm 6 months returned in order.
+1. **`GET /activity`** — paginated audit-log reads with `resource_type` and `resource_id` filters, sorted by `created_at DESC`. *(commit `d57b7f7`)*
+2. **Exchange rate daily fetch job + `GET /exchange-rates`** — stdlib-only Python script (`app/jobs/fetch_exchange_rates.py`) that calls Frankfurter (`https://api.frankfurter.app/latest?from=USD&to=<targets>`) and upserts canonical USD-based rows into `exchange_rates`. The read endpoint uses the shared `get_rate` helper which handles directional math (inversion, cross-rates) at lookup time. Wiring the script to a daily Render Cron Job is operational and tracked in [TODO.md](../TODO.md). Historical backfill is also a user-owned task in [TODO.md](../TODO.md), scheduled for the very end of engine work. *(commit `d57b7f7`)*
+3. **`GET /dashboard`** — current calendar month summary. Single call, everything needed for the main view. Response includes:
+   - **`bank_accounts`** — all real accounts (`is_person = false`, not archived) with `current_balance_cents` + `current_balance_home_cents` (home converted at today's rate via `get_rate`).
+   - **`people`** — all person accounts (`is_person = true`) with balances in both currencies. Same shape as `bank_accounts`, separated for client convenience.
+   - **`categories`** — every non-deleted category with `spent_cents` (signed) and `spent_home_cents` (signed) for the current month. Also returns `hashtag_breakdown`: an array of `{ hashtag_combination: [hashtag_id, ...], spent_cents, spent_home_cents }` rows that sum cleanly to the parent category total. The combination is the *exact set* of hashtags on a transaction — `[#lunch, #work]` and `[#lunch]` are different rows. Transactions with no hashtags appear as a row with `hashtag_combination: []`.
+   - **`totals`** — current month `inflow_cents`, `outflow_cents`, `net_cents` (all signed) in both currencies.
+   - **Signed-flow semantics:** every transaction row contributes a signed amount derived from `transaction_type` + `transfer_direction`. Expenses and transfer debits are negative (outflow); income and transfer credits are positive (inflow). Categories sum signed amounts, so a real-to-real transfer naturally cancels to zero under `@Transfer`. `spent_cents` can be negative for income-dominant categories or for lending-out months on `@Transfer`/`@Debt`. *(commit `0ce92d4`)*
+4. **`GET /reports/monthly`** — historical month data. Shares the exact same aggregation helper as `/dashboard` (`app/helpers/monthly_report.py`), so byte-identical shapes by construction. Query params:
+   - `?year=&month=` — single month. Response is a bare object.
+   - `?from_year=&from_month=&to_year=&to_month=` — multi-month range (inclusive, capped at 24 months). Response wraps per-month payloads in a `months` array, oldest first.
+   - Mutually exclusive; partial/mixed/inverted/oversized inputs return `422` with the standard error shape. *(commit `a21d8c4`)*
+5. **Cross-currency transfer zero-sum fix** *(discovered during Part A implementation, not originally in the plan)*. Before: `app/helpers/transfers.py` called `lookup_exchange_rate` independently for each leg of a cross-currency transfer, using the ECB market rate. For transfers where the user's actual execution rate differed from the market rate, the two legs' `amount_home_cents` values diverged and phantom home-currency balances leaked into dashboard totals on every cross-currency transfer. After: the dominant-side rule forces the non-dominant side's home value by direct assignment, guaranteeing zero-sum by construction. Documented in [api-design-principles.md §12](api-design-principles.md) and [schema-reference.md "Cross-currency transfers"](schema-reference.md). *(commit `f5f417c`)*
 
-**Commit:** `feat: sync endpoint, dashboard, monthly reports, activity log reads, exchange rate fetch job`
+**Hashtag-combination grouping rule:** Aggregation is `GROUP BY (category_id, sorted_array_of_hashtag_ids)`. The hashtag set is sorted by `id` before grouping so `[#a, #b]` and `[#b, #a]` are the same group. The sum of all `hashtag_breakdown` rows under a category equals the category's `spent_cents` exactly — enforced by construction (the category total is computed from the breakdown rows, not a separate query).
+
+**Verify Part A:**
+- Trigger `python -m app.jobs.fetch_exchange_rates` manually, confirm a row appears in `exchange_rates`. Call `GET /v1/exchange-rates?base=USD&target=PEN`.
+- Call `GET /v1/dashboard`. Confirm `bank_accounts`, `people`, `categories` (with `hashtag_breakdown`), and `totals` are all populated. Sum of `hashtag_breakdown` rows equals each category's `spent_cents`.
+- Call `GET /v1/reports/monthly?from_year=2025&from_month=11&to_year=2026&to_month=4` and confirm 6 months returned in order.
+- Create a cross-currency transfer (3750 PEN → 1000 USD with `main_currency = PEN`). Call `GET /v1/dashboard`. Confirm both legs have `amount_home_cents = 375000` (PEN cents) and that `totals.net_home_cents` is unchanged by the transfer.
+
+### Step 9 Part B — Sync ⏳ Pending
+
+6. **`GET /sync`** — delta sync with sync token pattern. Reads `sync_checkpoints`, returns records with `version` higher than checkpoint, includes tombstones for deletes. Uses `X-Client-Id` header to identify the device/install (a stable UUID per client, matching the `X-Idempotency-Key` pattern). Needs its own planning pass before implementation — see Context section at top of the Part A plan in `~/.claude/plans/`.
+
+**Verify Part B:**
+- `GET /v1/sync` with `sync_token=*` returns all active records plus a new token.
+- Mutate a transaction, re-sync with the returned token, confirm only the mutated row comes back.
+- Soft-delete a transaction, re-sync, confirm it appears as a tombstone (`deleted_at` set).
 
 ---
 
 ## Step 9.1 — Home Currency Recalculation
 
-*Deliverable: changing `main_currency` in settings recalculates all home-currency amounts and the client knows when it's done.*
+*Deliverable: changing `main_currency` in settings recalculates all home-currency amounts, idempotently and in batches, via a first-class job.*
 
-Depends on: Step 6 (transactions exist), Step 9 (historical exchange rates seeded, background job infrastructure in place).
+Depends on: Step 6 (transactions exist), Step 9 Part A (historical exchange rates available, background job infrastructure in place).
 
-When `PUT /auth/settings` detects that `main_currency` changed (compare old value to new), trigger a recalculation:
+### Why this is a real feature, not a setting toggle
 
-1. **`amount_home_cents` on all `expense_transactions`** — batch UPDATE joining `exchange_rates` for per-date rate lookup. If `account.currency_code == new main_currency`, set `amount_home_cents = amount_cents`. Otherwise, convert using the historical rate for that transaction's `date`.
-2. **`current_balance_home_cents` on all `expense_bank_accounts`** — recompute using today's rate against the new home currency.
-3. **`exchange_rate` on pending inbox items** (`status = 1`) — update to reflect conversion to the new home currency so future promotions compute correctly.
-4. **Single `activity_log` entry** — resource_type `user_settings`, action `updated`, recording `main_currency` changed from X to Y. Individual transaction updates are not logged (bulk recalculation, not user edits).
-5. **Completion tracking** — the response must include a mechanism for the client to know when recalculation is finished. Design decision needed: a `recalculation_jobs` table with polling, a simpler `recalculation_pending` flag on `user_settings`, or a synchronous approach if transaction volume is reliably low (two currencies, single user).
+Every production multi-currency system we looked at (QuickBooks Online, Xero, Firefly III, Lunch Money) treats the home/base currency as **effectively immutable** post-setup. QBO and Xero refuse to change it in place at all; Firefly III allows it but only via a `correction:recalculate-pc-amounts` command that "may take some time if you have a lot of transactions." The reason is that `amount_home_cents` is cached on every transaction at write time (per IAS 21.21 — spot rate at transaction date, immutable), so changing the home currency requires rewriting every row. This is a background job, not a setting toggle, and the product UX should signal that.
 
-**Verify:** Set `main_currency` to USD. Create transactions on a PEN account. Switch `main_currency` to PEN. Confirm all `amount_home_cents` values are recalculated. Confirm `current_balance_home_cents` on accounts updated. Confirm pending inbox items have updated `exchange_rate`. Confirm a single activity log entry was written.
+### Behavior
+
+When `PUT /auth/settings` detects that `main_currency` has actually changed (old value != new value), trigger a recalculation modelled after Firefly III's `correction:recalculate-pc-amounts`:
+
+1. **Idempotent, batched, restartable.** The job can be re-run safely; a partial run can be resumed. Implemented as an async background task (or a synchronous operation for small data volumes — see "execution model" below).
+2. **`amount_home_cents` on all non-deleted `expense_transactions`** — per-row lookup of the historical rate for that transaction's `date` via the shared `get_rate` helper, honouring any `exchange_rate` override already stored on the row (user overrides must not be clobbered). If `account.currency_code == new main_currency`, set `amount_home_cents = amount_cents` directly. Cross-currency transfer pairs stay zero-sum by re-applying the dominant-side rule (see [api-design-principles.md §12](api-design-principles.md)).
+3. **`current_balance_home_cents` on all non-deleted `expense_bank_accounts`** — recomputed at today's rate against the new home currency.
+4. **`exchange_rate` on pending inbox items** (`status = 1`) — recomputed to reflect the new home currency so future promotions compute correctly.
+5. **Single `activity_log` entry** — `resource_type = 'user_settings'`, `action = 2` (updated), recording `main_currency` changed from X to Y plus the job's summary (rows touched, duration, outcome). Individual transaction updates are **not** logged — bulk recalculation is a single audit event, not thousands.
+6. **Never retroactively mutate rates or re-derive them from current `exchange_rates`** unless the `exchange_rate` on the row is null or the transaction's date was explicitly edited. User manual overrides survive.
+
+### Execution model
+
+**Phase 1 reality:** transaction volume is low (single user, hundreds to low thousands of rows). A synchronous recalculation inside the `PUT /auth/settings` request is acceptable as long as it fits within the Render request timeout. The response returns only after recalculation completes; the client sees normal synchronous semantics.
+
+**Phase 2 / multi-tenant:** when customer transaction counts grow, migrate to an async job model. The `PUT /auth/settings` request enqueues the job, the response includes a `recalculation_job_id`, and a new `GET /auth/recalculation_jobs/{id}` endpoint lets the client poll for completion. Do NOT introduce this complexity until it's needed — ship the synchronous version first.
+
+### Verify
+
+- Set `main_currency = USD`. Create a few transactions on a PEN account. Switch `main_currency = PEN`. Confirm all `amount_home_cents` values are recomputed. Confirm `current_balance_home_cents` on accounts is recomputed at today's rate. Confirm pending inbox items' `exchange_rate` is updated. Confirm exactly one `activity_log` entry was written.
+- Re-run the job (trigger another `PUT /auth/settings` that toggles back). Confirm it completes cleanly and produces identical results on repeated runs (idempotence).
+- Create a cross-currency transfer in PEN main. Switch to USD main. Confirm the transfer still nets to zero in the new home currency.
 
 **Commit:** `feat: home currency recalculation on main_currency change`
 
