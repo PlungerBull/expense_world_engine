@@ -29,5 +29,18 @@ GET /v1/exchange-rates?target=PEN&base=USD
 Should return the rate just inserted, not 404.
 
 **Not in scope here:**
-- Backfilling historical rates for transactions that were written before the cron started running — that's Step 9.1 (`Home Currency Recalculation`).
 - Adopting the whole service into `render.yaml` / Blueprint. The web service is currently dashboard-managed; adding a Blueprint would conflict. Keep everything dashboard-managed for now.
+
+---
+
+## Backfill historical exchange rates (manual, user-owned)
+
+**What:** Populate `exchange_rates` with per-date rows going back to the earliest transaction date in the system, so historical transactions can be re-converted with accurate point-in-time rates.
+
+**Why:** The daily cron only inserts `/latest` going forward. Any historical transaction whose `amount_home_cents` was computed with the `1.0` fallback (or with a mismatched date) will stay wrong until the historical rates exist in the table and are used to recalculate.
+
+**Owner:** User (PlungerBull) will handle this directly against the database — not via engine code.
+
+**When:** at the very end of engine work, after all of Step 9 (Parts A + B) and Step 9.1 ship, and immediately before moving on to the CLI repo. This is the last cleanup task for the engine.
+
+**Reference:** Frankfurter supports per-date queries — `https://api.frankfurter.app/YYYY-MM-DD?from=USD&to=PEN` returns the closing rate for that specific date. Any backfill script or manual run should use this and insert rows canonically as `(base_currency='USD', target_currency=<X>, rate_date=<date>, rate=<rate>)`, matching the daily cron's format.
