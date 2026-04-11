@@ -6,22 +6,15 @@ from fastapi import APIRouter
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import AppError
 from app.helpers.exchange_rate import get_rate
-from app.helpers.monthly_report import compute_month_bounds, compute_month_flow
+from app.helpers.monthly_report import (
+    compute_month_bounds,
+    compute_month_flow,
+    get_user_report_settings,
+)
 from app.schemas.dashboard import DashboardResponse
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
-
-
-async def _get_user_settings(conn: asyncpg.Connection, user_id: str) -> dict:
-    row = await conn.fetchrow(
-        "SELECT main_currency, display_timezone FROM user_settings WHERE user_id = $1",
-        user_id,
-    )
-    if row is None:
-        raise AppError(409, "SETTINGS_MISSING", "User settings not found. Call /auth/bootstrap first.")
-    return {"main_currency": row["main_currency"], "display_timezone": row["display_timezone"]}
 
 
 async def _load_accounts(
@@ -83,7 +76,7 @@ async def _load_accounts(
 @router.get("")
 async def get_dashboard(auth_user: CurrentUser):
     async with db.pool.acquire() as conn:
-        settings = await _get_user_settings(conn, auth_user.id)
+        settings = await get_user_report_settings(conn, auth_user.id)
         year, month, start_utc, end_utc = compute_month_bounds(settings["display_timezone"])
 
         bank_accounts = await _load_accounts(

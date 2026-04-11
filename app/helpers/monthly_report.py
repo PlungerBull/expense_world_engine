@@ -22,6 +22,22 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from app.errors import AppError
+
+
+async def get_user_report_settings(
+    conn: asyncpg.Connection,
+    user_id: str,
+) -> dict:
+    """Load main_currency + display_timezone for a user, or 409 if they haven't bootstrapped."""
+    row = await conn.fetchrow(
+        "SELECT main_currency, display_timezone FROM user_settings WHERE user_id = $1",
+        user_id,
+    )
+    if row is None:
+        raise AppError(409, "SETTINGS_MISSING", "User settings not found. Call /auth/bootstrap first.")
+    return {"main_currency": row["main_currency"], "display_timezone": row["display_timezone"]}
+
 
 def compute_month_bounds(
     display_timezone: str,

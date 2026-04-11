@@ -16,6 +16,7 @@ from app.routers import (
     health,
     inbox,
     reconciliations,
+    reports,
     transactions,
 )
 
@@ -46,4 +47,5 @@ app.include_router(exchange_rates.router, prefix="/v1")
 app.include_router(hashtags.router, prefix="/v1")
 app.include_router(inbox.router, prefix="/v1")
 app.include_router(reconciliations.router, prefix="/v1")
+app.include_router(reports.router, prefix="/v1")
 app.include_router(transactions.router, prefix="/v1")
