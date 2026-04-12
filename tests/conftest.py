@@ -120,6 +120,12 @@ async def _ensure_test_data(conn, data: TestData):
                VALUES ($1, $2, 'Test Inbox', 1.0, 1, now(), now())""",
             data.inbox_id, data.user_id,
         )
+        # Seed exchange rate so get_rate(PEN, USD, ...) works in recalc tests
+        await conn.execute(
+            """INSERT INTO exchange_rates (base_currency, target_currency, rate, rate_date, created_at)
+               VALUES ('USD', 'PEN', 3.75, CURRENT_DATE, now())
+               ON CONFLICT (base_currency, target_currency, rate_date) DO NOTHING""",
+        )
     _test_data_created = True
 
 
@@ -128,6 +134,8 @@ async def _cleanup_test_data(data: TestData):
     conn = await asyncpg.connect(settings.supabase_db_url)
     try:
         async with conn.transaction():
+            await conn.execute("DELETE FROM idempotency_keys WHERE user_id = $1", data.user_id)
+            await conn.execute("DELETE FROM activity_log WHERE user_id = $1", data.user_id)
             await conn.execute("DELETE FROM sync_checkpoints WHERE user_id = $1", data.user_id)
             await conn.execute("DELETE FROM expense_transaction_hashtags WHERE user_id = $1", data.user_id)
             await conn.execute("DELETE FROM expense_transactions WHERE user_id = $1", data.user_id)

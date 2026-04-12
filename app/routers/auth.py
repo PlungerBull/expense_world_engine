@@ -8,6 +8,7 @@ from app.deps import CurrentUser
 from app.errors import not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.idempotency import check_idempotency, store_idempotency
+from app.helpers.recalculate_home_currency import recalculate_home_currency
 from app.schemas.auth import (
     BootstrapRequest,
     BootstrapResponse,
@@ -200,10 +201,20 @@ async def update_settings(
             after_row = await conn.fetchrow(query, *params)
             after = _settings_from_row(after_row)
 
+            # Home-currency recalculation when main_currency actually changes
+            old_currency = before_row["main_currency"]
+            new_currency = after_row["main_currency"]
+            recalc_summary = None
+
+            if old_currency != new_currency:
+                recalc_summary = await recalculate_home_currency(
+                    conn, auth_user.id, new_currency,
+                )
+
             await write_activity_log(
                 conn, auth_user.id, "user_settings", auth_user.id, 2,
                 before_snapshot=before,
-                after_snapshot=after,
+                after_snapshot={**after, "recalculation": recalc_summary} if recalc_summary else after,
             )
 
         await store_idempotency(conn, auth_user.id, x_idempotency_key, after)
