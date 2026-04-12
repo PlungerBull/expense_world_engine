@@ -4,7 +4,7 @@ The single entry point is `run_sync(conn, user_id, client_id, sync_token)` which
 wraps every read and the checkpoint write in one REPEATABLE READ transaction so
 that the snapshot is consistent across all synced tables.
 
-Wire format and design rationale: see plans/virtual-munching-lamport.md.
+Wire format and design rationale: see docs/engine-spec.md §Sync and docs/api-design-principles.md §3.
 """
 from __future__ import annotations
 

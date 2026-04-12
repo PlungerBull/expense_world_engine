@@ -73,8 +73,9 @@ Before writing a new helper, utility, or service function, check if one already 
 | 8 | Reconciliations | ✅ Done |
 | 9 | Sync, Dashboard, Reports, Activity reads, Exchange rates | ✅ Done |
 | 9.1 | Home Currency Recalculation | ✅ Done |
-| 9.5 | Web Dashboard (read-only) | Pending |
-| 10 | Engine complete → Start CLI | Pending |
+| — | **Engine feature-complete. All endpoints shipped + tested.** | ✅ Done |
+| 9.5 | Web Dashboard (read-only) | Pending (separate repo) |
+| 10 | CLI | Pending (separate repo) |
 
 ## Error format
 

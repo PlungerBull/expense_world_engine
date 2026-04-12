@@ -197,7 +197,7 @@ All reconciliation endpoints. Complete/revert logic. Field locking enforcement i
 
 ## Step 9 — Sync + Dashboard + Exchange Rates (Phase 2)
 
-Split into **Part A** (read-side endpoints + exchange rates) and **Part B** (sync), with sync pulled out so it can be designed and executed in isolation. See `plans/` for detailed execution plans.
+Split into **Part A** (read-side endpoints + exchange rates) and **Part B** (sync), with sync pulled out so it can be designed and executed in isolation.
 
 ### Step 9 Part A — Activity, Exchange Rates, Dashboard, Reports ✅ Shipped
 
@@ -225,7 +225,7 @@ Split into **Part A** (read-side endpoints + exchange rates) and **Part B** (syn
 
 ### Step 9 Part B — Sync 🔨 In Progress
 
-Planned and implemented per `~/.claude/plans/virtual-munching-lamport.md`. Design validated against Todoist Sync API v9, YNAB delta requests, Contentful CDA, Lunch Money, TickTick, and Things Cloud — see the plan's "Production Research" section for the side-by-side.
+Design validated against Todoist Sync API v9, YNAB delta requests, Contentful CDA, Lunch Money, TickTick, and Things Cloud. See `docs/api-design-principles.md §3` for the full sync model and `docs/engine-spec.md §Sync` for the wire contract.
 
 6. **`GET /v1/sync`** — delta sync with opaque-UUID `sync_token` and per-client checkpoints via `X-Client-Id` header. Wildcard `*` does full fetch; deltas use `WHERE updated_at > last_sync_at` against every synced table. All reads + the checkpoint write happen inside one Postgres `REPEATABLE READ` transaction for snapshot isolation. Response carries 8 top-level keys (`sync_token`, `accounts`, `categories`, `hashtags`, `inbox`, `transactions`, `reconciliations`, `settings`). Transactions embed `hashtag_ids: [uuid, ...]`; junction table stays internal. Soft-deleted rows flow as tombstones with `deleted_at` set. Schema migration `sql/009_user_settings_sync.sql` adds `version` + `deleted_at` to `user_settings` (closing a documented schema convention gap) and `(user_id, updated_at)` indexes to every synced table for query performance at 1000+ users. Cross-cutting: `DELETE /hashtags/{id}` now bumps `version` + `updated_at` on every transaction whose junction rows it soft-deletes (parent-bump rule, see [api-design-principles.md §3](api-design-principles.md)).
 
@@ -236,9 +236,11 @@ Planned and implemented per `~/.claude/plans/virtual-munching-lamport.md`. Desig
 
 ---
 
-## Step 9.1 — Home Currency Recalculation
+## Step 9.1 — Home Currency Recalculation ✅ Shipped
 
 *Deliverable: changing `main_currency` in settings recalculates all home-currency amounts, idempotently and in batches, via a first-class job.*
+
+**Implementation:** `app/helpers/recalculate_home_currency.py`, wired into `PUT /auth/settings` in `app/routers/auth.py`. Three passes: (1) regular transactions — `get_rate` lookup + recompute, (2) transfer pairs — dominant-side rule reapplication for zero-sum, (3) pending inbox items — `exchange_rate` refresh. Synchronous inside the settings request (Phase 1). Every updated row bumps `version + updated_at` for sync. Single `activity_log` entry includes recalc summary. 6 integration tests in `tests/test_home_currency_recalc.py`. *(commit `003c204`)*
 
 Depends on: Step 6 (transactions exist), Step 9 Part A (historical exchange rates available, background job infrastructure in place).
 
@@ -312,7 +314,9 @@ expense_world_ios      → later, maybe never needed
 
 ## Step 10 — Engine Complete → Start CLI
 
-Phase 1 and 2 of the engine are done and deployed. Now write the `expense_world_cli` spec (fill in `cli-spec.md`) and start building CLI commands against the live engine.
+**Engine is feature-complete.** All endpoints (Steps 0–9.1) are implemented, documented, and tested (26 sync + 6 recalc integration tests). Two operational tasks remain before full production readiness — see [TODO.md](../TODO.md): (1) wire up the Render Cron Job for daily exchange-rate fetching, (2) backfill historical exchange rates.
+
+Next: write the `expense_world_cli` spec (fill in `cli-spec.md`) and start building CLI commands against the live engine.
 
 ---
 

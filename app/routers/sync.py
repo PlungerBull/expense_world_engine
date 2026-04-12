@@ -1,6 +1,6 @@
 """GET /v1/sync — delta sync endpoint.
 
-Wire contract: see plans/virtual-munching-lamport.md and engine-spec.md.
+Wire contract: see docs/engine-spec.md §Sync.
 """
 from typing import Optional
 

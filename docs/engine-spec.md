@@ -96,7 +96,13 @@ Returns the authenticated user's profile and settings in a single response. Retu
 ### `PUT /auth/settings`
 Updates `user_settings`. Partial update — only supplied fields are changed. If no fields are supplied, returns current settings without making changes. Every successful update bumps `version` and `updated_at` so the next `GET /sync` surfaces the change to other devices.
 
-**Special case — `main_currency` change:** If `main_currency` actually changes (old != new), the engine runs a **first-class idempotent recalculation job** that rewrites `amount_home_cents` on every non-deleted `expense_transactions` row using the stored `exchange_rate` where present (respecting user overrides) or looking up the historical rate for each transaction's `date`. `current_balance_home_cents` on all accounts is recomputed at today's rate against the new home currency, and `exchange_rate` on pending inbox items is updated so future promotions compute correctly. Cross-currency transfer pairs stay zero-sum by re-applying the dominant-side rule. A **single** `activity_log` entry records the currency change plus the job's summary (rows touched, outcome) — individual transaction updates are not logged. The recalculation is synchronous in Phase 1 (low volume); a future async variant returns a `recalculation_job_id` the client can poll. See [roadmap.md Step 9.1](../docs/roadmap.md) for the full spec. *(Implemented in Step 9.1. Until then, `main_currency` changes apply to new transactions only; existing `amount_home_cents` values are not retroactively recalculated, and the product UX should prevent or warn on `main_currency` changes.)*
+**Special case — `main_currency` change:** If `main_currency` actually changes (old != new), the engine runs a synchronous recalculation inside the same request that rewrites home-currency amounts across three passes:
+
+1. **Regular transactions** (`transfer_transaction_id IS NULL`): for each row, look up `get_rate(account_currency → new_main_currency, tx.date)`, rewrite `exchange_rate` and `amount_home_cents`.
+2. **Transfer pairs** (`transfer_transaction_id IS NOT NULL`): reapply the dominant-side rule — the leg whose account currency matches the new `main_currency` is dominant (`amount_home_cents = amount_cents`, `exchange_rate = 1.0`); the other leg's `amount_home_cents` is forced to match so the pair nets to zero.
+3. **Pending inbox items** (`status = 1`, `account_id IS NOT NULL`): recompute `exchange_rate` so future promotions use the correct home currency.
+
+`current_balance_home_cents` on accounts does **not** need updating — it is computed at read time, not stored. Every updated transaction row bumps `version + updated_at` so `/sync` surfaces the changes. A **single** `activity_log` entry records the currency change plus the recalculation summary (rows touched per pass). Individual transaction updates are not logged — bulk recalculation is one audit event, not thousands. No-op when `main_currency` doesn't actually change. Synchronous in Phase 1; a future async variant with `recalculation_job_id` polling can be added when volumes require it. See [roadmap.md Step 9.1](../docs/roadmap.md).
 
 ---
 
@@ -250,6 +256,8 @@ Auto-populates `exchange_rate` and computes `amount_home_cents` same as inbox.
 Partial update.
 
 **Field locking:** If the transaction belongs to a completed reconciliation (`reconciliation_id` is set and reconciliation `status = 2`), these fields are read-only: `amount_cents`, `account_id`, `title`, `date`. Attempting to update them returns `422`.
+
+**Transfer edit guard:** If the transaction is part of a transfer pair (`transfer_transaction_id` is set), `amount_cents` and `account_id` are read-only. Attempting to update them returns `422`. Transfers must be deleted and re-created to change amounts or accounts — this prevents the paired sibling from silently going out of sync. Other fields (`title`, `description`, `cleared`, `date`, `category_id`, `hashtag_ids`) remain editable on transfer transactions.
 
 **Date change:** If `date` changes, the engine automatically re-fetches the historical exchange rate for the new date and recalculates `amount_home_cents`. The user's manually set `exchange_rate` is replaced with the historical rate for the new date. (If the user then wants to override it, they can in a follow-up PUT.)
 
