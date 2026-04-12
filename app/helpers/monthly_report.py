@@ -16,7 +16,7 @@ inflow - outflow and is unaffected by internal movement volume.
 for spec-contract reasons but semantically it is "signed net flow through this
 category this month".
 """
-from datetime import date as date_type, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 

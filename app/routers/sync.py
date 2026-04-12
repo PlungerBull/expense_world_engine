@@ -15,11 +15,11 @@ from app.helpers.sync import (
     get_checkpoint_since,
     rotate_checkpoint,
 )
-from app.routers.accounts import _account_from_row
-from app.routers.auth import _settings_from_row
-from app.routers.categories import _category_from_row
-from app.routers.hashtags import _hashtag_from_row
-from app.routers.inbox import _inbox_from_row
+from app.schemas.accounts import account_from_row
+from app.schemas.auth import settings_from_row
+from app.schemas.categories import category_from_row
+from app.schemas.hashtags import hashtag_from_row
+from app.schemas.inbox import inbox_from_row
 from app.schemas.reconciliations import reconciliation_from_row
 from app.schemas.transactions import transaction_from_row
 
@@ -82,11 +82,11 @@ async def sync(
         # them call /dashboard, which is the canonical place for derived values.
         return {
             "sync_token": new_token,
-            "accounts": [_account_from_row(r) for r in deltas["accounts"]],
-            "categories": [_category_from_row(r) for r in deltas["categories"]],
-            "hashtags": [_hashtag_from_row(r) for r in deltas["hashtags"]],
-            "inbox": [_inbox_from_row(r) for r in deltas["inbox"]],
+            "accounts": [account_from_row(r) for r in deltas["accounts"]],
+            "categories": [category_from_row(r) for r in deltas["categories"]],
+            "hashtags": [hashtag_from_row(r) for r in deltas["hashtags"]],
+            "inbox": [inbox_from_row(r) for r in deltas["inbox"]],
             "transactions": [_transaction_with_hashtags(r) for r in deltas["transactions"]],
             "reconciliations": [reconciliation_from_row(r) for r in deltas["reconciliations"]],
-            "settings": _settings_from_row(settings_row) if settings_row else None,
+            "settings": settings_from_row(settings_row) if settings_row else None,
         }

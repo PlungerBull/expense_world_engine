@@ -16,6 +16,7 @@ from datetime import date as date_type, datetime, timezone
 
 import asyncpg
 
+from app.constants import TransferDirection
 from app.helpers.exchange_rate import get_rate
 
 
@@ -25,6 +26,18 @@ async def recalculate_home_currency(
     new_main_currency: str,
 ) -> dict:
     today = datetime.now(timezone.utc).date()
+
+    # Rate cache keyed by (currency, date). Without this, a user with 5,000
+    # transactions that share (say) 20 distinct (currency, date) pairs would
+    # hit the exchange_rates table 5,000 times. With it, at most 20.
+    rate_cache: dict[tuple[str, date_type], float] = {}
+
+    async def _cached_rate(currency: str, as_of: date_type) -> float:
+        cache_key = (currency, as_of)
+        if cache_key not in rate_cache:
+            result = await get_rate(conn, currency, new_main_currency, as_of)
+            rate_cache[cache_key] = result[0] if result else 1.0
+        return rate_cache[cache_key]
 
     # ── Pass 1: Regular transactions (non-transfer) ──────────────────────
     regular = await conn.fetch(
@@ -44,8 +57,7 @@ async def recalculate_home_currency(
         currency = row["currency_code"]
         tx_date = row["date"].date() if isinstance(row["date"], datetime) else row["date"]
 
-        result = await get_rate(conn, currency, new_main_currency, tx_date)
-        rate = result[0] if result else 1.0
+        rate = await _cached_rate(currency, tx_date)
 
         new_home = round(row["amount_cents"] * rate)
         await conn.execute(
@@ -104,7 +116,7 @@ async def recalculate_home_currency(
             dom, non_dom = leg_b, leg_a
         else:
             # 3-currency case: debit side dominant via market rate
-            if leg_a["transfer_direction"] == 1:
+            if leg_a["transfer_direction"] == TransferDirection.DEBIT:
                 dom, non_dom = leg_a, leg_b
             else:
                 dom, non_dom = leg_b, leg_a
@@ -114,8 +126,7 @@ async def recalculate_home_currency(
             dom_rate = 1.0
             dom_home = dom["amount_cents"]
         else:
-            result = await get_rate(conn, dom_currency, new_main_currency, tx_date)
-            dom_rate = result[0] if result else 1.0
+            dom_rate = await _cached_rate(dom_currency, tx_date)
             dom_home = round(dom["amount_cents"] * dom_rate)
 
         non_dom_home = dom_home
@@ -164,8 +175,7 @@ async def recalculate_home_currency(
         else:
             ix_date = today
 
-        result = await get_rate(conn, currency, new_main_currency, ix_date)
-        rate = result[0] if result else 1.0
+        rate = await _cached_rate(currency, ix_date)
 
         await conn.execute(
             """

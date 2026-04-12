@@ -3,8 +3,10 @@ from typing import Optional
 
 import asyncpg
 
+from app.constants import ActivityAction, TransactionType, TransferDirection
 from app.errors import validation_error
 from app.helpers.activity_log import write_activity_log
+from app.helpers.balance import apply_balance
 from app.helpers.categories import ensure_system_category
 from app.helpers.exchange_rate import lookup_exchange_rate
 from app.schemas.transactions import transaction_from_row
@@ -101,10 +103,10 @@ async def create_transfer_pair(
     # 5. Normalize amounts and determine transfer_direction
     # ------------------------------------------------------------------
     primary_abs = abs(primary_amount_cents)
-    primary_direction = 1 if primary_amount_cents < 0 else 2  # 1=debit, 2=credit
+    primary_direction = TransferDirection.DEBIT if primary_amount_cents < 0 else TransferDirection.CREDIT
 
     sibling_abs = abs(transfer_amount_cents)
-    sibling_direction = 1 if transfer_amount_cents < 0 else 2
+    sibling_direction = TransferDirection.DEBIT if transfer_amount_cents < 0 else TransferDirection.CREDIT
 
     # ------------------------------------------------------------------
     # 6. Exchange rates and amount_home_cents (dominant-side rule)
@@ -151,7 +153,7 @@ async def create_transfer_pair(
     else:
         # Neither side is main currency — rare 3-currency case.
         # Use market rate on the debit side, force the credit side to match.
-        if primary_direction == 1:  # primary is the debit side
+        if primary_direction == TransferDirection.DEBIT:  # primary is the debit side
             primary_exchange_rate = await lookup_exchange_rate(
                 conn, primary_account_id, primary_date, user_id,
             )
@@ -236,32 +238,24 @@ async def create_transfer_pair(
     )
 
     # ------------------------------------------------------------------
-    # 10. Update balances on both accounts
+    # 10. Update balances on both accounts via the shared helper so the
+    #     transfer-direction sign matrix lives in one place (helpers/balance.py).
     # ------------------------------------------------------------------
-    primary_delta = -primary_abs if primary_direction == 1 else primary_abs
-    await conn.execute(
-        """
-        UPDATE expense_bank_accounts
-        SET current_balance_cents = current_balance_cents + $1,
-            updated_at = now(), version = version + 1
-        WHERE id = $2 AND user_id = $3
-        """,
-        primary_delta,
+    await apply_balance(
+        conn,
         primary_account_id,
         user_id,
+        primary_abs,
+        TransactionType.TRANSFER,
+        transfer_direction=primary_direction,
     )
-
-    sibling_delta = -sibling_abs if sibling_direction == 1 else sibling_abs
-    await conn.execute(
-        """
-        UPDATE expense_bank_accounts
-        SET current_balance_cents = current_balance_cents + $1,
-            updated_at = now(), version = version + 1
-        WHERE id = $2 AND user_id = $3
-        """,
-        sibling_delta,
+    await apply_balance(
+        conn,
         transfer_account_id,
         user_id,
+        sibling_abs,
+        TransactionType.TRANSFER,
+        transfer_direction=sibling_direction,
     )
 
     # ------------------------------------------------------------------
@@ -274,11 +268,11 @@ async def create_transfer_pair(
     # 12. Activity logs — one per transaction
     # ------------------------------------------------------------------
     await write_activity_log(
-        conn, user_id, "transaction", primary_id, 1,
+        conn, user_id, "transaction", primary_id, ActivityAction.CREATED,
         after_snapshot=primary_response,
     )
     await write_activity_log(
-        conn, user_id, "transaction", sibling_id, 1,
+        conn, user_id, "transaction", sibling_id, ActivityAction.CREATED,
         after_snapshot=sibling_response,
     )
 

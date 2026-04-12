@@ -6,7 +6,7 @@ from fastapi import APIRouter
 
 from app import db
 from app.deps import CurrentUser
-from app.helpers.exchange_rate import get_rate
+from app.helpers.exchange_rate import batch_get_rates
 from app.helpers.monthly_report import (
     compute_month_bounds,
     compute_month_flow,
@@ -46,19 +46,26 @@ async def _load_accounts(
     rows = await conn.fetch(query, user_id)
     today = datetime.now(timezone.utc).date()
 
+    # Batch rate resolution — previously this loop fired one `get_rate` call
+    # per account, producing an N+1 pattern on the hottest read in the app.
+    # Collecting distinct currencies once and resolving in a single batch
+    # call deduplicates lookups so the DB is hit once per currency, not once
+    # per account.
+    currencies = {row["currency_code"] for row in rows}
+    rate_by_currency = (
+        await batch_get_rates(conn, currencies, main_currency, today)
+        if currencies
+        else {}
+    )
+
     result: list[dict] = []
     for row in rows:
-        home_cents: Optional[int]
-        rate_lookup = await get_rate(
-            conn,
-            from_currency=row["currency_code"],
-            to_currency=main_currency,
-            as_of=today,
+        rate = rate_by_currency.get(row["currency_code"])
+        home_cents: Optional[int] = (
+            round(int(row["current_balance_cents"]) * rate)
+            if rate is not None
+            else None
         )
-        if rate_lookup is None:
-            home_cents = None
-        else:
-            home_cents = round(int(row["current_balance_cents"]) * rate_lookup[0])
 
         result.append(
             {

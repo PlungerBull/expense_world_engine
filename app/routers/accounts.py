@@ -1,3 +1,5 @@
+"""HTTP handlers for /accounts — thin adapters over helpers.accounts."""
+
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -6,53 +8,14 @@ from fastapi.responses import JSONResponse
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import conflict, not_found, validation_error
-from app.helpers.activity_log import write_activity_log
-from app.helpers.exchange_rate import get_rate
+from app.errors import not_found
+from app.helpers import accounts as accounts_service
+from app.helpers.exchange_rate import batch_get_rates
 from app.helpers.idempotency import check_idempotency, store_idempotency
 from app.helpers.pagination import clamp_limit, paginated_response
-from app.schemas.accounts import AccountCreateRequest, AccountResponse, AccountUpdateRequest
+from app.schemas.accounts import AccountCreateRequest, AccountUpdateRequest, account_from_row
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
-
-
-def _account_from_row(row, balance_home_cents: Optional[int] = None) -> dict:
-    return AccountResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
-        name=row["name"],
-        currency_code=row["currency_code"],
-        is_person=row["is_person"],
-        color=row["color"],
-        current_balance_cents=row["current_balance_cents"],
-        current_balance_home_cents=balance_home_cents,
-        is_archived=row["is_archived"],
-        sort_order=row["sort_order"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        version=row["version"],
-        deleted_at=row["deleted_at"],
-    ).model_dump(mode="json")
-
-
-async def _get_home_balance(conn, currency_code: str, balance_cents: int, user_id: str) -> Optional[int]:
-    """Convert balance to home currency. Returns None if no rate available."""
-    settings = await conn.fetchrow(
-        "SELECT main_currency FROM user_settings WHERE user_id = $1", user_id
-    )
-    if settings is None:
-        return None
-
-    result = await get_rate(
-        conn,
-        from_currency=currency_code,
-        to_currency=settings["main_currency"],
-        as_of=datetime.now(timezone.utc).date(),
-    )
-    if result is None:
-        return None
-
-    return round(balance_cents * result[0])
 
 
 @router.get("")
@@ -95,10 +58,37 @@ async def list_accounts(
             offset,
         )
 
+        # Batch home-balance conversion. Previously this loop called
+        # `_get_home_balance` once per account, which itself fired one query
+        # for user_settings and one for the exchange rate — an N+1 pattern
+        # that produced ~2N extra DB round-trips per list request. Now:
+        #   1. Fetch user_settings ONCE outside the loop.
+        #   2. Collect distinct account currencies.
+        #   3. Resolve all rates in one deduplicated batch.
+        # The loop becomes a pure in-memory transform.
+        settings_row = await conn.fetchrow(
+            "SELECT main_currency FROM user_settings WHERE user_id = $1",
+            auth_user.id,
+        )
+        main_currency = settings_row["main_currency"] if settings_row else None
+
+        rate_by_currency: dict[str, float] = {}
+        if main_currency and rows:
+            currencies = {row["currency_code"] for row in rows}
+            today = datetime.now(timezone.utc).date()
+            rate_by_currency = await batch_get_rates(
+                conn, currencies, main_currency, today,
+            )
+
         data = []
         for row in rows:
-            home = await _get_home_balance(conn, row["currency_code"], row["current_balance_cents"], auth_user.id)
-            data.append(_account_from_row(row, home))
+            rate = rate_by_currency.get(row["currency_code"])
+            home = (
+                round(row["current_balance_cents"] * rate)
+                if rate is not None
+                else None
+            )
+            data.append(account_from_row(row, home))
 
         return paginated_response(data, total, limit, offset)
 
@@ -114,50 +104,9 @@ async def create_account(
         if cached is not None:
             return JSONResponse(content=cached, status_code=201)
 
-        # Validate currency_code
-        currency = await conn.fetchrow(
-            "SELECT code FROM global_currencies WHERE code = $1", body.currency_code
-        )
-        if currency is None:
-            raise validation_error(
-                "Invalid currency code.",
-                {"currency_code": f"'{body.currency_code}' is not a valid currency code."},
-            )
-
-        # Check uniqueness
-        existing = await conn.fetchrow(
-            """
-            SELECT id FROM expense_bank_accounts
-            WHERE user_id = $1 AND name = $2 AND currency_code = $3 AND deleted_at IS NULL
-            """,
-            auth_user.id,
-            body.name,
-            body.currency_code,
-        )
-        if existing is not None:
-            raise conflict(f"An account named '{body.name}' with currency '{body.currency_code}' already exists.")
-
         async with conn.transaction():
-            row = await conn.fetchrow(
-                """
-                INSERT INTO expense_bank_accounts
-                    (user_id, name, currency_code, color, sort_order, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, now(), now())
-                RETURNING *
-                """,
-                auth_user.id,
-                body.name,
-                body.currency_code,
-                body.color or "#3b82f6",
-                body.sort_order or 0,
-            )
-
-            home = await _get_home_balance(conn, row["currency_code"], row["current_balance_cents"], auth_user.id)
-            response = _account_from_row(row, home)
-
-            await write_activity_log(
-                conn, auth_user.id, "account", str(row["id"]), 1,
-                after_snapshot=response,
+            response = await accounts_service.create_account(
+                conn, auth_user.id, body.name, body.currency_code, body.color, body.sort_order,
             )
 
         await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
@@ -175,8 +124,10 @@ async def get_account(account_id: str, auth_user: CurrentUser):
         if row is None:
             raise not_found("account")
 
-        home = await _get_home_balance(conn, row["currency_code"], row["current_balance_cents"], auth_user.id)
-        return _account_from_row(row, home)
+        home = await accounts_service.get_home_balance(
+            conn, row["currency_code"], row["current_balance_cents"], auth_user.id
+        )
+        return account_from_row(row, home)
 
 
 @router.put("/{account_id}")
@@ -188,103 +139,18 @@ async def update_account(
 ):
     fields = body.model_dump(exclude_none=True)
 
-    # Reject currency_code changes
-    if "currency_code" in fields:
-        raise validation_error(
-            "currency_code is immutable after creation.",
-            {"currency_code": "Cannot be changed after account creation."},
-        )
-
     async with db.pool.acquire() as conn:
         cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
         if cached is not None:
             return JSONResponse(content=cached)
 
-        # Empty update — return current
-        if not fields:
-            row = await conn.fetchrow(
-                "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-                account_id,
-                auth_user.id,
-            )
-            if row is None:
-                raise not_found("account")
-            home = await _get_home_balance(conn, row["currency_code"], row["current_balance_cents"], auth_user.id)
-            return _account_from_row(row, home)
-
-        # Check name uniqueness if name is changing
-        if "name" in fields:
-            existing = await conn.fetchrow(
-                """
-                SELECT id FROM expense_bank_accounts
-                WHERE user_id = $1 AND name = $2 AND id != $3 AND deleted_at IS NULL
-                """,
-                auth_user.id,
-                fields["name"],
-                account_id,
-            )
-            if existing is not None:
-                # Need currency to check full uniqueness
-                current = await conn.fetchrow(
-                    "SELECT currency_code FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
-                    account_id,
-                    auth_user.id,
-                )
-                if current:
-                    dup = await conn.fetchrow(
-                        """
-                        SELECT id FROM expense_bank_accounts
-                        WHERE user_id = $1 AND name = $2 AND currency_code = $3 AND id != $4 AND deleted_at IS NULL
-                        """,
-                        auth_user.id,
-                        fields["name"],
-                        current["currency_code"],
-                        account_id,
-                    )
-                    if dup is not None:
-                        raise conflict(f"An account named '{fields['name']}' with this currency already exists.")
-
         async with conn.transaction():
-            before_row = await conn.fetchrow(
-                "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-                account_id,
-                auth_user.id,
-            )
-            if before_row is None:
-                raise not_found("account")
-
-            home_before = await _get_home_balance(conn, before_row["currency_code"], before_row["current_balance_cents"], auth_user.id)
-            before = _account_from_row(before_row, home_before)
-
-            set_clauses = []
-            params = [account_id, auth_user.id]
-            for i, (key, value) in enumerate(fields.items(), start=3):
-                set_clauses.append(f"{key} = ${i}")
-                params.append(value)
-            set_clauses.append("updated_at = now()")
-            set_clauses.append("version = version + 1")
-
-            query = f"""
-                UPDATE expense_bank_accounts
-                SET {', '.join(set_clauses)}
-                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-                RETURNING *
-            """
-            after_row = await conn.fetchrow(query, *params)
-            if after_row is None:
-                raise not_found("account")
-
-            home_after = await _get_home_balance(conn, after_row["currency_code"], after_row["current_balance_cents"], auth_user.id)
-            after = _account_from_row(after_row, home_after)
-
-            await write_activity_log(
-                conn, auth_user.id, "account", account_id, 2,
-                before_snapshot=before,
-                after_snapshot=after,
+            response = await accounts_service.update_account(
+                conn, auth_user.id, account_id, fields,
             )
 
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, after)
-        return after
+        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
+        return response
 
 
 @router.delete("/{account_id}")
@@ -298,52 +164,13 @@ async def delete_account(
         if cached is not None:
             return JSONResponse(content=cached)
 
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            account_id,
-            auth_user.id,
-        )
-        if row is None:
-            raise not_found("account")
-
-        # Check for active transactions
-        has_txns = await conn.fetchval(
-            """
-            SELECT 1 FROM expense_transactions
-            WHERE account_id = $1 AND user_id = $2 AND deleted_at IS NULL
-            LIMIT 1
-            """,
-            account_id,
-            auth_user.id,
-        )
-        if has_txns:
-            raise conflict("Account has active transactions. Archive instead.")
-
         async with conn.transaction():
-            home = await _get_home_balance(conn, row["currency_code"], row["current_balance_cents"], auth_user.id)
-            before = _account_from_row(row, home)
-
-            after_row = await conn.fetchrow(
-                """
-                UPDATE expense_bank_accounts
-                SET deleted_at = now(), updated_at = now(), version = version + 1
-                WHERE id = $1 AND user_id = $2
-                RETURNING *
-                """,
-                account_id,
-                auth_user.id,
-            )
-            home_after = await _get_home_balance(conn, after_row["currency_code"], after_row["current_balance_cents"], auth_user.id)
-            after = _account_from_row(after_row, home_after)
-
-            await write_activity_log(
-                conn, auth_user.id, "account", account_id, 3,
-                before_snapshot=before,
-                after_snapshot=after,
+            response = await accounts_service.delete_account(
+                conn, auth_user.id, account_id,
             )
 
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, after)
-        return after
+        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
+        return response
 
 
 @router.post("/{account_id}/archive")
@@ -358,36 +185,9 @@ async def archive_account(
             return JSONResponse(content=cached)
 
         async with conn.transaction():
-            before_row = await conn.fetchrow(
-                "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-                account_id,
-                auth_user.id,
-            )
-            if before_row is None:
-                raise not_found("account")
-
-            home_before = await _get_home_balance(conn, before_row["currency_code"], before_row["current_balance_cents"], auth_user.id)
-            before = _account_from_row(before_row, home_before)
-
-            after_row = await conn.fetchrow(
-                """
-                UPDATE expense_bank_accounts
-                SET is_archived = true, updated_at = now(), version = version + 1
-                WHERE id = $1 AND user_id = $2
-                RETURNING *
-                """,
-                account_id,
-                auth_user.id,
+            response = await accounts_service.archive_account(
+                conn, auth_user.id, account_id,
             )
 
-            home_after = await _get_home_balance(conn, after_row["currency_code"], after_row["current_balance_cents"], auth_user.id)
-            after = _account_from_row(after_row, home_after)
-
-            await write_activity_log(
-                conn, auth_user.id, "account", account_id, 2,
-                before_snapshot=before,
-                after_snapshot=after,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, after)
-        return after
+        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
+        return response

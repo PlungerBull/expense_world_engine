@@ -1,16 +1,50 @@
+"""Exchange rate lookups with an in-process TTL cache.
+
+The cache is per-worker (no Redis). At 10K concurrent users this is
+acceptable because rates change at most once per day, so a 1-hour TTL
+means each worker hits the DB at most once per hour per distinct
+(from, to, date) tuple. If you scale horizontally across N Render
+dynos, each dyno maintains its own cache; worst case is N DB hits
+per hour per rate instead of one.
+
+Negative results (no rate available) are also cached — otherwise a
+missing rate would be re-queried on every call. Eviction is lazy:
+expired entries are deleted on next access.
+
+Cache sizing: for realistic workloads (users typically have 1-3
+currencies and care about recent dates), the cache stays well under
+a few thousand entries (<1MB). No LRU cap is enforced today. If
+the cache grows beyond ~10K entries in practice, an LRU cap should
+be considered.
+"""
 from datetime import date as date_type, datetime
+import time
 from typing import Optional
 
 import asyncpg
 
 
-async def get_rate(
+_RATE_CACHE_TTL_SECONDS = 3600  # 1 hour
+
+_RateResult = Optional[tuple[float, date_type]]
+_RATE_CACHE: dict[tuple[str, str, date_type], tuple[_RateResult, float]] = {}
+
+
+def clear_rate_cache() -> None:
+    """Empty the in-process rate cache. Test helper."""
+    _RATE_CACHE.clear()
+
+
+async def _fetch_rate_from_db(
     conn: asyncpg.Connection,
     from_currency: str,
     to_currency: str,
     as_of: date_type,
-) -> Optional[tuple[float, date_type]]:
-    """Return (rate, actual_rate_date) to convert `from_currency` → `to_currency` as of `as_of`.
+) -> _RateResult:
+    """Execute the actual SQL rate lookup with no caching.
+
+    Called by ``get_rate`` on cache miss. Input currencies are already
+    upper-cased by the caller.
 
     Exchange rates are stored canonically as USD-based rows:
       (base_currency='USD', target_currency=<X>, rate = units of X per 1 USD).
@@ -24,9 +58,6 @@ async def get_rate(
 
     Returns None if any required rate row is missing. Callers decide the fallback.
     """
-    from_currency = from_currency.upper()
-    to_currency = to_currency.upper()
-
     if from_currency == to_currency:
         return (1.0, as_of)
 
@@ -87,6 +118,71 @@ async def get_rate(
     if row is None or float(row["from_rate"]) == 0.0:
         return None
     return (float(row["to_rate"]) / float(row["from_rate"]), row["rate_date"])
+
+
+async def get_rate(
+    conn: asyncpg.Connection,
+    from_currency: str,
+    to_currency: str,
+    as_of: date_type,
+) -> _RateResult:
+    """Return (rate, actual_rate_date) to convert `from_currency` → `to_currency` as of `as_of`.
+
+    Cached: see module docstring. Callers do not need to think about
+    the cache — it's transparent, per-worker, and self-evicting. Both
+    hits and negative results (None) are cached for the same TTL.
+
+    Returns None if any required rate row is missing. Callers decide
+    the fallback.
+    """
+    from_currency = from_currency.upper()
+    to_currency = to_currency.upper()
+
+    cache_key = (from_currency, to_currency, as_of)
+    now = time.monotonic()
+
+    cached = _RATE_CACHE.get(cache_key)
+    if cached is not None:
+        value, expires_at = cached
+        if now < expires_at:
+            return value
+        # Expired — drop and fall through to the real lookup.
+        del _RATE_CACHE[cache_key]
+
+    result = await _fetch_rate_from_db(conn, from_currency, to_currency, as_of)
+    _RATE_CACHE[cache_key] = (result, now + _RATE_CACHE_TTL_SECONDS)
+    return result
+
+
+async def batch_get_rates(
+    conn: asyncpg.Connection,
+    from_currencies: set[str],
+    to_currency: str,
+    as_of: date_type,
+) -> dict[str, float]:
+    """Resolve exchange rates for multiple source currencies to one target.
+
+    Returns a ``{from_currency: rate}`` mapping. Currencies with no available
+    rate are simply absent from the result (callers should treat them as None).
+
+    This helper is what callers should use when they need rates for several
+    accounts/rows at once — it deduplicates lookups so the DB is hit once per
+    *distinct* currency rather than once per row. Callers that still loop and
+    call ``get_rate`` row-by-row will hit an N+1 pattern.
+
+    Implementation note: this currently calls ``get_rate`` once per distinct
+    currency rather than issuing a single combined SQL query. That still
+    eliminates the N+1 at the caller level (which was the hot path), and
+    preserves ``get_rate``'s three-path conversion logic (same-currency,
+    USD involvement, cross-rate). A true single-query version is possible
+    but requires rewriting the SQL for all three paths.
+    """
+    result: dict[str, float] = {}
+    for currency in set(from_currencies):
+        lookup = await get_rate(conn, currency, to_currency, as_of)
+        if lookup is not None:
+            result[currency] = lookup[0]
+    return result
 
 
 async def lookup_exchange_rate(

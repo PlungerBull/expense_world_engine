@@ -3,6 +3,8 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from app.schemas.transactions import TransactionResponse
+
 
 class ReconciliationCreateRequest(BaseModel):
     account_id: str
@@ -53,3 +55,13 @@ def reconciliation_from_row(row) -> dict:
         version=row["version"],
         deleted_at=row["deleted_at"],
     ).model_dump(mode="json")
+
+
+class ReconciliationDetailResponse(ReconciliationResponse):
+    """Reconciliation plus its assigned transactions — returned by GET /reconciliations/{id}.
+
+    Validated via a proper Pydantic schema so the response shape is documented
+    in OpenAPI and every field follows null-over-omission semantics.
+    """
+    transactions: list[TransactionResponse]
+    transactions_truncated: bool  # True if the transactions list was capped

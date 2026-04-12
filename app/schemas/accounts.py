@@ -33,3 +33,22 @@ class AccountResponse(BaseModel):
     updated_at: datetime
     version: int
     deleted_at: Optional[datetime] = None
+
+
+def account_from_row(row, balance_home_cents: Optional[int] = None) -> dict:
+    return AccountResponse(
+        id=str(row["id"]),
+        user_id=str(row["user_id"]),
+        name=row["name"],
+        currency_code=row["currency_code"],
+        is_person=row["is_person"],
+        color=row["color"],
+        current_balance_cents=row["current_balance_cents"],
+        current_balance_home_cents=balance_home_cents,
+        is_archived=row["is_archived"],
+        sort_order=row["sort_order"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        version=row["version"],
+        deleted_at=row["deleted_at"],
+    ).model_dump(mode="json")
