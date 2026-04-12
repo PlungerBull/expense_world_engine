@@ -71,7 +71,7 @@ Before writing a new helper, utility, or service function, check if one already 
 | 7 | Transfers | ✅ Done |
 | — | **Phase 1 complete. Deployed to Render.** | ✅ Done |
 | 8 | Reconciliations | ✅ Done |
-| 9 | Sync, Dashboard, Reports, Activity reads, Exchange rates | 🔨 Next |
+| 9 | Sync, Dashboard, Reports, Activity reads, Exchange rates | ✅ Done |
 | 9.1 | Home Currency Recalculation | Pending |
 | 9.5 | Web Dashboard (read-only) | Pending |
 | 10 | Engine complete → Start CLI | Pending |
