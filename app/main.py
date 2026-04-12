@@ -17,6 +17,7 @@ from app.routers import (
     inbox,
     reconciliations,
     reports,
+    sync,
     transactions,
 )
 
@@ -48,4 +49,5 @@ app.include_router(hashtags.router, prefix="/v1")
 app.include_router(inbox.router, prefix="/v1")
 app.include_router(reconciliations.router, prefix="/v1")
 app.include_router(reports.router, prefix="/v1")
+app.include_router(sync.router, prefix="/v1")
 app.include_router(transactions.router, prefix="/v1")

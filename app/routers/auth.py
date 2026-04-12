@@ -41,8 +41,10 @@ def _settings_from_row(row) -> dict:
         sidebar_show_bank_accounts=row["sidebar_show_bank_accounts"],
         sidebar_show_people=row["sidebar_show_people"],
         sidebar_show_categories=row["sidebar_show_categories"],
+        version=row["version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        deleted_at=row["deleted_at"],
     ).model_dump(mode="json")
 
 
@@ -191,6 +193,7 @@ async def update_settings(
             for i, (key, value) in enumerate(fields.items(), start=2):
                 set_clauses.append(f"{key} = ${i}")
                 params.append(value)
+            set_clauses.append("version = version + 1")
             set_clauses.append("updated_at = now()")
 
             query = f"UPDATE user_settings SET {', '.join(set_clauses)} WHERE user_id = $1 RETURNING *"

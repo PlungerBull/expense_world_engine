@@ -82,7 +82,13 @@ user_settings
   - sidebar_show_categories        boolean, NOT NULL, default true
   - created_at                     timestamptz, NOT NULL, default now()
   - updated_at                     timestamptz, NOT NULL, default now()
+  - version                        integer, NOT NULL, default 1
+                                   — bumped on every PUT /auth/settings update
+  - deleted_at                     timestamptz, NULL
+                                   — present for sync uniformity; always NULL in practice (settings can't be deleted)
 ```
+
+`user_settings` is fully sync-capable and appears in `GET /sync` responses as a singleton `settings` object.
 
 **Timezone architecture:** All timestamps stored in UTC. `display_timezone` is the IANA string used for all "today" calculations, date boundaries, and overdue detection. Set to device timezone on first launch. Conversion to local time always happens at the presentation layer.
 
@@ -404,6 +410,8 @@ expense_hashtags
 Junction table. Links hashtags to transactions in either the inbox or the ledger. `transaction_source` distinguishes which table `transaction_id` refers to (no formal FK, but always valid).
 
 A transaction with 3 hashtags produces 3 rows in this table — same `transaction_id`, three different `hashtag_id` values.
+
+**Parent version-bump rule (sync correctness):** any mutation to a junction row (insert, update, soft-delete) must, in the same DB transaction, also bump `version` and `updated_at` on the parent `expense_transactions` row. This is the bridge between junction-table storage and the embedded `hashtag_ids` array on the wire — without it, a hashtag-only edit would leave the parent transaction's `updated_at` stale and `GET /sync` would miss the change. The `DELETE /hashtags/{id}` cascade also bumps every transaction whose junction rows it soft-deletes. See [api-design-principles.md §3](api-design-principles.md) for the full sync model and [§N](api-design-principles.md) for the junction-vs-wire-format principle.
 
 ```
 expense_transaction_hashtags

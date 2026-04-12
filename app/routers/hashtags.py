@@ -227,16 +227,30 @@ async def delete_hashtag(
         async with conn.transaction():
             before = _hashtag_from_row(row)
 
-            # Soft-delete all junction rows for this hashtag
-            await conn.execute(
+            # Soft-delete all junction rows for this hashtag, capturing the
+            # affected transaction IDs so we can bump their version + updated_at.
+            # Without the parent bump, /sync would miss the hashtag_ids change.
+            affected = await conn.fetch(
                 """
                 UPDATE expense_transaction_hashtags
                 SET deleted_at = now(), updated_at = now(), version = version + 1
                 WHERE hashtag_id = $1 AND user_id = $2 AND deleted_at IS NULL
+                RETURNING transaction_id
                 """,
                 hashtag_id,
                 auth_user.id,
             )
+
+            if affected:
+                await conn.execute(
+                    """
+                    UPDATE expense_transactions
+                    SET updated_at = now(), version = version + 1
+                    WHERE id = ANY($1::uuid[]) AND user_id = $2
+                    """,
+                    list({r["transaction_id"] for r in affected}),
+                    auth_user.id,
+                )
 
             after_row = await conn.fetchrow(
                 """

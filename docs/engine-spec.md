@@ -94,7 +94,7 @@ Called by any client immediately after a successful Supabase sign-in, on every n
 Returns the authenticated user's profile and settings in a single response. Returns `404` if the user or settings row does not exist (edge case — should not occur after bootstrap).
 
 ### `PUT /auth/settings`
-Updates `user_settings`. Partial update — only supplied fields are changed. If no fields are supplied, returns current settings without making changes.
+Updates `user_settings`. Partial update — only supplied fields are changed. If no fields are supplied, returns current settings without making changes. Every successful update bumps `version` and `updated_at` so the next `GET /sync` surfaces the change to other devices.
 
 **Special case — `main_currency` change:** If `main_currency` actually changes (old != new), the engine runs a **first-class idempotent recalculation job** that rewrites `amount_home_cents` on every non-deleted `expense_transactions` row using the stored `exchange_rate` where present (respecting user overrides) or looking up the historical rate for each transaction's `date`. `current_balance_home_cents` on all accounts is recomputed at today's rate against the new home currency, and `exchange_rate` on pending inbox items is updated so future promotions compute correctly. Cross-currency transfer pairs stay zero-sum by re-applying the dominant-side rule. A **single** `activity_log` entry records the currency change plus the job's summary (rows touched, outcome) — individual transaction updates are not logged. The recalculation is synchronous in Phase 1 (low volume); a future async variant returns a `recalculation_job_id` the client can poll. See [roadmap.md Step 9.1](../docs/roadmap.md) for the full spec. *(Implemented in Step 9.1. Until then, `main_currency` changes apply to new transactions only; existing `amount_home_cents` values are not retroactively recalculated, and the product UX should prevent or warn on `main_currency` changes.)*
 
@@ -221,6 +221,8 @@ Returns the newly created `expense_transactions` object.
 
 ## Transactions (Ledger)
 
+**Hashtag wire format:** every transaction returned by the sync endpoint includes a `hashtag_ids: [uuid, ...]` array (sorted ascending) listing every hashtag attached to it. The junction table `expense_transaction_hashtags` is internal storage only — clients never see junction rows. Mutations to a transaction's hashtag set bump the parent transaction's `version` and `updated_at` in the same DB transaction so delta sync always surfaces the change. Individual list/get endpoints return the same `version`/`updated_at` columns but do not currently embed `hashtag_ids` (clients fetching a single transaction can use `?hashtag_id=` filtered listings or the dedicated hashtag endpoints).
+
 ### `GET /transactions`
 Returns all active ledger transactions. Supports filtering:
 - `?account_id=` — filter by account
@@ -336,26 +338,45 @@ Soft-delete. Only allowed if `status = 1` (draft). Returns `409` if status is co
 ## Sync
 
 ### `GET /sync`
-Delta sync endpoint. Returns all records that have changed since the client's last sync.
+
+Delta sync endpoint. Returns every record that has changed since the client's last sync, plus tombstones for soft-deleted records. Single call gives the client everything it needs to bring its local replica up to date.
+
+**Headers:**
+- `Authorization: Bearer <jwt>` — required (standard).
+- `X-Client-Id: <uuid>` — **required**. A stable UUID per device/install, generated client-side on first launch and persisted (Keychain on iOS, localStorage on web, config file on CLI). Each `(user_id, client_id)` pair has its own checkpoint, so multi-device sync is independent — device A's sync doesn't affect device B's bookmark. Mirrors the `X-Idempotency-Key` pattern.
 
 **Query params:**
-- `sync_token=*` — full fetch, returns all active records and creates a new checkpoint.
-- `sync_token=<token>` — delta fetch, returns only records with `version` higher than the checkpoint.
+- `sync_token=*` — full fetch. Returns every non-deleted record for the user, no tombstones, and creates a fresh checkpoint. First-launch behavior.
+- `sync_token=<uuid>` — delta fetch. Returns only records whose `updated_at` is newer than the checkpoint, including soft-deleted rows as tombstones.
 
-**Response shape:**
+The token is opaque to the client — never parse it, just store it and send it back. Server-side the token maps to a `last_sync_at` timestamp in `sync_checkpoints`; the delta query is `WHERE updated_at > last_sync_at`. All reads and the checkpoint write happen inside one Postgres `REPEATABLE READ` transaction so the snapshot is consistent across every table — a concurrent mutation either lands entirely in this sync or entirely in the next.
+
+**Response shape (always 8 top-level keys, null-over-omission):**
 ```json
 {
-  "sync_token": "<new_token>",
-  "accounts": [...],
-  "categories": [...],
-  "hashtags": [...],
-  "inbox": [...],
-  "transactions": [...],
-  "reconciliations": [...]
+  "sync_token": "<new_opaque_uuid>",
+  "accounts": [ /* expense_bank_accounts rows */ ],
+  "categories": [ /* expense_categories rows */ ],
+  "hashtags": [ /* expense_hashtags rows */ ],
+  "inbox": [ /* expense_transaction_inbox rows */ ],
+  "transactions": [ /* expense_transactions rows with hashtag_ids */ ],
+  "reconciliations": [ /* expense_reconciliations rows */ ],
+  "settings": { /* user_settings singleton, or null on delta if unchanged */ }
 }
 ```
 
-Deleted records are included with `deleted_at` set (tombstones). The client removes any record from local state where `deleted_at` is not null.
+**Row shapes:** every row matches the same schema returned by the resource's individual list/get endpoints — `version`, `updated_at`, `deleted_at`, and all native + home-currency fields. `accounts` rows return `current_balance_home_cents: null` in sync responses; clients that need home-currency balances call `/dashboard`, which is the canonical place for derived values.
+
+**Transactions and `hashtag_ids`:** every transaction row in the sync response includes a `hashtag_ids: [uuid, ...]` array (sorted ascending) listing every hashtag attached to that transaction. The junction table `expense_transaction_hashtags` is internal storage and never appears on the wire. When a hashtag is added or removed from a transaction — even with no other field change — the parent transaction's `version` and `updated_at` are bumped in the same DB transaction, so the next delta sync surfaces the change.
+
+**Tombstones:** soft-deleted rows (`deleted_at IS NOT NULL`) appear in delta responses as full row payloads with `deleted_at` set. Client treats any row with non-null `deleted_at` as instruction to remove it from local state. Wildcard fetches never return tombstones (the client has never seen those rows so there's nothing to delete locally).
+
+**`settings`:** the `user_settings` singleton appears as an object on wildcard fetches and on deltas where settings have changed since the checkpoint. On a delta where settings are unchanged, the field is `null`.
+
+**Errors (standard error envelope):**
+- `401` — missing or invalid JWT.
+- `422 VALIDATION_ERROR` — missing or non-UUID `X-Client-Id` header, or missing `sync_token` query param.
+- `422 VALIDATION_ERROR` — `sync_token` is neither `*` nor a known token for this `(user_id, client_id)` pair. Client must retry with `sync_token=*` to recover.
 
 ---
 

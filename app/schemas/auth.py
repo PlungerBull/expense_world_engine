@@ -28,8 +28,10 @@ class UserSettingsResponse(BaseModel):
     sidebar_show_bank_accounts: bool
     sidebar_show_people: bool
     sidebar_show_categories: bool
+    version: int
     created_at: datetime
     updated_at: datetime
+    deleted_at: Optional[datetime]
 
 
 class BootstrapResponse(BaseModel):

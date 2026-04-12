@@ -223,9 +223,11 @@ Split into **Part A** (read-side endpoints + exchange rates) and **Part B** (syn
 - Call `GET /v1/reports/monthly?from_year=2025&from_month=11&to_year=2026&to_month=4` and confirm 6 months returned in order.
 - Create a cross-currency transfer (3750 PEN → 1000 USD with `main_currency = PEN`). Call `GET /v1/dashboard`. Confirm both legs have `amount_home_cents = 375000` (PEN cents) and that `totals.net_home_cents` is unchanged by the transfer.
 
-### Step 9 Part B — Sync ⏳ Pending
+### Step 9 Part B — Sync 🔨 In Progress
 
-6. **`GET /sync`** — delta sync with sync token pattern. Reads `sync_checkpoints`, returns records with `version` higher than checkpoint, includes tombstones for deletes. Uses `X-Client-Id` header to identify the device/install (a stable UUID per client, matching the `X-Idempotency-Key` pattern). Needs its own planning pass before implementation — see Context section at top of the Part A plan in `~/.claude/plans/`.
+Planned and implemented per `~/.claude/plans/virtual-munching-lamport.md`. Design validated against Todoist Sync API v9, YNAB delta requests, Contentful CDA, Lunch Money, TickTick, and Things Cloud — see the plan's "Production Research" section for the side-by-side.
+
+6. **`GET /v1/sync`** — delta sync with opaque-UUID `sync_token` and per-client checkpoints via `X-Client-Id` header. Wildcard `*` does full fetch; deltas use `WHERE updated_at > last_sync_at` against every synced table. All reads + the checkpoint write happen inside one Postgres `REPEATABLE READ` transaction for snapshot isolation. Response carries 8 top-level keys (`sync_token`, `accounts`, `categories`, `hashtags`, `inbox`, `transactions`, `reconciliations`, `settings`). Transactions embed `hashtag_ids: [uuid, ...]`; junction table stays internal. Soft-deleted rows flow as tombstones with `deleted_at` set. Schema migration `sql/009_user_settings_sync.sql` adds `version` + `deleted_at` to `user_settings` (closing a documented schema convention gap) and `(user_id, updated_at)` indexes to every synced table for query performance at 1000+ users. Cross-cutting: `DELETE /hashtags/{id}` now bumps `version` + `updated_at` on every transaction whose junction rows it soft-deletes (parent-bump rule, see [api-design-principles.md §3](api-design-principles.md)).
 
 **Verify Part B:**
 - `GET /v1/sync` with `sync_token=*` returns all active records plus a new token.

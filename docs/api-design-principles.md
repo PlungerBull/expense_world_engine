@@ -32,7 +32,17 @@ If a feature cannot be expressed as an API operation, it is not well-designed. F
 
 ### 3. Sync Token Pattern
 
-Every mutable table carries a `version` integer, incremented on every update. The `sync_checkpoints` table tracks each client's last known sync position. Delta requests return only records with a `version` higher than the client's last checkpoint, plus tombstones for deleted records. Full re-fetch uses a wildcard token. See `lessons-todoist.md §3`.
+Every mutable table carries a `version` integer and `updated_at` timestamp, both bumped on every update. The `sync_checkpoints` table tracks each client's last known sync position via `(user_id, client_id)` — clients send a stable `X-Client-Id` UUID on every `/v1/sync` call so each device gets its own independent checkpoint.
+
+**Token mechanics.** The `sync_token` is an opaque UUID. Server-side, the `sync_checkpoints` row stores the token alongside a `last_sync_at` timestamp captured at sync time. Delta queries are `WHERE updated_at > last_sync_at` against every synced table. Wildcard `sync_token=*` does a full fetch (active rows only, no tombstones, fresh checkpoint). Tokens are opaque to clients — they store the value and send it back on the next sync, never parse it.
+
+**Snapshot isolation.** Every sync read and the checkpoint write happen inside one Postgres `REPEATABLE READ` transaction so all tables are read at the same MVCC snapshot. A concurrent mutation either lands entirely in this sync or entirely in the next, never split across them. Without this, two queries against different tables could observe partially-applied multi-table transactions.
+
+**Parent-bump rule for junction edits.** When a junction row is mutated, the same DB transaction must also bump `version` + `updated_at` on the parent row whose embedded array changes. Concrete instance: editing `expense_transaction_hashtags` for a transaction also bumps the parent `expense_transactions.updated_at`. Without this, a hashtag-only edit would leave the parent stale and `/sync` would miss the change. See `lessons-todoist.md §3`.
+
+### 3a. Junction Tables Are Storage, Not Wire Format
+
+Many-to-many relationships (transaction ↔ hashtag) live in junction tables in the database — the canonical storage with FK integrity, per-link `version`, per-link `deleted_at`, and per-link activity-log entries. **On the wire, the relationship is flattened to an embedded array of IDs on the parent object.** Clients see `transaction.hashtag_ids = [uuid, ...]` and never see junction rows. This matches Todoist's `task.labels` and Lunch Money's `transaction.tags`. The price of denormalizing on the wire while normalizing in storage is the parent-bump rule above (§3): junction-row mutations must bump the parent so delta sync notices.
 
 ### 4. Idempotency Keys
 
