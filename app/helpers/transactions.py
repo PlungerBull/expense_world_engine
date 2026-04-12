@@ -46,6 +46,7 @@ from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance, reverse_balance
 from app.helpers.exchange_rate import lookup_exchange_rate
 from app.helpers.query_builder import dynamic_update
+from app.helpers.validation import validate_active_account, validate_active_category
 from app.schemas.transactions import (
     TransactionBatchRequest,
     TransactionCreateRequest,
@@ -97,19 +98,22 @@ async def _sync_hashtags(
         user_id,
     )
 
-    # Insert new rows
+    # Insert new rows in a single statement. Previously this was a
+    # per-hashtag INSERT loop — a transaction with 50 hashtags fired 50
+    # round-trips. Unnesting an array lets us batch to one round-trip
+    # regardless of count.
     if hashtag_ids:
-        for h_id in hashtag_ids:
-            await conn.execute(
-                """
-                INSERT INTO expense_transaction_hashtags
-                    (transaction_id, transaction_source, hashtag_id, user_id, created_at, updated_at)
-                VALUES ($1, 1, $2, $3, now(), now())
-                """,
-                transaction_id,
-                h_id,
-                user_id,
-            )
+        await conn.execute(
+            """
+            INSERT INTO expense_transaction_hashtags
+                (transaction_id, transaction_source, hashtag_id, user_id, created_at, updated_at)
+            SELECT $1, 1, hashtag_id, $2, now(), now()
+            FROM unnest($3::uuid[]) AS hashtag_id
+            """,
+            transaction_id,
+            user_id,
+            hashtag_ids,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -181,32 +185,14 @@ async def create_transaction(
 
     # ----- Normal (non-transfer) branch -----
 
-    # Validate account_id — active, non-archived
-    account = await conn.fetchrow(
-        """
-        SELECT id, currency_code FROM expense_bank_accounts
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-        """,
-        body.account_id,
-        user_id,
-    )
-    if account is None:
-        raise validation_error(
-            "Transaction validation failed.",
-            {"account_id": "Must reference an active, non-archived account."},
-        )
-
-    # Validate category_id — active
-    category = await conn.fetchrow(
-        "SELECT id FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        body.category_id,
-        user_id,
-    )
-    if category is None:
-        raise validation_error(
-            "Transaction validation failed.",
-            {"category_id": "Must reference an active category."},
-        )
+    # Validate account and category via shared helpers. These raise
+    # AppError on failure, which the router surfaces as a 422 — matches
+    # the prior inline behaviour, just with a consistent top-level
+    # message ("Account validation failed." / "Category validation
+    # failed.") instead of the previous "Transaction validation failed."
+    # The field-level error remains the authoritative signal for clients.
+    await validate_active_account(conn, body.account_id, user_id)
+    await validate_active_category(conn, body.category_id, user_id)
 
     # Infer transaction_type and normalize amount to positive storage form
     transaction_type = infer_transaction_type(body.amount_cents)
@@ -410,33 +396,12 @@ async def update_transaction(
 
     # Validate new account_id if changing
     if "account_id" in fields:
-        account = await conn.fetchrow(
-            """
-            SELECT id FROM expense_bank_accounts
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-            """,
-            fields["account_id"],
-            user_id,
-        )
-        if account is None:
-            raise validation_error(
-                "Account validation failed.",
-                {"account_id": "Must reference an active, non-archived account."},
-            )
+        await validate_active_account(conn, fields["account_id"], user_id)
         needs_balance_update = True
 
     # Validate new category_id if changing
     if "category_id" in fields:
-        category = await conn.fetchrow(
-            "SELECT id FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            fields["category_id"],
-            user_id,
-        )
-        if category is None:
-            raise validation_error(
-                "Category validation failed.",
-                {"category_id": "Must reference an active category."},
-            )
+        await validate_active_category(conn, fields["category_id"], user_id)
 
     # Validate title if changing
     if "title" in fields and (not fields["title"] or not fields["title"].strip()):
@@ -698,7 +663,39 @@ async def create_batch(
 
     now = await conn.fetchval("SELECT now()")
 
-    # Pre-validate all items
+    # Pre-validate all items. Account and category existence checks
+    # are vectorised: instead of firing 2 queries per item (2N total),
+    # we collect the distinct IDs referenced across the whole batch and
+    # validate them in 2 queries. Membership is then checked in memory.
+    # A 100-item batch drops from 200 validation queries to 2.
+    requested_account_ids = {item.account_id for item in body.transactions}
+    requested_category_ids = {item.category_id for item in body.transactions}
+
+    valid_account_rows = await conn.fetch(
+        """
+        SELECT id FROM expense_bank_accounts
+        WHERE id = ANY($1::uuid[])
+          AND user_id = $2
+          AND deleted_at IS NULL
+          AND is_archived = false
+        """,
+        list(requested_account_ids),
+        user_id,
+    )
+    valid_account_ids = {str(r["id"]) for r in valid_account_rows}
+
+    valid_category_rows = await conn.fetch(
+        """
+        SELECT id FROM expense_categories
+        WHERE id = ANY($1::uuid[])
+          AND user_id = $2
+          AND deleted_at IS NULL
+        """,
+        list(requested_category_ids),
+        user_id,
+    )
+    valid_category_ids = {str(r["id"]) for r in valid_category_rows}
+
     all_errors = []
     for i, item in enumerate(body.transactions):
         item_errors: dict = {}
@@ -710,23 +707,10 @@ async def create_batch(
         if item.date > now:
             item_errors["date"] = "Must not be in the future."
 
-        account = await conn.fetchrow(
-            """
-            SELECT id, currency_code FROM expense_bank_accounts
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-            """,
-            item.account_id,
-            user_id,
-        )
-        if account is None:
+        if item.account_id not in valid_account_ids:
             item_errors["account_id"] = "Must reference an active, non-archived account."
 
-        category = await conn.fetchrow(
-            "SELECT id FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            item.category_id,
-            user_id,
-        )
-        if category is None:
+        if item.category_id not in valid_category_ids:
             item_errors["category_id"] = "Must reference an active category."
 
         if item_errors:

@@ -2,6 +2,15 @@
 
 Consolidates account/category validation that was duplicated across
 transactions.py, inbox.py, reconciliations.py, and transfers.py.
+
+These helpers RAISE ``AppError`` on failure. Use them when your flow
+wants to short-circuit on the first bad reference (e.g. single-resource
+create/update endpoints).
+
+If your flow collects multiple field errors into a dict and raises
+once at the end (e.g. ``promote_inbox_item``, ``create_transfer_pair``,
+``create_batch``'s vectorised path), do NOT use these helpers — use
+inline fetches that set ``errors[field]`` without raising.
 """
 
 import asyncpg

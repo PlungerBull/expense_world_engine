@@ -17,6 +17,7 @@ from app.constants import ActivityAction, ReconciliationStatus
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import dynamic_update, soft_delete
+from app.helpers.validation import validate_active_account
 from app.schemas.reconciliations import reconciliation_from_row
 
 
@@ -39,20 +40,8 @@ async def create_reconciliation(
     Raises:
         validation_error: account reference is invalid or name is empty.
     """
-    # Validate account_id
-    account = await conn.fetchrow(
-        """
-        SELECT id FROM expense_bank_accounts
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-        """,
-        account_id,
-        user_id,
-    )
-    if account is None:
-        raise validation_error(
-            "Account validation failed.",
-            {"account_id": "Must reference an active, non-archived account."},
-        )
+    # Validate account_id via shared helper (raises 422 on invalid).
+    await validate_active_account(conn, account_id, user_id)
 
     # Validate name
     if not name or not name.strip():
