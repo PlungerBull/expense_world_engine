@@ -123,3 +123,83 @@ async def _get_balance(account_id: str) -> int:
             "SELECT current_balance_cents FROM expense_bank_accounts WHERE id = $1",
             account_id,
         )
+
+
+@pytest.mark.asyncio
+async def test_replay_preserves_200_status_for_put(client, test_data):
+    """The Sprint 3 refactor moved status code into the idempotency
+    snapshot (the new ``response_status`` column on ``idempotency_keys``).
+    The earlier test above proves replay returns 201 for create. This
+    test proves the same envelope round-trip works for 200 responses on
+    PUTs — guarding against a regression where the helper hardcodes 201
+    or drops the status entirely.
+    """
+    # Create a fresh account so the PUT has a target.
+    account_id = str(uuid.uuid4())
+    create_r = await client.post(
+        "/v1/accounts",
+        json={
+            "id": account_id,
+            "name": f"replay-200-{uuid.uuid4()}",
+            "currency_code": "PEN",
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert create_r.status_code == 201, create_r.text
+
+    update_key = str(uuid.uuid4())
+    new_color = f"#{uuid.uuid4().hex[:6]}"
+
+    try:
+        first = await client.put(
+            f"/v1/accounts/{account_id}",
+            json={"color": new_color},
+            headers={"X-Idempotency-Key": update_key},
+        )
+        assert first.status_code == 200, first.text
+        first_body = first.json()
+
+        # Replay with the same key — must return 200 (NOT 201, NOT some
+        # default), and the body must be byte-for-byte identical to the
+        # first call. Confirms response_status round-trips through the
+        # idempotency snapshot.
+        second = await client.put(
+            f"/v1/accounts/{account_id}",
+            json={"color": new_color},
+            headers={"X-Idempotency-Key": update_key},
+        )
+        assert second.status_code == 200, (
+            f"Replay must preserve 200 status (no per-route drift to 201/default), "
+            f"got {second.status_code}: {second.text}"
+        )
+        assert second.json() == first_body, (
+            "Replayed PUT response diverged from first call's body"
+        )
+
+        # Snapshot in the DB carries the captured status.
+        async with db.pool.acquire() as conn:
+            stored_status = await conn.fetchval(
+                """
+                SELECT response_status FROM idempotency_keys
+                WHERE key = $1 AND user_id = $2
+                """,
+                update_key, test_data.user_id,
+            )
+        assert stored_status == 200, (
+            f"idempotency_keys.response_status should be 200, got {stored_status}"
+        )
+
+    finally:
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM idempotency_keys WHERE user_id = $1 AND key = ANY($2::text[])",
+                test_data.user_id, [update_key],
+            )
+            await conn.execute(
+                "DELETE FROM activity_log WHERE resource_id = $1 AND user_id = $2",
+                account_id, test_data.user_id,
+            )
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
+                account_id, test_data.user_id,
+            )

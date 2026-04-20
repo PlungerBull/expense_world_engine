@@ -166,12 +166,18 @@ idempotency_keys
   - user_id            UUID, NOT NULL, FK → users
   - processed_at       timestamptz, NOT NULL
   - response_snapshot  jsonb, NOT NULL
-                       — stored response returned verbatim on duplicate requests
+                       — stored response BODY returned verbatim on duplicate requests
+  - response_status    smallint, NOT NULL, default 200
+                       — HTTP status code captured alongside the body so replays
+                         reconstruct the full envelope verbatim (no per-route
+                         re-derivation). Added in sql/011.
   - expires_at         timestamptz, NOT NULL
                        — processed_at + 24 hours
   - created_at         timestamptz, NOT NULL, default now()
   - UNIQUE (user_id, key)
 ```
+
+**Concurrency:** Every write handler acquires a transaction-scoped Postgres advisory lock (`pg_advisory_xact_lock`) hashed from `(user_id, key)` as the first statement inside the write transaction. Two concurrent requests with the same key serialize at the DB — the second blocks until the first commits, then reads the stored snapshot and returns it. This closes the check-then-store race that would otherwise allow duplicate side effects.
 
 ---
 
@@ -240,27 +246,38 @@ expense_bank_accounts
 
 ### expense_categories
 
-Flat category list. No hierarchy. No type restriction — any category can be used on any transaction type (expense, income, or transfer). System categories are auto-created, non-deletable, and non-renamable.
+Flat category list. No hierarchy. No type restriction — any category can be used on any transaction type (expense, income, or transfer). System categories are auto-created and non-deletable, but can be renamed by the user (the engine identifies them by `system_key`, not by display name).
 
 ```
 expense_categories
   - id          UUID, primary key, default uuid_generate_v4()
   - user_id     UUID, NOT NULL, FK → users
   - name        text, NOT NULL
+                — display label. Free to rename, including for system categories.
   - color       text, NOT NULL, default '#6b7280'
   - is_system   boolean, NOT NULL, default false
-                — true for @Transfer and @Debt. System categories cannot be deleted or renamed.
+                — true for system-managed categories (@Transfer, @Debt). Cannot be deleted.
+  - system_key  text, nullable
+                — immutable discriminator for system categories ('debt', 'transfer').
+                  NULL for regular user-created categories. The engine looks up
+                  system rows by (user_id, system_key) so display name renames
+                  are safe — added in sql/010 to fix the bug where renaming
+                  '@Debt' caused subsequent transfers to lazily auto-create a
+                  duplicate '@Debt' row.
   - sort_order  integer, NOT NULL, default 0
   - created_at  timestamptz, NOT NULL, default now()
   - updated_at  timestamptz, NOT NULL, default now()
   - version     integer, NOT NULL, default 1
   - deleted_at  timestamptz, nullable
   - UNIQUE (user_id, name)
+  - PARTIAL UNIQUE INDEX (user_id, system_key) WHERE system_key IS NOT NULL AND deleted_at IS NULL
 ```
 
-**System categories (auto-created on first use, `is_system = true`):**
-- `@Transfer` — auto-assigned to both legs of a transfer between the user's own real accounts. Cannot be manually assigned to other transactions.
-- `@Debt` — auto-assigned to transactions on person accounts (both the receivable entry and the settlement). Represents money owed to or from people.
+**System categories (auto-seeded on first use, `is_system = true`):**
+- `@Transfer` (`system_key = 'transfer'`) — auto-assigned to both legs of a transfer between the user's own real accounts. Cannot be manually assigned to other transactions.
+- `@Debt` (`system_key = 'debt'`) — auto-assigned to transactions on person accounts (both the receivable entry and the settlement). Represents money owed to or from people.
+
+Both display names are user-renameable; the engine's transfer pipeline always resolves them by `system_key`.
 
 **Category on transfers:** `category_id` is NOT NULL on all transactions, including transfers. Own-account transfers auto-receive `@Transfer`. Person-account transactions auto-receive `@Debt`. This enforces completeness without requiring the user to choose a category manually for these flows.
 
