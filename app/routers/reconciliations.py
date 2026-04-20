@@ -23,9 +23,6 @@ from app.schemas.transactions import transaction_from_row
 router = APIRouter(prefix="/reconciliations", tags=["reconciliations"])
 
 
-RECONCILIATION_TRANSACTIONS_CAP = 500
-
-
 # ---------------------------------------------------------------------------
 # GET /reconciliations
 # ---------------------------------------------------------------------------
@@ -107,6 +104,8 @@ async def get_reconciliation(
     reconciliation_id: str,
     auth_user: CurrentUser,
     debit_as_negative: bool = Query(False),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -117,25 +116,27 @@ async def get_reconciliation(
         if row is None:
             raise not_found("reconciliation")
 
-        # Fetch cap+1 rows so we can detect truncation without a COUNT query.
-        # For reconciliations larger than RECONCILIATION_TRANSACTIONS_CAP, clients
-        # should fall back to paginated GET /transactions (future: add
-        # reconciliation_id filter) instead of consuming the full set here.
+        transactions_total = await conn.fetchval(
+            """
+            SELECT count(*) FROM expense_transactions
+            WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
+            """,
+            reconciliation_id,
+            auth_user.id,
+        )
+
         txn_rows = await conn.fetch(
             """
             SELECT * FROM expense_transactions
             WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
             ORDER BY date DESC, created_at DESC
-            LIMIT $3
+            LIMIT $3 OFFSET $4
             """,
             reconciliation_id,
             auth_user.id,
-            RECONCILIATION_TRANSACTIONS_CAP + 1,
+            limit,
+            offset,
         )
-
-        transactions_truncated = len(txn_rows) > RECONCILIATION_TRANSACTIONS_CAP
-        if transactions_truncated:
-            txn_rows = txn_rows[:RECONCILIATION_TRANSACTIONS_CAP]
 
         rate_by_id = await reconciliations_service.resolve_home_rates(
             conn, auth_user.id, [row]
@@ -145,10 +146,20 @@ async def get_reconciliation(
         if debit_as_negative:
             txns = [apply_debit_as_negative(t) for t in txns]
 
-        # Validate the combined shape through a proper schema so the response
-        # is documented in OpenAPI and every field follows null-over-omission.
+        # ``transactions_truncated`` stays in the response so existing clients
+        # don't need immediate updates; it now means "there are more rows
+        # beyond this page", derived from the total vs. the current window.
+        transactions_truncated = (offset + len(txn_rows)) < transactions_total
+
         return ReconciliationDetailResponse.model_validate(
-            {**recon, "transactions": txns, "transactions_truncated": transactions_truncated}
+            {
+                **recon,
+                "transactions": txns,
+                "transactions_total": transactions_total,
+                "transactions_limit": limit,
+                "transactions_offset": offset,
+                "transactions_truncated": transactions_truncated,
+            }
         ).model_dump(mode="json")
 
 

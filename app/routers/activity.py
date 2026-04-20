@@ -1,5 +1,6 @@
 import json
 from typing import Any, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Query
 
@@ -29,6 +30,7 @@ def _activity_from_row(row) -> dict:
         before_snapshot=_parse_snapshot(row["before_snapshot"]),
         after_snapshot=_parse_snapshot(row["after_snapshot"]),
         changed_by=str(row["changed_by"]),
+        actor_type=row["actor_type"],
         created_at=row["created_at"],
     ).model_dump(mode="json")
 
@@ -37,7 +39,7 @@ def _activity_from_row(row) -> dict:
 async def list_activity(
     auth_user: CurrentUser,
     resource_type: Optional[str] = Query(None),
-    resource_id: Optional[str] = Query(None),
+    resource_id: Optional[UUID] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
@@ -63,7 +65,8 @@ async def list_activity(
         rows = await conn.fetch(
             f"""
             SELECT id, user_id, resource_type, resource_id, action,
-                   before_snapshot, after_snapshot, changed_by, created_at
+                   before_snapshot, after_snapshot, changed_by, actor_type,
+                   created_at
             FROM activity_log
             WHERE {where}
             ORDER BY created_at DESC

@@ -74,10 +74,19 @@ def reconciliation_from_row(row, rate: Optional[float] = None) -> dict:
 
 
 class ReconciliationDetailResponse(ReconciliationResponse):
-    """Reconciliation plus its assigned transactions — returned by GET /reconciliations/{id}.
+    """Reconciliation plus a paged window of its assigned transactions —
+    returned by GET /reconciliations/{id}.
 
     Validated via a proper Pydantic schema so the response shape is documented
     in OpenAPI and every field follows null-over-omission semantics.
+
+    The embedded list is paginated via ``limit`` / ``offset`` query params
+    on the endpoint; ``transactions_total`` / ``transactions_limit`` /
+    ``transactions_offset`` echo the window and ``transactions_truncated``
+    is True whenever more rows exist beyond the current page.
     """
     transactions: list[TransactionResponse]
-    transactions_truncated: bool  # True if the transactions list was capped
+    transactions_total: int
+    transactions_limit: int
+    transactions_offset: int
+    transactions_truncated: bool

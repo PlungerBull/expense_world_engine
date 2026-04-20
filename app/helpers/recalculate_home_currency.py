@@ -22,12 +22,15 @@ questions. The triggering user_settings entry is the canonical record.
 """
 from __future__ import annotations
 
+import logging
 from datetime import date as date_type, datetime, timezone
 
 import asyncpg
 
 from app.constants import TransferDirection
 from app.helpers.exchange_rate import get_rate
+
+logger = logging.getLogger(__name__)
 
 
 async def recalculate_home_currency(
@@ -101,6 +104,7 @@ async def recalculate_home_currency(
     by_id = {str(r["id"]): r for r in transfers}
     seen = set()
     transfer_count = 0
+    orphan_count = 0
 
     for row in transfers:
         row_id = str(row["id"])
@@ -110,6 +114,17 @@ async def recalculate_home_currency(
         sibling_id = str(row["transfer_transaction_id"])
         sibling = by_id.get(sibling_id)
         if sibling is None:
+            # Orphan leg: the partner was soft-deleted or never created.
+            # Skip — we can't apply the dominant-side rule without both legs —
+            # but count and log so ops can detect the drift. Recalc can't
+            # fix this on its own; the user must resolve the orphan via
+            # the transactions API before the leg's home-cents will update.
+            orphan_count += 1
+            logger.warning(
+                "recalc: orphan transfer leg skipped — user=%s leg=%s sibling=%s",
+                user_id, row_id, sibling_id,
+            )
+            seen.add(row_id)
             continue
 
         seen.add(row_id)
@@ -201,6 +216,7 @@ async def recalculate_home_currency(
     return {
         "regular_transactions": regular_count,
         "transfer_transactions": transfer_count,
+        "orphan_transfer_legs": orphan_count,
         "inbox_items": inbox_count,
         "total": regular_count + transfer_count + inbox_count,
     }

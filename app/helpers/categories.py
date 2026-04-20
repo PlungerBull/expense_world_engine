@@ -21,6 +21,7 @@ from app.constants import (
 from app.errors import conflict, forbidden, not_found
 from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
+from app.helpers.validation import normalize_name
 from app.schemas.categories import category_from_row
 
 
@@ -92,12 +93,15 @@ async def create_category(
     """Validate uniqueness, insert, and log the creation.
 
     Raises:
-        conflict: a non-deleted category with the same name or id already exists.
+        validation_error: name is empty after stripping.
+        conflict: a non-deleted category with the same name (case-insensitive)
+            or id already exists.
     """
+    name = normalize_name(name)
     existing = await conn.fetchrow(
         """
         SELECT id FROM expense_categories
-        WHERE user_id = $1 AND name = $2 AND deleted_at IS NULL
+        WHERE user_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
         """,
         user_id,
         name,
@@ -167,12 +171,14 @@ async def update_category(
 
     before = category_from_row(before_row)
 
-    # Name uniqueness check
+    # Name normalization + case-insensitive uniqueness
     if "name" in fields:
+        fields["name"] = normalize_name(fields["name"])
         dup = await conn.fetchrow(
             """
             SELECT id FROM expense_categories
-            WHERE user_id = $1 AND name = $2 AND id != $3 AND deleted_at IS NULL
+            WHERE user_id = $1 AND LOWER(name) = LOWER($2)
+              AND id != $3 AND deleted_at IS NULL
             """,
             user_id,
             fields["name"],
@@ -283,7 +289,8 @@ async def restore_category(
     dup = await conn.fetchrow(
         """
         SELECT id FROM expense_categories
-        WHERE user_id = $1 AND name = $2 AND id != $3 AND deleted_at IS NULL
+        WHERE user_id = $1 AND LOWER(name) = LOWER($2)
+          AND id != $3 AND deleted_at IS NULL
         """,
         user_id,
         before_row["name"],

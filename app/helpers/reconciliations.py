@@ -167,6 +167,16 @@ async def create_reconciliation(
     return response
 
 
+# Fields that cannot be edited once a reconciliation is COMPLETED.
+# A completed batch is a historical record of the balance the user
+# confirmed at a point in time — changing the range or the starting/
+# ending balances after the fact would rewrite that history. Cosmetic
+# fields (name) stay editable so users can re-label archived batches.
+_LOCKED_FIELDS_WHEN_COMPLETED = frozenset(
+    {"beginning_balance_cents", "ending_balance_cents", "date_start", "date_end"}
+)
+
+
 async def update_reconciliation(
     conn: asyncpg.Connection,
     user_id: str,
@@ -180,7 +190,8 @@ async def update_reconciliation(
 
     Raises:
         not_found: no active reconciliation with that id for this user.
-        validation_error: name is provided but empty after stripping.
+        validation_error: name is provided but empty after stripping, or a
+            locked field is edited while status=COMPLETED.
     """
     # Empty update — return current state unchanged
     if not fields:
@@ -210,6 +221,17 @@ async def update_reconciliation(
     )
     if before_row is None:
         raise not_found("reconciliation")
+
+    # Once COMPLETED, the balance range is frozen. Reject edits to any
+    # locked field with a field-level error so clients can highlight the
+    # offending keys. The user must /revert first.
+    if before_row["status"] == ReconciliationStatus.COMPLETED:
+        attempted = _LOCKED_FIELDS_WHEN_COMPLETED & fields.keys()
+        if attempted:
+            raise validation_error(
+                "Reconciliation is completed. Revert to draft before editing these fields.",
+                {f: "Locked while reconciliation is completed." for f in attempted},
+            )
 
     before_rate = await resolve_home_rates(conn, user_id, [before_row])
     before = reconciliation_from_row(before_row, before_rate.get(str(before_row["id"])))
@@ -256,16 +278,21 @@ async def complete_reconciliation(
         rate_by_id = await resolve_home_rates(conn, user_id, [row])
         return reconciliation_from_row(row, rate_by_id.get(str(row["id"])))
 
-    # Must have at least one assigned transaction
-    txn_count = await conn.fetchval(
+    # Lock and count assigned transactions in one shot. FOR UPDATE
+    # serializes concurrent transaction edits against this status flip —
+    # without it, a transaction could be reassigned away or edited
+    # between the count check and the status update, leaving the client's
+    # view of "what's locked" inconsistent with what actually got locked.
+    assigned_txns = await conn.fetch(
         """
-        SELECT count(*) FROM expense_transactions
+        SELECT id FROM expense_transactions
         WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
+        FOR UPDATE
         """,
         reconciliation_id,
         user_id,
     )
-    if txn_count == 0:
+    if not assigned_txns:
         raise validation_error(
             "Cannot complete reconciliation with no assigned transactions.",
             {"transactions": "At least one transaction must be assigned."},
@@ -280,6 +307,19 @@ async def complete_reconciliation(
         SET status = 2, updated_at = now(), version = version + 1
         WHERE id = $1 AND user_id = $2
         RETURNING *
+        """,
+        reconciliation_id,
+        user_id,
+    )
+
+    # Bump version on every assigned transaction so delta-sync clients
+    # see them flip into the "fields locked" state in the same tick as
+    # the reconciliation itself.
+    await conn.execute(
+        """
+        UPDATE expense_transactions
+        SET version = version + 1, updated_at = now()
+        WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
         """,
         reconciliation_id,
         user_id,
@@ -322,6 +362,19 @@ async def revert_reconciliation(
         rate_by_id = await resolve_home_rates(conn, user_id, [row])
         return reconciliation_from_row(row, rate_by_id.get(str(row["id"])))
 
+    # Mirror complete_reconciliation: lock assigned txns before flipping
+    # state so concurrent edits serialize behind the revert, and sync
+    # clients see the same tick bump the txn versions.
+    await conn.fetch(
+        """
+        SELECT id FROM expense_transactions
+        WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
+        FOR UPDATE
+        """,
+        reconciliation_id,
+        user_id,
+    )
+
     before_rate = await resolve_home_rates(conn, user_id, [row])
     before = reconciliation_from_row(row, before_rate.get(str(row["id"])))
 
@@ -331,6 +384,16 @@ async def revert_reconciliation(
         SET status = 1, updated_at = now(), version = version + 1
         WHERE id = $1 AND user_id = $2
         RETURNING *
+        """,
+        reconciliation_id,
+        user_id,
+    )
+
+    await conn.execute(
+        """
+        UPDATE expense_transactions
+        SET version = version + 1, updated_at = now()
+        WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
         """,
         reconciliation_id,
         user_id,

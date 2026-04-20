@@ -77,6 +77,20 @@ async def validate_active_account(
     return account
 
 
+def normalize_name(name: Optional[str], field: str = "name") -> str:
+    """Strip whitespace and reject empty names with a 422 field error.
+
+    Returns the trimmed name. The caller is responsible for any
+    case-insensitive uniqueness check against storage.
+    """
+    if name is None or not name.strip():
+        raise validation_error(
+            f"{field.capitalize()} must not be empty.",
+            {field: "Must not be empty."},
+        )
+    return name.strip()
+
+
 async def validate_active_category(
     conn: asyncpg.Connection,
     category_id: str,

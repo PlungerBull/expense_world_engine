@@ -6,10 +6,10 @@
     account_id, title, date). This prevents silently rewriting the
     history that produced a "matching" reconciled balance.
 
-  * **Transactions-list cap** — Sprint A1 capped ``GET /reconciliations/{id}``
-    at 500 embedded transactions with a ``transactions_truncated`` flag.
-    The test patches the cap to a small value so it can verify the
-    truncation path without creating 500+ rows.
+  * **Detail endpoint pagination** — ``GET /reconciliations/{id}`` pages
+    the embedded transactions list via ``limit`` / ``offset`` params
+    and echoes ``transactions_total`` plus a ``transactions_truncated``
+    flag so clients know when to page.
 
 Run: .venv/bin/pytest tests/test_reconciliation_rules.py -v
 """
@@ -18,7 +18,6 @@ import uuid
 import pytest
 
 from app import db
-from app.routers import reconciliations as reconciliations_router
 
 
 async def _cleanup_reconciliation(recon_id: str, user_id: str) -> None:
@@ -163,27 +162,170 @@ async def test_completed_reconciliation_locks_transaction_fields(client, test_da
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_transactions_cap_truncates_and_flags(
-    client, test_data, monkeypatch,
-):
-    """GET /reconciliations/{id} caps embedded transactions at the
-    configured maximum and sets ``transactions_truncated = True`` when
-    the underlying set exceeds the cap.
-
-    We patch the cap to 3 so the test only needs 4 transactions instead
-    of 500+.
-    """
-    # Shrink the cap for this test only.
-    monkeypatch.setattr(
-        reconciliations_router, "RECONCILIATION_TRANSACTIONS_CAP", 3,
+async def test_completed_reconciliation_rejects_balance_edits(client, test_data):
+    """PUT /reconciliations/{id} on a COMPLETED row must reject edits to
+    the locked set (beginning_balance_cents, ending_balance_cents,
+    date_start, date_end) with a 422 and name them in error.fields. Name
+    stays editable."""
+    # Create a txn so we can complete the recon.
+    txn_create = await client.post(
+        "/v1/transactions",
+        json={
+            "id": str(uuid.uuid4()),
+            "title": f"lock-recon-{uuid.uuid4()}",
+            "amount_cents": -250,
+            "date": "2026-04-12T10:00:00Z",
+            "account_id": test_data.account_id,
+            "category_id": test_data.category_id,
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
+    assert txn_create.status_code == 201
+    txn_id = txn_create.json()["id"]
 
     recon_create = await client.post(
         "/v1/reconciliations",
         json={
             "id": str(uuid.uuid4()),
             "account_id": test_data.account_id,
-            "name": f"cap-test-{uuid.uuid4()}",
+            "name": f"lock-recon-{uuid.uuid4()}",
+            "beginning_balance_cents": 0,
+            "ending_balance_cents": 0,
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert recon_create.status_code == 201
+    recon_id = recon_create.json()["id"]
+
+    try:
+        await client.put(
+            f"/v1/transactions/{txn_id}",
+            json={"reconciliation_id": recon_id},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        complete = await client.post(
+            f"/v1/reconciliations/{recon_id}/complete",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert complete.status_code == 200, complete.text
+
+        # Attempt to edit locked balance field — must fail.
+        bad = await client.put(
+            f"/v1/reconciliations/{recon_id}",
+            json={"ending_balance_cents": 12345},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert bad.status_code == 422, bad.text
+        assert "ending_balance_cents" in (bad.json()["error"].get("fields") or {})
+
+        # Name stays editable on COMPLETED.
+        ok = await client.put(
+            f"/v1/reconciliations/{recon_id}",
+            json={"name": "renamed-after-complete"},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["name"] == "renamed-after-complete"
+    finally:
+        await client.post(
+            f"/v1/reconciliations/{recon_id}/revert",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        await _cleanup_reconciliation(recon_id, test_data.user_id)
+        await _cleanup_transactions([txn_id], test_data.user_id)
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + 250 WHERE id = $1 AND user_id = $2",
+                test_data.account_id, test_data.user_id,
+            )
+
+
+@pytest.mark.asyncio
+async def test_recon_complete_and_revert_bump_assigned_txn_version(client, test_data):
+    """complete_reconciliation and revert_reconciliation must increment
+    the version of every assigned transaction atomically with the status
+    flip so delta-sync clients see the lock state change."""
+    txn_create = await client.post(
+        "/v1/transactions",
+        json={
+            "id": str(uuid.uuid4()),
+            "title": f"version-bump-{uuid.uuid4()}",
+            "amount_cents": -100,
+            "date": "2026-04-12T10:00:00Z",
+            "account_id": test_data.account_id,
+            "category_id": test_data.category_id,
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert txn_create.status_code == 201
+    txn_id = txn_create.json()["id"]
+
+    recon_create = await client.post(
+        "/v1/reconciliations",
+        json={
+            "id": str(uuid.uuid4()),
+            "account_id": test_data.account_id,
+            "name": f"version-bump-{uuid.uuid4()}",
+            "beginning_balance_cents": 0,
+            "ending_balance_cents": 0,
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert recon_create.status_code == 201
+    recon_id = recon_create.json()["id"]
+
+    try:
+        await client.put(
+            f"/v1/transactions/{txn_id}",
+            json={"reconciliation_id": recon_id},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        # Capture the version AFTER the assign-put.
+        pre_version = (await client.get(f"/v1/transactions/{txn_id}")).json()["version"]
+
+        await client.post(
+            f"/v1/reconciliations/{recon_id}/complete",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        after_complete = (await client.get(f"/v1/transactions/{txn_id}")).json()["version"]
+        assert after_complete > pre_version, (
+            f"Transaction version must bump on complete: was {pre_version}, got {after_complete}"
+        )
+
+        await client.post(
+            f"/v1/reconciliations/{recon_id}/revert",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        after_revert = (await client.get(f"/v1/transactions/{txn_id}")).json()["version"]
+        assert after_revert > after_complete, (
+            f"Transaction version must bump on revert: was {after_complete}, got {after_revert}"
+        )
+    finally:
+        await _cleanup_reconciliation(recon_id, test_data.user_id)
+        await _cleanup_transactions([txn_id], test_data.user_id)
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + 100 WHERE id = $1 AND user_id = $2",
+                test_data.account_id, test_data.user_id,
+            )
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_transactions_paginate_and_flag_truncation(
+    client, test_data,
+):
+    """GET /reconciliations/{id} returns a paged window of embedded
+    transactions controlled by ``limit`` / ``offset`` params. The
+    response echoes ``transactions_total`` and sets
+    ``transactions_truncated = True`` whenever there are more rows
+    beyond the current page.
+    """
+    recon_create = await client.post(
+        "/v1/reconciliations",
+        json={
+            "id": str(uuid.uuid4()),
+            "account_id": test_data.account_id,
+            "name": f"page-test-{uuid.uuid4()}",
             "beginning_balance_cents": 0,
             "ending_balance_cents": 0,
         },
@@ -200,7 +342,7 @@ async def test_reconciliation_transactions_cap_truncates_and_flags(
                 "/v1/transactions",
                 json={
                     "id": str(uuid.uuid4()),
-                    "title": f"cap-txn-{i}-{uuid.uuid4()}",
+                    "title": f"page-txn-{i}-{uuid.uuid4()}",
                     "amount_cents": -100,
                     "date": "2026-04-12T10:00:00Z",
                     "account_id": test_data.account_id,
@@ -219,33 +361,31 @@ async def test_reconciliation_transactions_cap_truncates_and_flags(
             )
             assert assign.status_code == 200
 
-        # Fetch the reconciliation — embedded list must be capped at 3
-        # and the truncation flag must be True.
-        r = await client.get(f"/v1/reconciliations/{recon_id}")
+        # First page of 3 — truncated=True, total=4.
+        r = await client.get(f"/v1/reconciliations/{recon_id}?limit=3&offset=0")
         assert r.status_code == 200, r.text
         body = r.json()
+        assert body["transactions_total"] == 4
+        assert body["transactions_limit"] == 3
+        assert body["transactions_offset"] == 0
+        assert body["transactions_truncated"] is True
+        assert len(body["transactions"]) == 3
 
-        assert "transactions_truncated" in body, (
-            "Response must include transactions_truncated flag"
-        )
-        assert body["transactions_truncated"] is True, (
-            "Four transactions with cap=3 should trigger truncation"
-        )
-        assert len(body["transactions"]) == 3, (
-            f"Transactions list should be capped at 3, got {len(body['transactions'])}"
-        )
-
-        # And the non-truncated case: raise the cap back above the count.
-        monkeypatch.setattr(
-            reconciliations_router, "RECONCILIATION_TRANSACTIONS_CAP", 10,
-        )
-        r2 = await client.get(f"/v1/reconciliations/{recon_id}")
+        # Second page — 1 row, truncated=False.
+        r2 = await client.get(f"/v1/reconciliations/{recon_id}?limit=3&offset=3")
         assert r2.status_code == 200
         body2 = r2.json()
-        assert body2["transactions_truncated"] is False, (
-            "Four transactions with cap=10 should NOT trigger truncation"
-        )
-        assert len(body2["transactions"]) == 4
+        assert body2["transactions_total"] == 4
+        assert body2["transactions_offset"] == 3
+        assert body2["transactions_truncated"] is False
+        assert len(body2["transactions"]) == 1
+
+        # Larger window than total — returns all, truncated=False.
+        r3 = await client.get(f"/v1/reconciliations/{recon_id}?limit=10")
+        assert r3.status_code == 200
+        body3 = r3.json()
+        assert body3["transactions_truncated"] is False
+        assert len(body3["transactions"]) == 4
 
     finally:
         await _cleanup_reconciliation(recon_id, test_data.user_id)

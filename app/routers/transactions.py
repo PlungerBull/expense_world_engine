@@ -60,6 +60,7 @@ async def list_transactions(
     account_id: Optional[str] = Query(None),
     category_id: Optional[str] = Query(None),
     hashtag_id: Optional[str] = Query(None),
+    reconciliation_id: Optional[str] = Query(None),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
     cleared: Optional[bool] = Query(None),
@@ -91,6 +92,10 @@ async def list_transactions(
                 f"WHERE th.transaction_id = t.id AND th.hashtag_id = ${len(params)} "
                 f"AND th.deleted_at IS NULL)"
             )
+
+        if reconciliation_id:
+            params.append(reconciliation_id)
+            conditions.append(f"t.reconciliation_id = ${len(params)}")
 
         if date_from:
             params.append(date_from)
