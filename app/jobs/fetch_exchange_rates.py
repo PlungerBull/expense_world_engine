@@ -4,8 +4,8 @@ Runs as a Render Cron Job (or manually via `python -m app.jobs.fetch_exchange_ra
 
 Storage is canonical USD-based: one row per non-USD currency per day, stored as
 `(base_currency='USD', target_currency=<X>, rate = units of X per 1 USD)`. Directional
-math (invert, cross-rate) lives in `app.helpers.exchange_rate.get_rate`, so the
-fetcher only needs to insert USD→X rows here.
+math (invert) lives in `app.helpers.exchange_rate.get_rate`, so the fetcher only
+needs to insert USD→X rows here.
 
 The target list is derived from every non-USD currency currently referenced by an
 active bank account or any user's main_currency. A single Frankfurter call

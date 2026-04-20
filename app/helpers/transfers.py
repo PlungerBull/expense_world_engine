@@ -14,7 +14,6 @@ from app.errors import conflict, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
 from app.helpers.categories import ensure_system_category
-from app.helpers.exchange_rate import lookup_exchange_rate
 from app.schemas.transactions import transaction_from_row
 
 
@@ -128,8 +127,12 @@ async def create_transfer_pair(
     #   1. If the caller supplied a primary_exchange_rate, the primary wins.
     #   2. If the primary's currency == main currency, the primary wins (rate 1.0).
     #   3. If the sibling's currency  == main currency, the sibling wins (rate 1.0).
-    #   4. Otherwise (3-currency edge case, neither side matches main), the
-    #      debit side wins via market rate lookup.
+    #
+    # Phase 1 supports only USD and PEN (sql/015 CHECK), so main_currency
+    # always matches one of the two legs — no 3-currency fallback is needed.
+    # The auth trigger (sql/006) guarantees user_settings exists for every
+    # authenticated user, so settings_row is None only under corrupted state;
+    # we raise loudly in that case rather than silently picking a fallback.
     #
     # In every case the non-dominant side's amount_home_cents is forced to
     # equal the dominant side's by direct assignment — never recomputed via
@@ -160,22 +163,12 @@ async def create_transfer_pair(
         primary_home = sibling_home
         primary_exchange_rate = primary_home / primary_abs
     else:
-        # Neither side is main currency — rare 3-currency case.
-        # Use market rate on the debit side, force the credit side to match.
-        if primary_direction == TransferDirection.DEBIT:  # primary is the debit side
-            primary_exchange_rate = await lookup_exchange_rate(
-                conn, primary_account_id, primary_date, user_id,
-            )
-            primary_home = round(primary_abs * primary_exchange_rate)
-            sibling_home = primary_home
-            sibling_exchange_rate = sibling_home / sibling_abs
-        else:  # sibling is the debit side
-            sibling_exchange_rate = await lookup_exchange_rate(
-                conn, transfer_account_id, primary_date, user_id,
-            )
-            sibling_home = round(sibling_abs * sibling_exchange_rate)
-            primary_home = sibling_home
-            primary_exchange_rate = primary_home / primary_abs
+        raise RuntimeError(
+            f"Transfer dominant-side rule failed: neither leg ({primary_currency}, "
+            f"{sibling_currency}) matches main_currency ({main_currency!r}). "
+            "Under the Phase 1 PEN/USD-only policy (sql/015) this state is "
+            "unreachable for valid data — likely indicates missing user_settings."
+        )
 
     if primary_id == sibling_id:
         raise validation_error(

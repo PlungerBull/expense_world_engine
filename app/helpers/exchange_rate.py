@@ -53,8 +53,8 @@ async def _fetch_rate_from_db(
       - from == to:               → (1.0, as_of)
       - from == 'USD':            → look up (USD, to), use rate as-is
       - to   == 'USD':            → look up (USD, from), invert (1 / rate)
-      - cross (neither is USD):   → look up (USD, from) and (USD, to) on the same date,
-                                     return (to_rate / from_rate, that_date)
+      - cross (neither is USD):   → unsupported under the Phase 1 PEN/USD-only
+                                     policy (sql/015); returns None.
 
     Returns None if any required rate row is missing. Callers decide the fallback.
     """
@@ -93,31 +93,12 @@ async def _fetch_rate_from_db(
             return None
         return (1.0 / float(row["rate"]), row["rate_date"])
 
-    # Cross-rate: both legs must come from the same rate_date to stay internally consistent.
-    row = await conn.fetchrow(
-        """
-        SELECT
-            f.rate AS from_rate,
-            t.rate AS to_rate,
-            f.rate_date AS rate_date
-        FROM exchange_rates f
-        JOIN exchange_rates t
-            ON t.base_currency = 'USD'
-           AND t.target_currency = $2
-           AND t.rate_date = f.rate_date
-        WHERE f.base_currency = 'USD'
-          AND f.target_currency = $1
-          AND f.rate_date <= $3
-        ORDER BY f.rate_date DESC
-        LIMIT 1
-        """,
-        from_currency,
-        to_currency,
-        as_of,
-    )
-    if row is None or float(row["from_rate"]) == 0.0:
-        return None
-    return (float(row["to_rate"]) / float(row["from_rate"]), row["rate_date"])
+    # Cross-rate (neither side USD) is unsupported. Phase 1 only accepts PEN
+    # and USD as currencies (sql/015 CHECK + the global_currencies FKs), so
+    # this branch is unreachable for valid data. Return None explicitly so
+    # the negative cache stores the result and callers fall back consistently
+    # rather than leaning on the previous JOIN's silent-no-match behaviour.
+    return None
 
 
 async def get_rate(
@@ -173,9 +154,9 @@ async def batch_get_rates(
     Implementation note: this currently calls ``get_rate`` once per distinct
     currency rather than issuing a single combined SQL query. That still
     eliminates the N+1 at the caller level (which was the hot path), and
-    preserves ``get_rate``'s three-path conversion logic (same-currency,
-    USD involvement, cross-rate). A true single-query version is possible
-    but requires rewriting the SQL for all three paths.
+    preserves ``get_rate``'s conversion paths (same-currency and USD-involving;
+    cross-rate is intentionally unsupported under the PEN/USD-only policy).
+    A true single-query version is possible but requires rewriting the SQL.
     """
     result: dict[str, float] = {}
     for currency in set(from_currencies):
