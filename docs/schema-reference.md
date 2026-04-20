@@ -201,6 +201,13 @@ activity_log
   - after_snapshot   jsonb, nullable
                      — full row state after the change. null on deletes.
   - changed_by       UUID, NOT NULL, FK → users
+                     — the user-id anchor. Defaults to resource owner's
+                       user_id when the actor is the user themself.
+  - actor_type       text, NOT NULL, default 'user'
+                     — who performed the mutation. 'user' for direct API
+                       calls; 'system' for cron-driven writes (scheduled
+                       rate refreshes, etc.); 'admin' reserved for future
+                       back-office flows. Added in sql/013.
   - created_at       timestamptz, NOT NULL, default now()
 ```
 
@@ -269,7 +276,12 @@ expense_categories
   - updated_at  timestamptz, NOT NULL, default now()
   - version     integer, NOT NULL, default 1
   - deleted_at  timestamptz, nullable
-  - UNIQUE (user_id, name)
+  - PARTIAL UNIQUE INDEX (user_id, LOWER(name)) WHERE deleted_at IS NULL
+                — case-insensitive uniqueness scoped to non-deleted rows.
+                  Replaces the original case-sensitive UNIQUE (user_id, name)
+                  in sql/012. Belt-and-suspenders with the service-layer
+                  normalize_name() check. Lets a user recreate a name they
+                  previously soft-deleted.
   - PARTIAL UNIQUE INDEX (user_id, system_key) WHERE system_key IS NOT NULL AND deleted_at IS NULL
 ```
 
@@ -417,7 +429,10 @@ expense_hashtags
   - updated_at  timestamptz, NOT NULL, default now()
   - version     integer, NOT NULL, default 1
   - deleted_at  timestamptz, nullable
-  - UNIQUE (user_id, name)
+  - PARTIAL UNIQUE INDEX (user_id, LOWER(name)) WHERE deleted_at IS NULL
+                — case-insensitive uniqueness scoped to non-deleted rows.
+                  Replaces the original UNIQUE (user_id, name) in sql/012.
+                  Mirrors the expense_categories constraint.
 ```
 
 ---

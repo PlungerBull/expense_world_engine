@@ -114,7 +114,7 @@ Updates `user_settings`. Partial update — only supplied fields are changed. If
 2. **Transfer pairs** (`transfer_transaction_id IS NOT NULL`): reapply the dominant-side rule — the leg whose account currency matches the new `main_currency` is dominant (`amount_home_cents = amount_cents`, `exchange_rate = 1.0`); the other leg's `amount_home_cents` is forced to match so the pair nets to zero.
 3. **Pending inbox items** (`status = 1`, `account_id IS NOT NULL`): recompute `exchange_rate` so future promotions use the correct home currency.
 
-`current_balance_home_cents` on accounts does **not** need updating — it is computed at read time, not stored. Every updated transaction row bumps `version + updated_at` so `/sync` surfaces the changes. A **single** `activity_log` entry records the currency change plus the recalculation summary (rows touched per pass). Individual transaction updates are **not** logged — this is a deliberate aggregate-exception to the "every mutation gets an activity_log entry" rule. A full recalc on a busy user can rewrite tens of thousands of rows in a single request; per-row entries would inflate `activity_log` by orders of magnitude without answering useful audit questions. The single `user_settings` UPDATED entry is the canonical record. No-op when `main_currency` doesn't actually change. Synchronous in Phase 1; a future async variant with `recalculation_job_id` polling can be added when volumes require it. See [roadmap.md Step 9.1](../docs/roadmap.md).
+`current_balance_home_cents` on accounts does **not** need updating — it is computed at read time, not stored. Every updated transaction row bumps `version + updated_at` so `/sync` surfaces the changes. A **single** `activity_log` entry records the currency change plus the recalculation summary: `regular_transactions`, `transfer_transactions`, `orphan_transfer_legs`, `inbox_items`, and `total`. The `orphan_transfer_legs` counter surfaces transfer legs whose sibling was soft-deleted — the helper can't reapply the dominant-side rule without both legs, so it skips them and records the count so ops can resolve the orphans via the transactions API. Individual transaction updates are **not** logged — this is a deliberate aggregate-exception to the "every mutation gets an activity_log entry" rule. A full recalc on a busy user can rewrite tens of thousands of rows in a single request; per-row entries would inflate `activity_log` by orders of magnitude without answering useful audit questions. The single `user_settings` UPDATED entry is the canonical record. No-op when `main_currency` doesn't actually change. Synchronous in Phase 1; a future async variant with `recalculation_job_id` polling can be added when volumes require it. See [roadmap.md Step 9.1](../docs/roadmap.md).
 
 **Settings preconditions:** Endpoints that read `user_settings` (dashboard, reports, recalc) return `422 SETTINGS_MISSING` with `fields: {"user_settings": "Must be provisioned via POST /v1/auth/bootstrap."}` if the user has not completed bootstrap. This is a precondition-unmet state, not a conflict.
 
@@ -186,6 +186,8 @@ Returns all active categories, sorted by `sort_order`. System categories (`is_sy
 **Required:** `id` (client-supplied UUID), `name`, `color`
 **Optional:** `sort_order`
 
+**Name normalization:** `name` is trimmed before storage. An empty-after-trim name returns `422 VALIDATION_ERROR` with `fields: {"name": "Must not be empty."}`. Uniqueness is **case-insensitive** per user: "Food", "food", and "FOOD" collide. A conflicting name returns `409 CONFLICT`. The database enforces this with a partial unique index on `(user_id, LOWER(name)) WHERE deleted_at IS NULL`, so deleting a category and creating a new one with the same name works as expected.
+
 Categories carry no type restriction. The same category can be used on expenses, income, and transfers — including refunds (same category as the original expense, positive amount).
 
 **Auto-creation (engine-side, not via this endpoint):**
@@ -194,7 +196,7 @@ Categories carry no type restriction. The same category can be used on expenses,
 Both are created with `is_system = true` and a stable `system_key` column (`"debt"` / `"transfer"`) — the engine looks them up by `system_key`, not by display name. This means users can freely rename the display text without breaking future transfer pipelines (which was a bug before the `system_key` column was added).
 
 ### `PUT /categories/{id}`
-System categories (`is_system = true`) CAN be renamed — the engine identifies them by `system_key`, not by `name`. Any other field is also editable. Returns `404` if the category is missing.
+System categories (`is_system = true`) CAN be renamed — the engine identifies them by `system_key`, not by `name`. Any other field is also editable. Returns `404` if the category is missing. The same name normalization rules as `POST` apply: renames are trimmed, empty names return `422`, and case-insensitive conflicts return `409`.
 
 ### `DELETE /categories/{id}`
 Soft-delete. Returns `409` if the category is referenced by any non-deleted transaction (inbox or ledger). System categories (`is_system = true`) always return `403` — they must remain available for the transfer pipeline.
@@ -213,7 +215,10 @@ Returns all active hashtags, sorted by `sort_order`. Supports standard paginatio
 **Required:** `id` (client-supplied UUID), `name`
 **Optional:** `sort_order`
 
+**Name normalization:** `name` is trimmed before storage. An empty-after-trim name returns `422 VALIDATION_ERROR`. Uniqueness is **case-insensitive** per user and scoped to non-deleted rows via a partial unique index on `(user_id, LOWER(name)) WHERE deleted_at IS NULL`. A conflicting name returns `409 CONFLICT`.
+
 ### `PUT /hashtags/{id}`
+The same name normalization rules as `POST` apply to renames.
 ### `DELETE /hashtags/{id}`
 Soft-delete. Cascades: soft-deletes all `expense_transaction_hashtags` junction rows for this hashtag and bumps each affected parent transaction's `version + updated_at` so the next `/sync` delta carries the hashtag_ids change. Writes a single `DELETED` activity log entry for the hashtag itself; per-junction-row entries are deliberately NOT written (see "Activity log aggregate exceptions" below).
 
@@ -438,18 +443,36 @@ Creates a new draft reconciliation batch.
 **Response shape:** Every reconciliation response includes `beginning_balance_home_cents` and `ending_balance_home_cents` alongside the native fields. The engine converts using the account's currency and the exchange rate at `date_end` (or today if `date_end` is null). Values are `null` only when no rate is available for the pair; list endpoints deduplicate rate lookups by `(currency, date_end)` so a page of N reconciliations produces at most K rate reads where K = distinct currency/date pairs.
 
 ### `GET /reconciliations/{id}`
-Returns the reconciliation plus all transactions currently assigned to it.
+Returns the reconciliation plus a **paged window** of its assigned transactions.
+
+**Query params:** `limit` (default 50, max 200, min 1), `offset` (default 0), `debit_as_negative` (bool, default false).
+
+**Response additions:** the embedded list is wrapped with pagination metadata:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `transactions` | array | Up to `limit` transactions, ordered by `date DESC, created_at DESC`. |
+| `transactions_total` | int | Total count of non-deleted transactions assigned to the reconciliation. |
+| `transactions_limit` | int | Echoes the requested limit. |
+| `transactions_offset` | int | Echoes the requested offset. |
+| `transactions_truncated` | bool | `true` when `offset + transactions.length < transactions_total` — i.e. there are more rows beyond this page. |
+
+For large reconciliations, the paged list endpoint `GET /transactions?reconciliation_id={id}` is a standalone escape hatch that supports the full filter surface (date range, category, hashtag, search).
 
 ### `PUT /reconciliations/{id}`
 Updates metadata fields. Cannot update `status` directly — use the complete/revert endpoints.
 
+**Field locking on COMPLETED status:** Once `status = 2`, the following fields are frozen: `beginning_balance_cents`, `ending_balance_cents`, `date_start`, `date_end`. Any attempt to edit them returns `422 VALIDATION_ERROR` with a `fields` map naming each attempted locked key (`"Locked while reconciliation is completed."`). To edit these fields, call `POST /reconciliations/{id}/revert` first. `name` stays editable on completed batches so archived reconciliations can be re-labelled.
+
 ### `POST /reconciliations/{id}/complete`
-Marks the reconciliation as complete (`status = 2`). From this point, the four locked fields (`amount_cents`, `account_id`, `title`, `date`) become read-only on all assigned transactions.
+Marks the reconciliation as complete (`status = 2`). From this point, the four locked fields (`amount_cents`, `account_id`, `title`, `date`) become read-only on all assigned transactions, and the reconciliation's own balance/date fields are locked (see `PUT` above).
+
+**Atomicity:** the handler locks every assigned transaction with `SELECT ... FOR UPDATE` before flipping the status, bumps `version + updated_at` on each one, and writes the `activity_log` entry — all inside the same DB transaction. Concurrent transaction edits serialize behind the status flip, and delta-sync clients see the transaction-lock state change on the same tick as the reconciliation status.
 
 **Validation:** Returns `422` if no transactions are assigned to the batch.
 
 ### `POST /reconciliations/{id}/revert`
-Reverts status to draft (`status = 1`). Unlocks all fields on assigned transactions.
+Reverts status to draft (`status = 1`). Unlocks all fields on assigned transactions, including the reconciliation's own balance/date fields. Same atomicity guarantees as `complete`: assigned transactions are locked with `FOR UPDATE`, versions bumped, status flipped — all in one DB transaction.
 
 ### `DELETE /reconciliations/{id}`
 Soft-delete. Only allowed if `status = 1` (draft). Returns `409` if status is completed — revert first. Cascade-unassigns every transaction that was linked to this batch (`reconciliation_id` set back to `null` with `version + updated_at` bumps).
@@ -637,7 +660,11 @@ The two query forms are mutually exclusive. Passing both → `422`. Passing neit
 ## Activity Log
 
 ### `GET /activity`
-Returns the activity log for the user. Supports filtering by `resource_type` and `resource_id`. Sorted by `created_at` descending. Useful for debugging and audit.
+Returns the activity log for the user. Supports filtering by `resource_type` (string) and `resource_id` (**UUID**). Sorted by `created_at` descending. Useful for debugging and audit.
+
+**Validation:** `resource_id` is typed as UUID — non-UUID values return `422 VALIDATION_ERROR` before the query runs.
+
+**Response fields:** each activity row includes `id`, `user_id`, `resource_type`, `resource_id`, `action`, `before_snapshot`, `after_snapshot`, `changed_by` (the user-id anchor), `actor_type`, and `created_at`. `actor_type` separates the performer of the mutation from the resource owner — values are `"user"` (default), `"system"` (cron-driven writes such as scheduled rate refreshes), and `"admin"` (reserved for future back-office flows). Pair `changed_by` with `actor_type` to resolve attribution.
 
 ### Action codes
 | Value | Name | Emitted when |
