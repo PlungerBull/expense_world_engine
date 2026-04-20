@@ -35,7 +35,7 @@
 }
 ```
 
-**`fields` semantics:** On `VALIDATION_ERROR` responses, `fields` is always an object (possibly empty) — never `null`. Clients can uniformly iterate `Object.keys(error.fields)` without a null check. On non-validation errors (`UNAUTHORIZED`, `NOT_FOUND`, `FORBIDDEN`, `CONFLICT`, `INTERNAL_ERROR`, etc.), `fields` is `null` — those errors aren't field-scoped. The envelope key is still present in every response.
+**`fields` semantics:** On `VALIDATION_ERROR` responses, `fields` is always an object (possibly empty) — never `null`. Clients can uniformly iterate `Object.keys(error.fields)` without a null check. Two precondition-unmet codes also carry field-scoped payloads: `SETTINGS_MISSING` (`fields: {"user_settings": ...}`) and `RATE_UNAVAILABLE` (`fields: {"exchange_rate": ...}`), both returned as `422`. On other non-validation errors (`UNAUTHORIZED`, `NOT_FOUND`, `FORBIDDEN`, `CONFLICT`, `INTERNAL_ERROR`), `fields` is `null` — those errors aren't field-scoped. The envelope key is still present in every response.
 
 **Global exception coverage:** Four handlers are registered: `AppError` (canonical raises from domain code), `RequestValidationError` (Pydantic), `StarletteHTTPException` (routing-level 404/405/413/415/429), and a catch-all `Exception` handler returning `500 INTERNAL_ERROR` after logging the traceback server-side. Tracebacks never leak to clients; every error response carries the canonical envelope.
 
@@ -118,6 +118,8 @@ Updates `user_settings`. Partial update — only supplied fields are changed. If
 
 **Settings preconditions:** Endpoints that read `user_settings` (dashboard, reports, recalc) return `422 SETTINGS_MISSING` with `fields: {"user_settings": "Must be provisioned via POST /v1/auth/bootstrap."}` if the user has not completed bootstrap. This is a precondition-unmet state, not a conflict.
 
+**Exchange-rate preconditions:** Any write that needs to compute `amount_home_cents` for a cross-currency account (`POST /transactions`, `PUT /transactions/{id}` with a `date` change, `POST /transactions/batch`, `POST /inbox`, `PUT /inbox/{id}` with a `date` change) returns `422 RATE_UNAVAILABLE` with `fields: {"exchange_rate": "No rate on or before <date> for <from>-><to>. Wait for the daily fetch or supply an explicit exchange_rate."}` when no `exchange_rates` row exists on or before the transaction's `date`. No silent `1.0` fallback — a missing rate fails loudly so `amount_home_cents` cannot be corrupted. Clients can either retry after the daily FX cron runs (see [TODO.md](../TODO.md)) or bypass the lookup by supplying an explicit `exchange_rate` on the request. Same-currency accounts short-circuit to the identity rate and never hit this path.
+
 ---
 
 ## Bank Accounts
@@ -153,7 +155,10 @@ Soft-deletes the account (`deleted_at = now()`). Returns `409` if the account ha
 Undoes a soft-delete by clearing `deleted_at`. Returns `404` if no soft-deleted account with that id exists. Writes a `RESTORED` activity log entry with before/after snapshots.
 
 ### `POST /accounts/{id}/archive`
-Sets `is_archived = true`. The account disappears from all pickers and entry flows but all historical transactions remain intact and participate in reports.
+Sets `is_archived = true`. The account disappears from all pickers and entry flows but all historical transactions remain intact and participate in reports. Bumps `version` and writes an `UPDATED` activity log entry.
+
+### `POST /accounts/{id}/unarchive`
+Inverse of `/archive`: sets `is_archived = false` and bumps `version`. Returns `404` if no active account with that id exists. Writes an `UPDATED` activity log entry. Calling on an already-active account is allowed (still bumps version + writes activity) so the round-trip is idempotent at the HTTP layer and explicit in the audit trail.
 
 ---
 
@@ -180,7 +185,7 @@ Until this endpoint ships, person accounts cannot be created through the API. Th
 ## Categories
 
 ### `GET /categories`
-Returns all active categories, sorted by `sort_order`. System categories (`is_system = true`) are always included and always appear first. Supports standard pagination. Use `?include_deleted=true` to include soft-deleted categories.
+Returns all active, non-archived categories, sorted by `sort_order`. System categories (`is_system = true`) are always included and always appear first. Supports standard pagination. Use `?include_archived=true` to include archived categories. Use `?include_deleted=true` to include soft-deleted categories.
 
 ### `POST /categories`
 **Required:** `id` (client-supplied UUID), `name`, `color`
@@ -204,12 +209,20 @@ Soft-delete. Returns `409` if the category is referenced by any non-deleted tran
 ### `POST /categories/{id}/restore`
 Undoes a soft-delete. Returns `404` if no soft-deleted category with that id exists. Returns `409` if an active category already uses the same name (the name collision check prevents silent duplicates). Writes a `RESTORED` activity log entry.
 
+### `POST /categories/{id}/archive`
+Sets `is_archived = true`. The category disappears from default `GET /categories` listings and dashboard month panels but remains attached to historical transactions. Bumps `version` and writes an `UPDATED` activity log entry. Returns `404` if the category is missing or soft-deleted. Returns `403` for system categories (`is_system = true`) — the transfer pipeline relies on them remaining available, mirroring the delete guard.
+
+**Attach guard:** Once archived, the engine refuses to attach the category to any new or updated transaction. `POST /transactions`, `PUT /transactions/{id}`, `POST /transactions/batch`, and `POST /inbox/{id}/promote` all return `422 VALIDATION_ERROR` with `fields: {"category_id": "Must reference an active, non-archived category."}` if `category_id` references an archived row. The same guard fires on `POST /transactions/{id}/restore` if the original category has been archived in the meantime — the restore is rejected until the category is unarchived. Inbox items pointing at an archived category are also dropped from `GET /inbox?ready=true`. This is the same parity rule that already applies to archived accounts.
+
+### `POST /categories/{id}/unarchive`
+Inverse of `/archive`: sets `is_archived = false` and bumps `version`. Returns `404` if no active category with that id exists. Writes an `UPDATED` activity log entry.
+
 ---
 
 ## Hashtags
 
 ### `GET /hashtags`
-Returns all active hashtags, sorted by `sort_order`. Supports standard pagination. Use `?include_deleted=true` to include soft-deleted hashtags.
+Returns all active, non-archived hashtags, sorted by `sort_order`. Supports standard pagination. Use `?include_archived=true` to include archived hashtags. Use `?include_deleted=true` to include soft-deleted hashtags.
 
 ### `POST /hashtags`
 **Required:** `id` (client-supplied UUID), `name`
@@ -224,6 +237,14 @@ Soft-delete. Cascades: soft-deletes all `expense_transaction_hashtags` junction 
 
 ### `POST /hashtags/{id}/restore`
 Undoes a soft-delete of the hashtag row itself. Does NOT automatically restore the cascaded junction rows — the restored hashtag comes back as an empty label that the user can re-apply manually to transactions. Silently re-tagging could surprise users. Returns `404` if no soft-deleted hashtag with that id exists. Returns `409` if an active hashtag already uses the same name.
+
+### `POST /hashtags/{id}/archive`
+Sets `is_archived = true`. The hashtag disappears from default `GET /hashtags` listings but its `expense_transaction_hashtags` junction rows are intentionally left intact — archive is a soft hide, not a destruction of links. Bumps `version` and writes an `UPDATED` activity log entry. Returns `404` if the hashtag is missing or soft-deleted.
+
+**Attach guard:** Once archived, the engine refuses to attach the hashtag to any new or updated transaction via `hashtag_ids`. `POST /transactions` and `PUT /transactions/{id}` return `422 VALIDATION_ERROR` with `fields: {"hashtag_ids": "Invalid IDs: ..."}` if any id in the list references an archived hashtag. Existing junction rows on transactions that already had this hashtag attached before archive remain intact and continue to surface in dashboards and reports.
+
+### `POST /hashtags/{id}/unarchive`
+Inverse of `/archive`: sets `is_archived = false` and bumps `version`. Returns `404` if no active hashtag with that id exists. Writes an `UPDATED` activity log entry.
 
 ---
 
@@ -241,7 +262,7 @@ Creates a new inbox item.
 
 `amount_cents` follows the standard sign convention: negative = expense, positive = income. The engine infers `transaction_type` from the sign and stores `amount_cents` as positive (same as the ledger). `transaction_type` is stored on the inbox row so direction is preserved through to promotion.
 
-Auto-populates `exchange_rate` from `exchange_rates` table for the transaction's `date` and `account_id.currency_code` if both are present. Falls back to `1.0` if no rate row exists.
+Auto-populates `exchange_rate` from `exchange_rates` table for the transaction's `date` and `account_id.currency_code` if both are present. If either field is absent, the column stores the DB default of `1.0` (partial inbox rows are allowed; rate is resolved at promote time). If both are present but no rate row exists on or before `date` for the pair, the request fails with `422 RATE_UNAVAILABLE` — no silent fallback. Same-currency accounts always resolve via the identity-rate short-circuit.
 
 **Response shape:** Inbox rows include both native AND home-currency amounts:
 - `amount_cents` + `amount_home_cents` — computed as `amount_cents × exchange_rate` at read time.
@@ -347,9 +368,9 @@ Partial update.
 
 **Field locking:** If the transaction belongs to a completed reconciliation (`reconciliation_id` is set and reconciliation `status = 2`), these fields are read-only: `amount_cents`, `account_id`, `title`, `date`. Attempting to update them returns `422`.
 
-**Transfer edit guard:** If the transaction is part of a transfer pair (`transfer_transaction_id` is set), `amount_cents` and `account_id` are read-only. Attempting to update them returns `422`. Transfers must be deleted and re-created to change amounts or accounts — this prevents the paired sibling from silently going out of sync. Other fields (`title`, `description`, `cleared`, `date`, `category_id`, `hashtag_ids`) remain editable on transfer transactions.
+**Transfer edit guard:** If the transaction is part of a transfer pair (`transfer_transaction_id` is set), these fields are read-only: `amount_cents`, `account_id`, `date`, `exchange_rate`, `amount_home_cents`. Attempting to update them returns `422`. Transfers must be deleted and re-created to change any of these — the PUT path mutates only the edited leg, so allowing any of them through would silently desync the pair (different dates, mismatched historical rates, legs that no longer net to zero in home currency). Other fields (`title`, `description`, `cleared`, `category_id`, `hashtag_ids`) remain editable per-leg.
 
-**Date change:** If `date` changes, the engine automatically re-fetches the historical exchange rate for the new date and recalculates `amount_home_cents`. The user's manually set `exchange_rate` is replaced with the historical rate for the new date. (If the user then wants to override it, they can in a follow-up PUT.)
+**Date change:** If `date` changes on a non-transfer transaction, the engine automatically re-fetches the historical exchange rate for the new date and recalculates `amount_home_cents`. The user's manually set `exchange_rate` is replaced with the historical rate for the new date. (If the user then wants to override it, they can in a follow-up PUT.) This does not apply to transfer legs — `date` is blocked by the transfer edit guard above, so the re-rate path is never reached for transfers.
 
 **Balance update:** If `amount_cents` or `account_id` changes, `current_balance_cents` is updated atomically on the affected account(s).
 
@@ -604,6 +625,30 @@ Returns the current calendar month overview. Single endpoint, one call, everythi
 - `bank_accounts[].current_balance_home_cents` and `people[].current_balance_home_cents` are `Optional[int]`. They are always populated for same-currency accounts (identity rate). For cross-currency accounts, they are `null` only when no exchange rate is available from the account's currency to `main_currency` for today's date — in that case, clients should display the native balance as a fallback.
 - "Current month" means `[first_day_of_month, last_day_of_month]` in the user's `display_timezone`.
 - `?debit_as_negative=true` is accepted for API consistency with other read endpoints but is a no-op here — dashboard aggregates are already signed by construction (per-category `spent_cents` is positive for income and negative for expense; totals return split positive `inflow_cents`/`outflow_cents` with `net_cents` as their difference).
+
+**`?include_archived=true`** — when set, the response additionally includes three "archived" panels alongside the active ones:
+
+```json
+{
+  "archived_accounts": [
+    { "id": "...", "name": "Old BCP Soles", "currency_code": "PEN",
+      "current_balance_cents": 0, "current_balance_home_cents": 0 }
+  ],
+  "archived_categories": [
+    { "id": "...", "name": "Crypto", "lifetime_spent_cents": -250000,
+      "lifetime_spent_home_cents": -250000 }
+  ],
+  "archived_hashtags": [
+    { "id": "...", "name": "#vacation-2024", "lifetime_spent_cents": -480000,
+      "lifetime_spent_home_cents": -480000 }
+  ]
+}
+```
+
+When `include_archived=false` (the default), all three fields are returned as `null` (per the null-over-omission rule). Their semantics:
+
+- `archived_accounts` — same row shape as `bank_accounts`. `is_person = true` is excluded; person accounts have no archive concept yet (deferred until the People API ships). `current_balance_cents` is the lifetime balance (no further transactions can land on archived rows in clients that respect the picker).
+- `archived_categories` / `archived_hashtags` — `lifetime_spent_cents` follows the same signed convention as the month-scoped `spent_cents`: positive for income / transfer credits, negative for expenses / transfer debits. Sums every non-deleted transaction ever attributed to the row, with no date floor. A transaction with multiple hashtags counts once under each hashtag — totals across hashtags do NOT sum to the global flow total, by design (each hashtag's lifetime view is independent).
 
 ### `GET /reports/monthly`
 

@@ -96,18 +96,27 @@ async def validate_active_category(
     category_id: str,
     user_id: str,
 ) -> asyncpg.Record:
-    """Fetch an active category or raise 422.
+    """Fetch an active, non-archived category or raise 422.
+
+    Mirrors ``validate_active_account``: archive is a "retired, do not
+    use" signal at the engine layer, not just a UI hide. Letting clients
+    attach transactions to archived categories would split the meaning
+    of ``is_archived`` between accounts and categories — and it would
+    leak through any non-iOS caller (CLI, CSV import, third-party).
 
     Returns the category row on success.
     """
     category = await conn.fetchrow(
-        "SELECT * FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+        """
+        SELECT * FROM expense_categories
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
+        """,
         category_id,
         user_id,
     )
     if category is None:
         raise validation_error(
             "Category validation failed.",
-            {"category_id": "Must reference an active category."},
+            {"category_id": "Must reference an active, non-archived category."},
         )
     return category

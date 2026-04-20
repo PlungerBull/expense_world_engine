@@ -96,7 +96,7 @@ Sign conventions are not baked into the schema. The engine accepts a `debit_as_n
 
 Optional fields with no value are returned as `null` in API responses, never omitted. The response shape is always identical regardless of data presence. Clients never check for key existence before reading — they always find the key, potentially null. See `lessons-ynab.md §7`.
 
-**`VALIDATION_ERROR.fields` is an exception** — on `VALIDATION_ERROR` responses specifically, `fields` is always an object (possibly empty), never `null`, so clients can uniformly iterate `Object.keys(error.fields)` without a null check. Non-validation errors (`UNAUTHORIZED`, `NOT_FOUND`, `FORBIDDEN`, `CONFLICT`, `SETTINGS_MISSING`, `INTERNAL_ERROR`) keep `fields: null` since they aren't field-scoped.
+**`VALIDATION_ERROR.fields` is an exception** — on `VALIDATION_ERROR` responses specifically, `fields` is always an object (possibly empty), never `null`, so clients can uniformly iterate `Object.keys(error.fields)` without a null check. Two other precondition-unmet codes also carry field-scoped payloads so clients can branch on the specific bootstrap/remediation step: `SETTINGS_MISSING` with `fields: {"user_settings": ...}` and `RATE_UNAVAILABLE` with `fields: {"exchange_rate": ...}`, both returned as `422`. Non-validation errors (`UNAUTHORIZED`, `NOT_FOUND`, `FORBIDDEN`, `CONFLICT`, `INTERNAL_ERROR`) keep `fields: null` since they aren't field-scoped.
 
 ### 11. IDs-Only as the Future Direction
 

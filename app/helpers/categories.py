@@ -263,6 +263,102 @@ async def delete_category(
     return after
 
 
+async def archive_category(
+    conn: asyncpg.Connection,
+    user_id: str,
+    category_id: str,
+) -> dict:
+    """Set ``is_archived = true`` on a category and log the change.
+
+    Mirrors ``helpers.accounts.archive_account``: direct UPDATE bumps
+    ``version`` and ``updated_at`` so delta sync surfaces the flag flip,
+    and the activity log carries before/after snapshots.
+
+    System categories raise 403 — the transfer pipeline relies on them
+    being available, so they cannot be archived (same rationale as the
+    delete guard).
+
+    Raises:
+        not_found: no active category with that id for this user.
+        forbidden: attempting to archive a system category.
+    """
+    before_row = await conn.fetchrow(
+        "SELECT * FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+        category_id,
+        user_id,
+    )
+    if before_row is None:
+        raise not_found("category")
+    if before_row["is_system"]:
+        raise forbidden(f"Cannot archive system category {before_row['name']}.")
+
+    before = category_from_row(before_row)
+
+    after_row = await conn.fetchrow(
+        """
+        UPDATE expense_categories
+        SET is_archived = true, updated_at = now(), version = version + 1
+        WHERE id = $1 AND user_id = $2
+        RETURNING *
+        """,
+        category_id,
+        user_id,
+    )
+    after = category_from_row(after_row)
+
+    await write_activity_log(
+        conn, user_id, "category", category_id, ActivityAction.UPDATED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
+async def unarchive_category(
+    conn: asyncpg.Connection,
+    user_id: str,
+    category_id: str,
+) -> dict:
+    """Clear ``is_archived`` on a category and log the change.
+
+    Targets active rows (``deleted_at IS NULL``) regardless of current
+    archive state — calling on an already-active row is a no-op write
+    that still bumps version and writes activity (idempotent at the
+    HTTP layer; explicit at the audit layer).
+
+    Raises:
+        not_found: no active category with that id for this user.
+    """
+    before_row = await conn.fetchrow(
+        "SELECT * FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+        category_id,
+        user_id,
+    )
+    if before_row is None:
+        raise not_found("category")
+
+    before = category_from_row(before_row)
+
+    after_row = await conn.fetchrow(
+        """
+        UPDATE expense_categories
+        SET is_archived = false, updated_at = now(), version = version + 1
+        WHERE id = $1 AND user_id = $2
+        RETURNING *
+        """,
+        category_id,
+        user_id,
+    )
+    after = category_from_row(after_row)
+
+    await write_activity_log(
+        conn, user_id, "category", category_id, ActivityAction.UPDATED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
 async def restore_category(
     conn: asyncpg.Connection,
     user_id: str,

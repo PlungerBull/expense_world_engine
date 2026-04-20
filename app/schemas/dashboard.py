@@ -49,9 +49,40 @@ class DashboardTotals(BaseModel):
     net_home_cents: int
 
 
+class DashboardArchivedAggregate(BaseModel):
+    """Lifetime signed flow for an archived category or hashtag.
+
+    `lifetime_spent_cents` follows the same signed convention as the
+    month-scoped `spent_cents` on `/dashboard.categories`: positive for
+    income / transfer credits, negative for expenses / transfer debits.
+    Sums every non-deleted transaction ever attributed to the row, with
+    no date floor.
+    """
+    id: str
+    name: str
+    lifetime_spent_cents: int
+    lifetime_spent_home_cents: int
+
+
 class DashboardResponse(BaseModel):
     month: DashboardMonth
     bank_accounts: list[DashboardAccount]
     people: list[DashboardAccount]
     categories: list[DashboardCategory]
     totals: DashboardTotals
+    archived_accounts: Optional[list[DashboardAccount]] = Field(
+        None,
+        description=(
+            "Populated only when `?include_archived=true`; null otherwise. "
+            "Same shape as `bank_accounts` — `current_balance_cents` is the "
+            "lifetime balance (no new transactions can land on archived rows)."
+        ),
+    )
+    archived_categories: Optional[list[DashboardArchivedAggregate]] = Field(
+        None,
+        description="Populated only when `?include_archived=true`; null otherwise.",
+    )
+    archived_hashtags: Optional[list[DashboardArchivedAggregate]] = Field(
+        None,
+        description="Populated only when `?include_archived=true`; null otherwise.",
+    )

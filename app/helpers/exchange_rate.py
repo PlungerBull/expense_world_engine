@@ -23,6 +23,8 @@ from typing import Optional
 
 import asyncpg
 
+from app.errors import not_found, rate_unavailable, settings_missing
+
 
 _RATE_CACHE_TTL_SECONDS = 3600  # 1 hour
 
@@ -174,9 +176,19 @@ async def lookup_exchange_rate(
 ) -> float:
     """Resolve the account's currency and the user's main currency, then look up the rate.
 
-    Backwards-compatible wrapper around `get_rate`. Returns 1.0 when the account or
-    user_settings can't be found, or when no rate is available — same fallback
-    behaviour the rest of the engine relies on today.
+    Raises (instead of the old silent 1.0 fallback, which silently corrupted
+    amount_home_cents whenever the daily FX fetch hadn't populated a row):
+
+      * AppError(NOT_FOUND) — account doesn't exist. Defensive: callers are
+        expected to validate the account first. Reaching this branch means
+        a bug upstream, not a rate problem.
+      * AppError(SETTINGS_MISSING) — user has no settings row. The user
+        never ran /auth/bootstrap; bubble the existing dedicated code so
+        clients can branch on "redirect to bootstrap flow".
+      * AppError(RATE_UNAVAILABLE) — no rate on or before `date` for the
+        account's currency -> main currency. Loud by design: the write
+        fails with 422 so the caller knows the FX job is stale instead of
+        silently storing a wrong home-currency value.
     """
     account = await conn.fetchrow(
         "SELECT currency_code FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
@@ -184,13 +196,13 @@ async def lookup_exchange_rate(
         user_id,
     )
     if account is None:
-        return 1.0
+        raise not_found("account")
 
     settings = await conn.fetchrow(
         "SELECT main_currency FROM user_settings WHERE user_id = $1", user_id
     )
     if settings is None:
-        return 1.0
+        raise settings_missing()
 
     target_date = date.date() if isinstance(date, datetime) else date
     result = await get_rate(
@@ -200,5 +212,9 @@ async def lookup_exchange_rate(
         as_of=target_date,
     )
     if result is None:
-        return 1.0
+        raise rate_unavailable(
+            account["currency_code"],
+            settings["main_currency"],
+            target_date,
+        )
     return result[0]

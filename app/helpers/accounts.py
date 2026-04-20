@@ -322,6 +322,31 @@ async def archive_account(
     Raises:
         not_found: no active account with that id for this user.
     """
+    return await _set_account_archive(conn, user_id, account_id, archived=True)
+
+
+async def unarchive_account(
+    conn: asyncpg.Connection,
+    user_id: str,
+    account_id: str,
+) -> dict:
+    """Clear ``is_archived`` on an account and log the change.
+
+    Mirror of ``archive_account``. Targets active rows (``deleted_at IS NULL``)
+    regardless of the current archive state.
+
+    Raises:
+        not_found: no active account with that id for this user.
+    """
+    return await _set_account_archive(conn, user_id, account_id, archived=False)
+
+
+async def _set_account_archive(
+    conn: asyncpg.Connection,
+    user_id: str,
+    account_id: str,
+    archived: bool,
+) -> dict:
     before_row = await conn.fetchrow(
         "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
         account_id,
@@ -338,12 +363,13 @@ async def archive_account(
     after_row = await conn.fetchrow(
         """
         UPDATE expense_bank_accounts
-        SET is_archived = true, updated_at = now(), version = version + 1
+        SET is_archived = $3, updated_at = now(), version = version + 1
         WHERE id = $1 AND user_id = $2
         RETURNING *
         """,
         account_id,
         user_id,
+        archived,
     )
 
     home_after = await get_home_balance(

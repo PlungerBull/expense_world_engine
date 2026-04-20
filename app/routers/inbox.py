@@ -59,10 +59,14 @@ async def list_inbox(
                 "EXISTS (SELECT 1 FROM expense_bank_accounts a "
                 "WHERE a.id = i.account_id AND a.deleted_at IS NULL AND a.is_archived = false)"
             )
-            # Category must be active
+            # Category must be active and non-archived (an inbox row pointing
+            # at an archived category isn't promotable — promote would 422 on
+            # the same guard, so excluding it from `?ready=true` keeps the
+            # client-facing list honest).
             conditions.append(
                 "EXISTS (SELECT 1 FROM expense_categories c "
-                "WHERE c.id = i.category_id AND c.deleted_at IS NULL)"
+                "WHERE c.id = i.category_id AND c.deleted_at IS NULL "
+                "AND c.is_archived = false)"
             )
 
         if overdue:

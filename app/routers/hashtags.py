@@ -19,6 +19,7 @@ router = APIRouter(prefix="/hashtags", tags=["hashtags"])
 @router.get("")
 async def list_hashtags(
     auth_user: CurrentUser,
+    include_archived: bool = Query(False),
     include_deleted: bool = Query(False),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
@@ -29,6 +30,8 @@ async def list_hashtags(
 
         if not include_deleted:
             conditions.append("deleted_at IS NULL")
+        if not include_archived:
+            conditions.append("is_archived = false")
 
         where = " AND ".join(conditions)
 
@@ -126,6 +129,38 @@ async def restore_hashtag(
         x_idempotency_key,
         status_code=200,
         work=lambda conn: hashtags_service.restore_hashtag(
+            conn, auth_user.id, hashtag_id,
+        ),
+    )
+
+
+@router.post("/{hashtag_id}/archive")
+async def archive_hashtag(
+    hashtag_id: str,
+    auth_user: CurrentUser,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: hashtags_service.archive_hashtag(
+            conn, auth_user.id, hashtag_id,
+        ),
+    )
+
+
+@router.post("/{hashtag_id}/unarchive")
+async def unarchive_hashtag(
+    hashtag_id: str,
+    auth_user: CurrentUser,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: hashtags_service.unarchive_hashtag(
             conn, auth_user.id, hashtag_id,
         ),
     )

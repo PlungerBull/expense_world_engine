@@ -208,6 +208,97 @@ async def delete_hashtag(
     return after
 
 
+async def archive_hashtag(
+    conn: asyncpg.Connection,
+    user_id: str,
+    hashtag_id: str,
+) -> dict:
+    """Set ``is_archived = true`` on a hashtag and log the change.
+
+    Mirrors ``helpers.accounts.archive_account``: direct UPDATE bumps
+    ``version`` and ``updated_at`` so delta sync surfaces the flag flip,
+    and the activity log carries before/after snapshots.
+
+    Junction rows (``expense_transaction_hashtags``) are intentionally
+    NOT touched — archive is a soft hide from pickers, not a destruction
+    of links. Existing transactions keep the hashtag attached.
+
+    Raises:
+        not_found: no active hashtag with that id for this user.
+    """
+    before_row = await conn.fetchrow(
+        "SELECT * FROM expense_hashtags WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+        hashtag_id,
+        user_id,
+    )
+    if before_row is None:
+        raise not_found("hashtag")
+
+    before = hashtag_from_row(before_row)
+
+    after_row = await conn.fetchrow(
+        """
+        UPDATE expense_hashtags
+        SET is_archived = true, updated_at = now(), version = version + 1
+        WHERE id = $1 AND user_id = $2
+        RETURNING *
+        """,
+        hashtag_id,
+        user_id,
+    )
+    after = hashtag_from_row(after_row)
+
+    await write_activity_log(
+        conn, user_id, "hashtag", hashtag_id, ActivityAction.UPDATED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
+async def unarchive_hashtag(
+    conn: asyncpg.Connection,
+    user_id: str,
+    hashtag_id: str,
+) -> dict:
+    """Clear ``is_archived`` on a hashtag and log the change.
+
+    Targets active rows (``deleted_at IS NULL``) regardless of current
+    archive state.
+
+    Raises:
+        not_found: no active hashtag with that id for this user.
+    """
+    before_row = await conn.fetchrow(
+        "SELECT * FROM expense_hashtags WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+        hashtag_id,
+        user_id,
+    )
+    if before_row is None:
+        raise not_found("hashtag")
+
+    before = hashtag_from_row(before_row)
+
+    after_row = await conn.fetchrow(
+        """
+        UPDATE expense_hashtags
+        SET is_archived = false, updated_at = now(), version = version + 1
+        WHERE id = $1 AND user_id = $2
+        RETURNING *
+        """,
+        hashtag_id,
+        user_id,
+    )
+    after = hashtag_from_row(after_row)
+
+    await write_activity_log(
+        conn, user_id, "hashtag", hashtag_id, ActivityAction.UPDATED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
 async def restore_hashtag(
     conn: asyncpg.Connection,
     user_id: str,

@@ -127,7 +127,9 @@ exchange_rates
 
 **Fetch schedule:** A daily background job fetches the previous day's closing rate every morning and inserts one row per currency pair. Clients never write to this table.
 
-**Missing rate fallback:** If no rate exists for a given date (e.g. the job hasn't run yet, or it's a weekend), the engine queries: `WHERE rate_date <= target_date ORDER BY rate_date DESC LIMIT 1` — the most recent available rate.
+**Stale-date backward scan:** The engine always queries `WHERE rate_date <= target_date ORDER BY rate_date DESC LIMIT 1`, so a weekend or one-day fetch gap transparently falls back to the most recent prior rate.
+
+**Truly missing rate:** If no row exists on or before `target_date` for the currency pair (e.g. the daily cron has never run, or the historical backfill is incomplete), the engine raises `422 RATE_UNAVAILABLE` on any write that would have needed `amount_home_cents`. There is **no silent `1.0` fallback** — the old behaviour corrupted home-currency totals and was removed. See engine-spec.md → "Exchange-rate preconditions".
 
 ---
 
@@ -263,7 +265,7 @@ expense_categories
                 — display label. Free to rename, including for system categories.
   - color       text, NOT NULL, default '#6b7280'
   - is_system   boolean, NOT NULL, default false
-                — true for system-managed categories (@Transfer, @Debt). Cannot be deleted.
+                — true for system-managed categories (@Transfer, @Debt). Cannot be deleted or archived.
   - system_key  text, nullable
                 — immutable discriminator for system categories ('debt', 'transfer').
                   NULL for regular user-created categories. The engine looks up
@@ -271,6 +273,10 @@ expense_categories
                   are safe — added in sql/010 to fix the bug where renaming
                   '@Debt' caused subsequent transfers to lazily auto-create a
                   duplicate '@Debt' row.
+  - is_archived boolean, NOT NULL, default false
+                — hides from default pickers and `GET /categories` listings;
+                  historical transactions remain attached. System categories
+                  cannot be archived. Added in sql/014.
   - sort_order  integer, NOT NULL, default 0
   - created_at  timestamptz, NOT NULL, default now()
   - updated_at  timestamptz, NOT NULL, default now()
@@ -424,6 +430,10 @@ expense_hashtags
   - id          UUID, primary key, default uuid_generate_v4()
   - user_id     UUID, NOT NULL, FK → users
   - name        text, NOT NULL
+  - is_archived boolean, NOT NULL, default false
+                — hides from default pickers and `GET /hashtags` listings;
+                  expense_transaction_hashtags junction rows are not touched.
+                  Added in sql/014.
   - sort_order  integer, NOT NULL, default 0
   - created_at  timestamptz, NOT NULL, default now()
   - updated_at  timestamptz, NOT NULL, default now()

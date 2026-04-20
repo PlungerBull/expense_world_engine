@@ -188,3 +188,19 @@ async def archive_account(
             conn, auth_user.id, account_id,
         ),
     )
+
+
+@router.post("/{account_id}/unarchive")
+async def unarchive_account(
+    account_id: str,
+    auth_user: CurrentUser,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: accounts_service.unarchive_account(
+            conn, auth_user.id, account_id,
+        ),
+    )

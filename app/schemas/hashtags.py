@@ -20,6 +20,7 @@ class HashtagResponse(BaseModel):
     id: str
     user_id: str
     name: str
+    is_archived: bool
     sort_order: int
     created_at: datetime
     updated_at: datetime
@@ -32,6 +33,7 @@ def hashtag_from_row(row) -> dict:
         id=str(row["id"]),
         user_id=str(row["user_id"]),
         name=row["name"],
+        is_archived=row["is_archived"],
         sort_order=row["sort_order"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],

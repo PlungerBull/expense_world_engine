@@ -1,4 +1,5 @@
 import logging
+from datetime import date as date_type
 from typing import Optional
 
 from fastapi import Request
@@ -90,6 +91,31 @@ def forbidden(message: str) -> AppError:
 
 def conflict(message: str) -> AppError:
     return AppError(409, "CONFLICT", message)
+
+
+def rate_unavailable(
+    from_currency: str,
+    to_currency: str,
+    as_of: date_type,
+) -> AppError:
+    # 422 rather than 409: the request is valid, the server simply can't
+    # compute amount_home_cents yet because no FX row exists on or before
+    # `as_of` for this pair. A dedicated code lets clients distinguish
+    # "retry after the daily fetch" from generic validation errors, and
+    # prevents the old silent 1.0 fallback that previously corrupted
+    # amount_home_cents on missing-rate days.
+    return AppError(
+        422,
+        "RATE_UNAVAILABLE",
+        f"Exchange rate for {from_currency}->{to_currency} on {as_of.isoformat()} is not available.",
+        {
+            "exchange_rate": (
+                f"No rate on or before {as_of.isoformat()} for "
+                f"{from_currency}->{to_currency}. Wait for the daily fetch "
+                f"or supply an explicit exchange_rate."
+            )
+        },
+    )
 
 
 def settings_missing() -> AppError:

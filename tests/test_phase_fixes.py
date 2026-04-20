@@ -10,6 +10,9 @@ regress the specific hazard the fix addressed.
     counter instead of silently skipping.
   * Phase 3.6 — activity_log rows carry actor_type and the GET /activity
     response exposes it.
+  * Transfer edit guard — PUT on a transfer leg rejects date / exchange_rate
+    in addition to the pre-existing amount_cents / account_id blocks, so
+    the pair can't end up on two different days or with mismatched rates.
 """
 import uuid
 
@@ -198,3 +201,173 @@ async def test_activity_response_includes_actor_type(client, test_data):
         async with db.pool.acquire() as conn:
             await conn.execute("DELETE FROM activity_log WHERE resource_id = $1", cat_id)
             await conn.execute("DELETE FROM expense_categories WHERE id = $1", cat_id)
+
+
+# ---------------------------------------------------------------------------
+# Transfer edit guard — date / exchange_rate rejected on transfer legs
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_transfer_edit_guard_rejects_date_and_rate(client, test_data):
+    """PUT on a transfer leg must reject `date` and `exchange_rate` with
+    422. The PUT path mutates only the edited leg, so letting either
+    through would desync the pair: different dates in the ledger, or
+    mismatched historical rates producing a pair that no longer nets
+    to zero in home currency."""
+    second_account_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 current_balance_cents, is_archived, sort_order,
+                 created_at, updated_at)
+            VALUES ($1, $2, 'Guard-Transfer-Target', 'PEN', false, '#123456',
+                    0, false, 9, now(), now())
+            """,
+            second_account_id, test_data.user_id,
+        )
+
+    primary_id = sibling_id = None
+    created_ids: list[str] = []
+    try:
+        create_r = await client.post(
+            "/v1/transactions",
+            json={
+                "id": str(uuid.uuid4()),
+                "title": f"guard-transfer-{uuid.uuid4()}",
+                "amount_cents": -1500,
+                "date": "2026-04-10T12:00:00Z",
+                "account_id": test_data.account_id,
+                "category_id": test_data.category_id,
+                "transfer": {
+                    "id": str(uuid.uuid4()),
+                    "account_id": second_account_id,
+                    "amount_cents": 1500,
+                },
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert create_r.status_code == 201, create_r.text
+        primary_id = create_r.json()["id"]
+        sibling_id = create_r.json()["transfer_transaction_id"]
+        created_ids = [primary_id, sibling_id]
+
+        async with db.pool.acquire() as conn:
+            before_primary = await conn.fetchrow(
+                "SELECT date, exchange_rate, amount_home_cents FROM expense_transactions WHERE id = $1",
+                primary_id,
+            )
+            before_sibling = await conn.fetchrow(
+                "SELECT date, exchange_rate, amount_home_cents FROM expense_transactions WHERE id = $1",
+                sibling_id,
+            )
+
+        for field, payload in (
+            ("date", {"date": "2026-04-20T12:00:00Z"}),
+            ("exchange_rate", {"exchange_rate": 1.2345}),
+        ):
+            r = await client.put(
+                f"/v1/transactions/{primary_id}",
+                json=payload,
+                headers={"X-Idempotency-Key": str(uuid.uuid4())},
+            )
+            assert r.status_code == 422, (field, r.text)
+            body = r.json()["error"]
+            assert body["code"] == "VALIDATION_ERROR"
+            assert field in (body.get("fields") or {}), (field, body)
+
+        async with db.pool.acquire() as conn:
+            after_primary = await conn.fetchrow(
+                "SELECT date, exchange_rate, amount_home_cents FROM expense_transactions WHERE id = $1",
+                primary_id,
+            )
+            after_sibling = await conn.fetchrow(
+                "SELECT date, exchange_rate, amount_home_cents FROM expense_transactions WHERE id = $1",
+                sibling_id,
+            )
+        assert dict(after_primary) == dict(before_primary), "primary leg was mutated by a rejected PUT"
+        assert dict(after_sibling) == dict(before_sibling), "sibling leg was mutated by a rejected PUT"
+
+    finally:
+        if created_ids:
+            async with db.pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM activity_log WHERE resource_id = ANY($1::uuid[])",
+                    created_ids,
+                )
+                await conn.execute(
+                    "DELETE FROM expense_transactions WHERE id = ANY($1::uuid[])",
+                    created_ids,
+                )
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = $1", second_account_id,
+            )
+
+
+# ---------------------------------------------------------------------------
+# FX loud fallback — no silent 1.0 when a rate is missing
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_create_transaction_rate_unavailable_raises_422(client, test_data):
+    """When the account's currency differs from main_currency and no
+    exchange_rates row covers the transaction date, POST /v1/transactions
+    must fail with 422 RATE_UNAVAILABLE — not silently fall back to a
+    1.0 rate that corrupts amount_home_cents. Also asserts no row was
+    written (fail-loud = no partial state)."""
+    from app.helpers.exchange_rate import clear_rate_cache
+
+    # Drop any negative-cache entries seeded by earlier tests.
+    clear_rate_cache()
+
+    usd_account_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 current_balance_cents, is_archived, sort_order,
+                 created_at, updated_at)
+               VALUES ($1, $2, 'USD-No-Rate', 'USD', false, '#0000FF',
+                       0, false, 99, now(), now())""",
+            usd_account_id, test_data.user_id,
+        )
+
+    txn_id = str(uuid.uuid4())
+    try:
+        # Date in 2000 — well before any seeded exchange_rates row, so the
+        # `rate_date <= $2` query returns nothing and lookup raises.
+        r = await client.post(
+            "/v1/transactions",
+            json={
+                "id": txn_id,
+                "title": f"rate-unavailable-{uuid.uuid4()}",
+                "amount_cents": -1000,
+                "date": "2000-01-01T12:00:00Z",
+                "account_id": usd_account_id,
+                "category_id": test_data.category_id,
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 422, r.text
+        body = r.json()["error"]
+        assert body["code"] == "RATE_UNAVAILABLE", body
+        assert "exchange_rate" in (body.get("fields") or {}), body
+
+        async with db.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id FROM expense_transactions WHERE id = $1", txn_id,
+            )
+        assert row is None, "No ledger row should be written when rate lookup fails"
+
+    finally:
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM activity_log WHERE resource_id = $1", txn_id,
+            )
+            await conn.execute(
+                "DELETE FROM expense_transactions WHERE id = $1", txn_id,
+            )
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = $1", usd_account_id,
+            )
+        clear_rate_cache()

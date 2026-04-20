@@ -401,15 +401,18 @@ async def promote_inbox_item(
     # Category validation only for non-transfers (transfers auto-assign)
     if not is_transfer:
         if inbox_row["category_id"] is None:
-            errors["category_id"] = "Must reference an active category."
+            errors["category_id"] = "Must reference an active, non-archived category."
         else:
             category = await conn.fetchrow(
-                "SELECT id FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+                """
+                SELECT id FROM expense_categories
+                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
+                """,
                 inbox_row["category_id"],
                 user_id,
             )
             if category is None:
-                errors["category_id"] = "Must reference an active category."
+                errors["category_id"] = "Must reference an active, non-archived category."
 
     if errors:
         raise validation_error("Inbox item is not ready to promote.", errors)
