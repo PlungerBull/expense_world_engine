@@ -10,6 +10,7 @@ open their own ``conn.transaction()`` — callers own transaction boundaries.
 
 from datetime import datetime, timezone
 from typing import Optional
+from uuid import UUID
 
 import asyncpg
 
@@ -17,7 +18,7 @@ from app.constants import ActivityAction
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.exchange_rate import get_rate
-from app.helpers.query_builder import dynamic_update, soft_delete
+from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.schemas.accounts import account_from_row
 
 
@@ -54,6 +55,7 @@ async def get_home_balance(
 async def create_account(
     conn: asyncpg.Connection,
     user_id: str,
+    account_id: UUID,
     name: str,
     currency_code: str,
     color: Optional[str],
@@ -64,7 +66,8 @@ async def create_account(
     Raises:
         validation_error: ``currency_code`` is not in ``global_currencies``.
         conflict: a non-deleted account with the same ``(name, currency_code)``
-            already exists for this user.
+            already exists for this user, OR a resource with the same id
+            already exists.
     """
     # Validate currency_code
     currency = await conn.fetchrow(
@@ -91,19 +94,23 @@ async def create_account(
             f"An account named '{name}' with currency '{currency_code}' already exists."
         )
 
-    row = await conn.fetchrow(
-        """
-        INSERT INTO expense_bank_accounts
-            (user_id, name, currency_code, color, sort_order, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, now(), now())
-        RETURNING *
-        """,
-        user_id,
-        name,
-        currency_code,
-        color or "#3b82f6",
-        sort_order or 0,
-    )
+    try:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, color, sort_order, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, now(), now())
+            RETURNING *
+            """,
+            account_id,
+            user_id,
+            name,
+            currency_code,
+            color or "#3b82f6",
+            sort_order or 0,
+        )
+    except asyncpg.UniqueViolationError:
+        raise conflict(f"An account with id '{account_id}' already exists.")
 
     home = await get_home_balance(conn, row["currency_code"], row["current_balance_cents"], user_id)
     response = account_from_row(row, home)
@@ -259,6 +266,43 @@ async def delete_account(
 
     await write_activity_log(
         conn, user_id, "account", account_id, ActivityAction.DELETED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
+async def restore_account(
+    conn: asyncpg.Connection,
+    user_id: str,
+    account_id: str,
+) -> dict:
+    """Undo a soft-delete on an account and log the restoration.
+
+    Raises:
+        not_found: no soft-deleted account with that id for this user.
+    """
+    before_row = await conn.fetchrow(
+        "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL",
+        account_id,
+        user_id,
+    )
+    if before_row is None:
+        raise not_found("account")
+
+    home_before = await get_home_balance(
+        conn, before_row["currency_code"], before_row["current_balance_cents"], user_id
+    )
+    before = account_from_row(before_row, home_before)
+
+    after_row = await restore(conn, "expense_bank_accounts", account_id, user_id)
+    home_after = await get_home_balance(
+        conn, after_row["currency_code"], after_row["current_balance_cents"], user_id
+    )
+    after = account_from_row(after_row, home_after)
+
+    await write_activity_log(
+        conn, user_id, "account", account_id, ActivityAction.RESTORED,
         before_snapshot=before,
         after_snapshot=after,
     )

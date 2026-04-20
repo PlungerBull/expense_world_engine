@@ -22,7 +22,7 @@ Observations drawn from studying production financial and productivity APIs:
 
 ### 1. UUID-First Resource Identification
 
-All resources are identified by a UUID generated client-side before server confirmation. No resource is identified by its name, slug, or any mutable attribute. The frontend always has the ID before making a write — it never needs to "find" a resource by querying its content first. See `lessons-todoist.md §1`.
+All resources are identified by a UUID generated client-side before server confirmation. Every `POST` that creates a resource requires an `id: UUID` field in the request body — the engine never picks the id. This enables offline-first clients to reference a resource (render it, attach hashtags, link it to other local state) before the round trip completes, and makes idempotent retries trivial: a second POST with the same `id` returns `409 CONFLICT`, not a duplicate row. No resource is identified by its name, slug, or any mutable attribute. The frontend always has the ID before making a write — it never needs to "find" a resource by querying its content first. Internally-seeded system resources (system categories, activity_log rows, idempotency keys, sync checkpoints) are the only exception and use server-generated UUIDs because no client request triggers them. See `lessons-todoist.md §1`.
 
 ### 2. Headless Architecture — The Engine Is the Product
 
@@ -44,17 +44,41 @@ Every mutable table carries a `version` integer and `updated_at` timestamp, both
 
 Many-to-many relationships (transaction ↔ hashtag) live in junction tables in the database — the canonical storage with FK integrity, per-link `version`, per-link `deleted_at`, and per-link activity-log entries. **On the wire, the relationship is flattened to an embedded array of IDs on the parent object.** Clients see `transaction.hashtag_ids = [uuid, ...]` and never see junction rows. This matches Todoist's `task.labels` and Lunch Money's `transaction.tags`. The price of denormalizing on the wire while normalizing in storage is the parent-bump rule above (§3): junction-row mutations must bump the parent so delta sync notices.
 
+### 3b. Client Local Replica Standard
+
+All interactive clients — iOS, web, CLI, and any future client — hold a disposable local read replica of the user's data, built from `GET /sync`. The replica is **not a second source of truth.** It is a performance optimization and an offline affordance. The engine remains the only authoritative store. This matches Todoist's client architecture, where every official app (mobile, desktop, web, CLI) maintains a sync-backed local cache and all business logic stays server-side.
+
+**Replica mechanics.** On first launch, a client generates a stable `X-Client-Id` UUID (OS keychain on iOS, localStorage on web, config file on CLI) and calls `GET /sync?sync_token=*` to fetch the full state for that user. Subsequent commands call `GET /sync?sync_token=<stored>` and apply deltas — inserts, updates, and tombstones — to the local store. Reads (list, search, balance lookups, category pickers) hit the local replica directly and are instant. Writes go to the engine over HTTPS with `X-Idempotency-Key`; on success, the affected rows are patched locally or refreshed via a follow-up delta sync.
+
+**Disposable by design.** The replica is always rebuildable. A corrupt cache, a new device, a schema migration, or a user wiping local state is not a recovery scenario — it is a cold start. The client calls `sync_token=*`, rebuilds from scratch, and continues. No client code ever attempts to repair the replica from partial local state; when in doubt, full-sync.
+
+**Offline writes are out of scope by default.** Writes require network connectivity. Individual clients may add a local write queue if their product calls for it — likely iOS, probably never CLI — but this is an explicit per-client decision, not the default. A client that queues writes locally takes on the full burden of conflict resolution, retry, reconciliation, and UUID pre-generation discipline. This is a significant design commitment, not a convenience, and must be documented in that client's own repo.
+
+**Home-currency amounts in the replica are point-in-time.** The `amount_home_cents` and related fields returned by `/sync` reflect FX rates at sync time and drift as rates move. Clients must treat any balance-sensitive display (dashboard totals, report summaries, net-worth views) as requiring a fresh engine call, not a local recomputation. `/dashboard` is the canonical place for derived home-currency values, and clients should prefer it over computing aggregates from cached transaction rows.
+
+**Stateless escape hatch (CLI).** The CLI additionally supports an explicit stateless mode via a `--no-cache` flag or `EXPENSE_STATELESS=1` environment variable that bypasses the replica entirely for a given invocation. In this mode, reads go straight to the engine, no cache file is opened, and no sync is performed. This mode exists for CSV imports, CI pipelines, cron-triggered scripts, and ad-hoc automation piped into tools like `jq` — contexts where per-invocation freshness matters more than speed, where ephemeral environments (CI containers) gain nothing from a cache, and where concurrent invocations would otherwise contend on the local SQLite file. Other clients may expose an equivalent mode if their product calls for it, but it is not required.
+
 ### 4. Idempotency Keys
 
-Clients generate a unique key per intended write operation and include it in the request. The engine checks `idempotency_keys` before processing — duplicates return the stored result of the original operation. TTL is 24 hours. Critical for transaction creation where duplicates corrupt balances. See `lessons-todoist.md §4`.
+Clients generate a unique key per intended write operation and include it in the request. The engine stores `(user_id, key) → (response_body, response_status)` in `idempotency_keys` so replays reconstruct the **full response envelope, including the original HTTP status code** — no per-route re-derivation. TTL is 24 hours.
+
+**Concurrency.** Every write handler acquires a transaction-scoped Postgres advisory lock (`pg_advisory_xact_lock`) derived from `(user_id, key)` as the first statement inside the write transaction. Two concurrent requests with the same key serialize at the DB: the second blocks until the first commits, then reads the stored snapshot and returns it verbatim. No double writes are possible, no race window between check and store. This is implemented once in `helpers/idempotency.py::run_idempotent` and every write handler delegates to it — changing idempotency behavior is a one-file edit, not a 23-file scavenger hunt.
+
+Critical for transaction creation where duplicates corrupt balances. See `lessons-todoist.md §4`.
 
 ### 5. Soft Delete Everywhere
 
-All mutable tables carry `deleted_at` (nullable timestamptz). Hard deletion is never performed on financial records. Deleted records are excluded from active queries but remain in the database and participate in historical calculations. Delta sync responses include tombstones — deletions are communicated explicitly, never inferred from absence. See `lessons-todoist.md §5`.
+All mutable tables carry `deleted_at` (nullable timestamptz). Hard deletion is never performed on financial records. Deleted records are excluded from active queries but remain in the database and participate in historical calculations. Delta sync responses include tombstones — deletions are communicated explicitly, never inferred from absence. Every resource with a delete endpoint also exposes `POST /{resource}/{id}/restore`, which clears `deleted_at`, writes a `RESTORED` activity log entry, and enforces any collision rules (e.g., restoring a category whose name now collides with an active one returns `409`). See `lessons-todoist.md §5`.
 
 ### 6. Activity Log as a Correctness Requirement
 
-Every mutation to any mutable table produces an immutable row in `activity_log` capturing: resource type, resource ID, action (created/updated/deleted/restored), full before/after JSON snapshots, timestamp, and actor. For a financial application this is not optional — it is the mechanism for answering "why does my balance look wrong?" Designed from day one; retrofitting loses historical record. See `lessons-todoist.md §6`.
+Every mutation to any mutable table produces an immutable row in `activity_log` capturing: resource type, resource ID, action (1=CREATED, 2=UPDATED, 3=DELETED, 4=RESTORED), full before/after JSON snapshots, timestamp, and actor. For a financial application this is not optional — it is the mechanism for answering "why does my balance look wrong?" Designed from day one; retrofitting loses historical record. See `lessons-todoist.md §6`.
+
+**Deliberate aggregate exceptions.** Three mutation paths skip per-row entries in favor of a single aggregate entry. Each is a conscious trade, not an oversight:
+
+1. **Junction-row mutations on `expense_transaction_hashtags`** — the parent transaction's `UPDATED` entry carries the full new `hashtag_ids` list, so the change is captured at parent granularity. Per-link entries would multiply audit row count by the average hashtags per transaction without enabling new audit questions.
+2. **`recalculate_home_currency` bulk UPDATEs** — a single `UPDATED` entry on `user_settings` carries a `recalculation` summary block (rows touched per pass). A full recalc on a busy user can rewrite tens of thousands of rows in one request; per-row entries would inflate `activity_log` by orders of magnitude.
+3. **`users.last_login_at` bumps on repeat bootstrap** — not logged at all. Login bumps are operational metadata, not user actions. If session-level audit becomes a requirement, a dedicated `auth_sessions` table is the right home, not inflated `activity_log`.
 
 ### 7. Command Batching for Multi-Record Workflows
 
@@ -71,6 +95,8 @@ Sign conventions are not baked into the schema. The engine accepts a `debit_as_n
 ### 10. Null Over Omission
 
 Optional fields with no value are returned as `null` in API responses, never omitted. The response shape is always identical regardless of data presence. Clients never check for key existence before reading — they always find the key, potentially null. See `lessons-ynab.md §7`.
+
+**`VALIDATION_ERROR.fields` is an exception** — on `VALIDATION_ERROR` responses specifically, `fields` is always an object (possibly empty), never `null`, so clients can uniformly iterate `Object.keys(error.fields)` without a null check. Non-validation errors (`UNAUTHORIZED`, `NOT_FOUND`, `FORBIDDEN`, `CONFLICT`, `SETTINGS_MISSING`, `INTERNAL_ERROR`) keep `fields: null` since they aren't field-scoped.
 
 ### 11. IDs-Only as the Future Direction
 
@@ -104,7 +130,7 @@ Four repositories, one managed database. Each has a single, clear role.
 Python (FastAPI) + Supabase. Single source of truth. Handles all database connections, all business logic (categorisation, balance updates, sync processing), and exposes the API that all clients consume. Hosted on Render. Never replaced — only evolved.
 
 **`expense_world_cli` — The Hands**
-Python (Typer). Developer-facing terminal interface. Talks to the engine via the API. Logs expenses, checks sync state, runs bulk imports. The primary tool for verifying backend behaviour during development. Built before the web dashboard.
+Python (Typer). Developer-facing terminal interface. Talks to the engine via the API. Holds a local SQLite replica built from `GET /sync` (see §3b) so interactive reads are instant and work offline; writes go directly to the engine over HTTPS with idempotency keys. Supports an explicit stateless mode (`--no-cache` / `EXPENSE_STATELESS=1`) that bypasses the replica for scripting, CSV imports, and CI contexts. The primary tool for verifying backend behaviour during development. Built before the web dashboard.
 
 **`expense_world_web` — The Eyes**
 Next.js on Vercel. Lightweight read-only dashboard. Calls the engine API and displays balances, monthly category totals, and recent transactions. No business logic, no entry, no editing — read-only first. Expanded incrementally as real needs emerge. May eventually replace the need for an iOS app.
@@ -154,4 +180,4 @@ Authentication is fully delegated to Supabase Auth. The engine never sees, store
 
 ---
 
-*Last updated: April 2026*
+*Last updated: April 2026 (Sprints 1–4 aligned)*

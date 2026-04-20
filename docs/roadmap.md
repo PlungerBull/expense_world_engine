@@ -166,9 +166,10 @@ Build each resource group completely before starting the next. For each: list, c
    - Auto-create `@Debt` or `@Transfer` system categories if they don't exist yet
    - Validate that the two transactions are directionally opposite (one negative, one positive)
    - Update `current_balance_cents` on both accounts
+   - **Do not auto-create person accounts.** If `transfer.account_id` references a non-existent or archived account, return `422`. Person accounts are created explicitly via the People API (Phase 4).
 3. Deletion of a transfer transaction deletes both rows atomically
 
-**Verify:** Create a real-to-real transfer (both sides get @Transfer). Create a real-to-person transfer (person side gets @Debt). Try to create a transfer where both sides are the same sign (expect 422).
+**Verify:** Create a real-to-real transfer (both sides get @Transfer). Test real-to-person transfer behaviour end-to-end once Phase 4 ships the People API — until then, this path is exercisable only by seeding a person account directly in the DB (dev/test only). Try to create a transfer where both sides are the same sign (expect 422). Try to create a transfer to a non-existent `account_id` (expect 422 — no auto-creation).
 
 **Commit:** `feat: transfer creation — paired transactions, zero-sum validation, auto-category`
 
@@ -324,7 +325,7 @@ Next: write the `expense_world_cli` spec (fill in `cli-spec.md`) and start build
 
 | Phase | Scope |
 |---|---|
-| Phase 4 | People & person accounts UI via CLI |
+| Phase 4 | People & person accounts — dedicated People API (`POST /people`, etc.) + CLI surface. **Person accounts are created only via this API, never auto-created by the transfer engine.** |
 | Phase 5 | Batch CSV import, `import_id` deduplication, recurrence templates |
 | Budgets | `expense_budgets` table, budget endpoints — deferred |
 | Sharing | `transaction_shares`, cross-user flows — deferred |

@@ -27,15 +27,17 @@ from the same inbox item.
 """
 
 from typing import Optional
+from uuid import UUID
 
 import asyncpg
 
-from app.constants import ActivityAction, TransactionType
-from app.errors import not_found, validation_error
+from app.constants import ActivityAction, InboxStatus, TransactionType
+from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
 from app.helpers.exchange_rate import lookup_exchange_rate
-from app.helpers.query_builder import dynamic_update, soft_delete
+from app.helpers.query_builder import dynamic_update, restore, soft_delete
+from app.helpers.validation import extract_update_fields
 from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
 from app.schemas.transactions import infer_transaction_type, transaction_from_row
 
@@ -90,28 +92,32 @@ async def create_inbox_item(
     if exchange_rate is None and body.account_id and body.date:
         exchange_rate = await lookup_exchange_rate(conn, body.account_id, body.date, user_id)
 
-    row = await conn.fetchrow(
-        """
-        INSERT INTO expense_transaction_inbox
-            (user_id, title, description, amount_cents, transaction_type,
-             date, account_id, category_id, exchange_rate,
-             transfer_account_id, transfer_amount_cents,
-             created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 1.0), $10, $11, now(), now())
-        RETURNING *
-        """,
-        user_id,
-        body.title,
-        body.description,
-        amount_cents,
-        transaction_type,
-        body.date,
-        body.account_id,
-        body.category_id,
-        exchange_rate,
-        transfer_account_id,
-        transfer_amount_cents,
-    )
+    try:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO expense_transaction_inbox
+                (id, user_id, title, description, amount_cents, transaction_type,
+                 date, account_id, category_id, exchange_rate,
+                 transfer_account_id, transfer_amount_cents,
+                 created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 1.0), $11, $12, now(), now())
+            RETURNING *
+            """,
+            body.id,
+            user_id,
+            body.title,
+            body.description,
+            amount_cents,
+            transaction_type,
+            body.date,
+            body.account_id,
+            body.category_id,
+            exchange_rate,
+            transfer_account_id,
+            transfer_amount_cents,
+        )
+    except asyncpg.UniqueViolationError:
+        raise conflict(f"An inbox item with id '{body.id}' already exists.")
 
     response = inbox_from_row(row)
 
@@ -138,11 +144,12 @@ async def update_inbox_item(
     as ``create_inbox_item``, plus auto-relookup of the exchange rate
     when ``date`` changes.
 
-    Empty updates (no fields after Pydantic exclude-none) short-circuit
-    to a fetch-and-return — matches the prior router behaviour and the
-    pattern established by other domain helpers.
+    Empty updates short-circuit to a fetch-and-return — matches the prior
+    router behaviour and the pattern established by other domain helpers.
+    Null values on any field are rejected with 422 (spec: PUT fields must
+    not be explicit-null).
     """
-    fields = body.model_dump(exclude_none=True)
+    fields = extract_update_fields(body)
 
     # Extract transfer before passing to dynamic UPDATE builder
     transfer = fields.pop("transfer", None)
@@ -249,6 +256,65 @@ async def delete_inbox_item(
 
 
 # ---------------------------------------------------------------------------
+# Restore
+# ---------------------------------------------------------------------------
+
+async def restore_inbox_item(
+    conn: asyncpg.Connection,
+    user_id: str,
+    inbox_id: str,
+) -> dict:
+    """Undo a soft-delete on a PENDING inbox item.
+
+    Only restores rows whose status is still PENDING — i.e., rows that
+    were dismissed before being promoted. Promoted rows (status = 2) are
+    deliberately NOT restorable here: the ledger transaction they created
+    still exists, so "restoring" the inbox side would leave the user one
+    promote-click away from a duplicate ledger row. To undo a promotion
+    the correct path is to delete the ledger transaction; once transaction
+    restore ships, clients can chain the two operations themselves.
+
+    The status guard uses ``!= PENDING`` (not ``== PROMOTED``) so any
+    future status value the spec adds is rejected by default rather than
+    silently accepted.
+
+    Raises:
+        not_found: no soft-deleted inbox row with that id for this user.
+        conflict: the row is soft-deleted but was promoted — restore is
+            not the right gesture; client should delete the ledger row
+            instead.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM expense_transaction_inbox
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL
+        """,
+        inbox_id,
+        user_id,
+    )
+    if row is None:
+        raise not_found("inbox item")
+
+    if row["status"] != InboxStatus.PENDING:
+        raise conflict(
+            "Inbox item was promoted to the ledger. Delete the ledger "
+            "transaction to undo the promotion."
+        )
+
+    before = inbox_from_row(row)
+
+    after_row = await restore(conn, "expense_transaction_inbox", inbox_id, user_id)
+    after = inbox_from_row(after_row)
+
+    await write_activity_log(
+        conn, user_id, "inbox", inbox_id, ActivityAction.RESTORED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
+# ---------------------------------------------------------------------------
 # Promote
 # ---------------------------------------------------------------------------
 
@@ -256,6 +322,8 @@ async def promote_inbox_item(
     conn: asyncpg.Connection,
     user_id: str,
     inbox_id: str,
+    target_id: UUID,
+    target_transfer_id: Optional[UUID],
 ) -> dict:
     """Promote a pending inbox item into a ledger transaction.
 
@@ -348,6 +416,12 @@ async def promote_inbox_item(
 
     # 4a. Transfer promotion branch
     if is_transfer:
+        if target_transfer_id is None:
+            raise validation_error(
+                "transfer_id is required when promoting a transfer inbox item.",
+                {"transfer_id": "Must be present for transfer promotions."},
+            )
+
         # Imported lazily to avoid circular-import complications
         from app.helpers.transfers import create_transfer_pair
 
@@ -359,6 +433,8 @@ async def promote_inbox_item(
         txn_response, _sibling = await create_transfer_pair(
             conn=conn,
             user_id=user_id,
+            primary_id=target_id,
+            sibling_id=target_transfer_id,
             primary_title=inbox_row["title"],
             primary_description=inbox_row["description"],
             primary_amount_cents=primary_signed,
@@ -381,27 +457,31 @@ async def promote_inbox_item(
         amount_home_cents = round(inbox_row["amount_cents"] * exchange_rate)
 
         # Create expense_transactions row
-        txn_row = await conn.fetchrow(
-            """
-            INSERT INTO expense_transactions
-                (user_id, title, description, amount_cents, amount_home_cents,
-                 transaction_type, date, account_id, category_id, exchange_rate,
-                 inbox_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
-            RETURNING *
-            """,
-            user_id,
-            inbox_row["title"],
-            inbox_row["description"],
-            inbox_row["amount_cents"],
-            amount_home_cents,
-            transaction_type,
-            inbox_row["date"],
-            inbox_row["account_id"],
-            inbox_row["category_id"],
-            inbox_row["exchange_rate"],
-            inbox_row["id"],
-        )
+        try:
+            txn_row = await conn.fetchrow(
+                """
+                INSERT INTO expense_transactions
+                    (id, user_id, title, description, amount_cents, amount_home_cents,
+                     transaction_type, date, account_id, category_id, exchange_rate,
+                     inbox_id, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
+                RETURNING *
+                """,
+                target_id,
+                user_id,
+                inbox_row["title"],
+                inbox_row["description"],
+                inbox_row["amount_cents"],
+                amount_home_cents,
+                transaction_type,
+                inbox_row["date"],
+                inbox_row["account_id"],
+                inbox_row["category_id"],
+                inbox_row["exchange_rate"],
+                inbox_row["id"],
+            )
+        except asyncpg.UniqueViolationError:
+            raise conflict(f"A transaction with id '{target_id}' already exists.")
 
         txn_response = transaction_from_row(txn_row)
 

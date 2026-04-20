@@ -3,13 +3,13 @@
 from typing import Optional
 
 from fastapi import APIRouter, Header
-from fastapi.responses import JSONResponse
 
 from app import db
 from app.deps import CurrentUser
 from app.errors import not_found
 from app.helpers import auth as auth_service
-from app.helpers.idempotency import check_idempotency, store_idempotency
+from app.helpers.idempotency import run_idempotent
+from app.helpers.validation import extract_update_fields
 from app.schemas.auth import (
     BootstrapRequest,
     BootstrapResponse,
@@ -22,28 +22,28 @@ from app.schemas.auth import (
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/bootstrap", response_model=BootstrapResponse)
+@router.post("/bootstrap", response_model=BootstrapResponse, status_code=200)
 async def bootstrap(
     body: BootstrapRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
-
-        async with conn.transaction():
-            response = await auth_service.bootstrap(
-                conn,
-                auth_user.id,
-                auth_user.email,
-                body.display_name,
-                body.timezone,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+    # 200, not 201: /bootstrap has upsert semantics. First call inserts the
+    # user + settings rows; subsequent calls update last_login_at on the
+    # existing rows. Unlike other POSTs (which are pure creates and return
+    # 201), bootstrap may find the resource already present.
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: auth_service.bootstrap(
+            conn,
+            auth_user.id,
+            auth_user.email,
+            body.display_name,
+            body.timezone,
+        ),
+    )
 
 
 @router.get("/me", response_model=BootstrapResponse)
@@ -73,17 +73,12 @@ async def update_settings(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    fields = body.model_dump(exclude_none=True)
-
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
-
-        async with conn.transaction():
-            response = await auth_service.update_settings(
-                conn, auth_user.id, fields,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+    fields = extract_update_fields(body)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: auth_service.update_settings(
+            conn, auth_user.id, fields,
+        ),
+    )

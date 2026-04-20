@@ -8,26 +8,28 @@ open their own ``conn.transaction()`` — callers own transaction boundaries.
 """
 
 from typing import Optional
+from uuid import UUID
 
 import asyncpg
 
 from app.constants import ActivityAction
 from app.errors import conflict, not_found
 from app.helpers.activity_log import write_activity_log
-from app.helpers.query_builder import dynamic_update, soft_delete
+from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.schemas.hashtags import hashtag_from_row
 
 
 async def create_hashtag(
     conn: asyncpg.Connection,
     user_id: str,
+    hashtag_id: UUID,
     name: str,
     sort_order: Optional[int],
 ) -> dict:
     """Validate uniqueness, insert, and log the creation.
 
     Raises:
-        conflict: a non-deleted hashtag with the same name already exists.
+        conflict: a non-deleted hashtag with the same name or id already exists.
     """
     existing = await conn.fetchrow(
         """
@@ -40,17 +42,21 @@ async def create_hashtag(
     if existing is not None:
         raise conflict(f"A hashtag named '{name}' already exists.")
 
-    row = await conn.fetchrow(
-        """
-        INSERT INTO expense_hashtags
-            (user_id, name, sort_order, created_at, updated_at)
-        VALUES ($1, $2, $3, now(), now())
-        RETURNING *
-        """,
-        user_id,
-        name,
-        sort_order or 0,
-    )
+    try:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO expense_hashtags
+                (id, user_id, name, sort_order, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, now(), now())
+            RETURNING *
+            """,
+            hashtag_id,
+            user_id,
+            name,
+            sort_order or 0,
+        )
+    except asyncpg.UniqueViolationError:
+        raise conflict(f"A hashtag with id '{hashtag_id}' already exists.")
 
     response = hashtag_from_row(row)
 
@@ -157,6 +163,12 @@ async def delete_hashtag(
     # Soft-delete all junction rows for this hashtag, capturing the
     # affected transaction IDs so we can bump their version + updated_at.
     # Without the parent bump, /sync would miss the hashtag_ids change.
+    #
+    # Activity log — per-row entries for the junction table are
+    # deliberately NOT written here (see helpers/transactions._sync_hashtags
+    # for the rationale). Each affected parent transaction's next delta
+    # sync carries the new hashtag_ids list via its version bump, and a
+    # single DELETED entry is written for the hashtag itself below.
     affected = await conn.fetch(
         """
         UPDATE expense_transaction_hashtags
@@ -184,6 +196,60 @@ async def delete_hashtag(
 
     await write_activity_log(
         conn, user_id, "hashtag", hashtag_id, ActivityAction.DELETED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
+async def restore_hashtag(
+    conn: asyncpg.Connection,
+    user_id: str,
+    hashtag_id: str,
+) -> dict:
+    """Undo a soft-delete on a hashtag and log the restoration.
+
+    Does NOT restore the junction rows cascaded-deleted at delete time —
+    restoring them would silently re-tag transactions the user may no
+    longer want labeled. The restored hashtag becomes an empty (zero
+    transactions) label that can be re-applied manually.
+
+    Checks for name collisions with active hashtags before clearing
+    deleted_at.
+
+    Raises:
+        not_found: no soft-deleted hashtag with that id for this user.
+        conflict: an active hashtag already uses the same name.
+    """
+    before_row = await conn.fetchrow(
+        "SELECT * FROM expense_hashtags WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL",
+        hashtag_id,
+        user_id,
+    )
+    if before_row is None:
+        raise not_found("hashtag")
+
+    dup = await conn.fetchrow(
+        """
+        SELECT id FROM expense_hashtags
+        WHERE user_id = $1 AND name = $2 AND id != $3 AND deleted_at IS NULL
+        """,
+        user_id,
+        before_row["name"],
+        hashtag_id,
+    )
+    if dup is not None:
+        raise conflict(
+            f"Cannot restore hashtag: an active hashtag named '{before_row['name']}' already exists."
+        )
+
+    before = hashtag_from_row(before_row)
+
+    after_row = await restore(conn, "expense_hashtags", hashtag_id, user_id)
+    after = hashtag_from_row(after_row)
+
+    await write_activity_log(
+        conn, user_id, "hashtag", hashtag_id, ActivityAction.RESTORED,
         before_snapshot=before,
         after_snapshot=after,
     )

@@ -57,7 +57,16 @@ async def bootstrap(
             after_snapshot=user_from_row(user_row),
         )
     else:
-        # Existing user — update last_login_at
+        # Existing user — bump last_login_at.
+        #
+        # Activity log — deliberate exception: this UPDATE does NOT write
+        # an activity_log entry. last_login_at is operational metadata
+        # (every successful bootstrap call touches it), not a user action
+        # worth auditing. Writing one per login would double-log every
+        # session start across every device and crowd out signal in the
+        # activity feed. If session-level audit becomes a requirement,
+        # store it in a dedicated ``auth_sessions`` table instead of
+        # inflating activity_log.
         user_row = await conn.fetchrow(
             """
             UPDATE users SET last_login_at = now(), updated_at = now()

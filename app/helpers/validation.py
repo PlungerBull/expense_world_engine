@@ -13,9 +13,43 @@ once at the end (e.g. ``promote_inbox_item``, ``create_transfer_pair``,
 inline fetches that set ``errors[field]`` without raising.
 """
 
+from typing import Optional
+
 import asyncpg
+from pydantic import BaseModel
 
 from app.errors import validation_error
+
+
+def extract_update_fields(
+    body: BaseModel,
+    nullable: Optional[set[str]] = None,
+) -> dict:
+    """Extract fields explicitly set by a PUT request body.
+
+    Uses ``model_dump(exclude_unset=True)`` so callers can distinguish
+    "field omitted" from "field explicitly null". Nulls on fields NOT listed
+    in ``nullable`` raise 422 — this enforces the spec rule that clients
+    cannot clear non-nullable fields by sending null, while preserving
+    legitimate "clear me" / "unassign me" semantics for fields that opt in.
+
+    The distinction matters for immutability checks: ``currency_code: null``
+    should be treated as "caller included the immutable field", not as
+    "caller omitted the field", so the service's immutability guard fires.
+    """
+    raw = body.model_dump(exclude_unset=True)
+    nullable = nullable or set()
+    violations = {
+        key: "Must not be null."
+        for key, value in raw.items()
+        if value is None and key not in nullable
+    }
+    if violations:
+        raise validation_error(
+            "Request contains null values for non-nullable fields.",
+            violations,
+        )
+    return raw
 
 
 async def validate_active_account(

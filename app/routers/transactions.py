@@ -9,15 +9,15 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Header, Query
-from fastapi.responses import JSONResponse
 
 from app import db
 from app.deps import CurrentUser
 from app.errors import not_found
 from app.helpers import transactions as transactions_service
 from app.helpers.formatting import apply_debit_as_negative
-from app.helpers.idempotency import check_idempotency, store_idempotency
-from app.helpers.pagination import clamp_limit, paginated_response
+from app.helpers.idempotency import run_idempotent
+from app.helpers.pagination import paginated_response
+from app.helpers.validation import extract_update_fields
 from app.schemas.transactions import (
     TransactionBatchRequest,
     TransactionCreateRequest,
@@ -66,11 +66,9 @@ async def list_transactions(
     search: Optional[str] = Query(None),
     include_deleted: bool = Query(False),
     debit_as_negative: bool = Query(False),
-    limit: int = Query(50),
-    offset: int = Query(0),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
-    limit = clamp_limit(limit)
-
     async with db.pool.acquire() as conn:
         conditions = ["t.user_id = $1"]
         params: list = [auth_user.id]
@@ -146,18 +144,14 @@ async def create_transaction(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached, status_code=201)
-
-        async with conn.transaction():
-            response = await transactions_service.create_transaction(
-                conn, auth_user.id, body,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return JSONResponse(content=response, status_code=201)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=201,
+        work=lambda conn: transactions_service.create_transaction(
+            conn, auth_user.id, body,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,35 +166,28 @@ async def update_transaction(
 ):
     # Split out hashtag_ids and reconciliation_id — the helper receives
     # the rest as a mutable ``fields`` dict it can update in place.
-    fields = body.model_dump(exclude_none=True)
+    # reconciliation_id accepts null (legitimate "unassign" signal);
+    # all other fields reject null via extract_update_fields.
+    fields = extract_update_fields(body, nullable={"reconciliation_id"})
     hashtag_ids = fields.pop("hashtag_ids", None)
 
-    # reconciliation_id needs special handling: model_dump(exclude_none=True)
-    # drops null values, but we need to distinguish "omitted" from
-    # "explicitly set to null" so clients can unassign by sending
-    # reconciliation_id: null.
-    recon_id_provided = "reconciliation_id" in body.model_fields_set
-    recon_id_value = body.reconciliation_id
-    fields.pop("reconciliation_id", None)
+    recon_id_provided = "reconciliation_id" in fields
+    recon_id_value = fields.pop("reconciliation_id", None)
 
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
-
-        async with conn.transaction():
-            response = await transactions_service.update_transaction(
-                conn,
-                auth_user.id,
-                transaction_id,
-                fields,
-                hashtag_ids,
-                recon_id_provided,
-                recon_id_value,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: transactions_service.update_transaction(
+            conn,
+            auth_user.id,
+            transaction_id,
+            fields,
+            hashtag_ids,
+            recon_id_provided,
+            recon_id_value,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -212,18 +199,33 @@ async def delete_transaction(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: transactions_service.delete_transaction(
+            conn, auth_user.id, transaction_id,
+        ),
+    )
 
-        async with conn.transaction():
-            response = await transactions_service.delete_transaction(
-                conn, auth_user.id, transaction_id,
-            )
 
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+# ---------------------------------------------------------------------------
+# POST /transactions/{transaction_id}/restore
+# ---------------------------------------------------------------------------
+@router.post("/{transaction_id}/restore")
+async def restore_transaction(
+    transaction_id: str,
+    auth_user: CurrentUser,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: transactions_service.restore_transaction(
+            conn, auth_user.id, transaction_id,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,15 +237,11 @@ async def batch_create_transactions(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached, status_code=201)
-
-        async with conn.transaction():
-            response = await transactions_service.create_batch(
-                conn, auth_user.id, body,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return JSONResponse(content=response, status_code=201)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=201,
+        work=lambda conn: transactions_service.create_batch(
+            conn, auth_user.id, body,
+        ),
+    )

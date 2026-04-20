@@ -60,3 +60,28 @@ async def soft_delete(
         resource_id,
         user_id,
     )
+
+
+async def restore(
+    conn: asyncpg.Connection,
+    table: str,
+    resource_id: str,
+    user_id: str,
+) -> Optional[asyncpg.Record]:
+    """Undo a soft-delete by clearing deleted_at, returning the updated row.
+
+    Only matches rows that are currently soft-deleted — a restore on an
+    already-active row returns ``None`` so callers can distinguish "not
+    deleted" from "not found". Bumps ``updated_at`` and ``version`` so
+    delta sync picks up the change.
+    """
+    return await conn.fetchrow(
+        f"""
+        UPDATE {table}
+        SET deleted_at = NULL, updated_at = now(), version = version + 1
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL
+        RETURNING *
+        """,
+        resource_id,
+        user_id,
+    )

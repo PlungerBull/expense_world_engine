@@ -9,49 +9,74 @@ open their own ``conn.transaction()`` — callers own transaction boundaries.
 
 import uuid
 from typing import Optional
+from uuid import UUID
 
 import asyncpg
 
-from app.constants import ActivityAction
+from app.constants import (
+    SYSTEM_CATEGORY_DEFAULT_NAMES,
+    ActivityAction,
+    SystemCategoryKey,
+)
 from app.errors import conflict, forbidden, not_found
 from app.helpers.activity_log import write_activity_log
-from app.helpers.query_builder import dynamic_update, soft_delete
+from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.schemas.categories import category_from_row
 
 
-async def ensure_system_category(conn: asyncpg.Connection, user_id: str, name: str) -> str:
-    """Return the ID of a system category, creating it if it doesn't exist.
+async def ensure_system_category(
+    conn: asyncpg.Connection,
+    user_id: str,
+    key: SystemCategoryKey,
+) -> str:
+    """Return the ID of a system category, seeding it on first use.
 
-    Uses ON CONFLICT for race-safety when two concurrent requests both try
-    to auto-create the same system category for the first time.
+    Lookup is by the immutable ``system_key`` column, not by display name,
+    so the category row survives renames without the transfer pipeline
+    fragmenting into duplicates.
+
+    The ON CONFLICT clause makes concurrent first-time seeding race-safe:
+    if two transactions both try to insert the same key, the loser hits
+    the partial unique index and falls through to the re-read.
     """
     row = await conn.fetchrow(
-        "SELECT id FROM expense_categories WHERE user_id = $1 AND name = $2 AND deleted_at IS NULL",
+        """
+        SELECT id FROM expense_categories
+        WHERE user_id = $1 AND system_key = $2 AND deleted_at IS NULL
+        """,
         user_id,
-        name,
+        key.value,
     )
     if row is not None:
         return str(row["id"])
 
+    default_name = SYSTEM_CATEGORY_DEFAULT_NAMES[key]
     row = await conn.fetchrow(
         """
-        INSERT INTO expense_categories (id, user_id, name, color, is_system, created_at, updated_at)
-        VALUES ($1, $2, $3, '#6b7280', true, now(), now())
-        ON CONFLICT (user_id, name) DO NOTHING
+        INSERT INTO expense_categories
+            (id, user_id, name, color, is_system, system_key, created_at, updated_at)
+        VALUES ($1, $2, $3, '#6b7280', true, $4, now(), now())
+        ON CONFLICT (user_id, system_key)
+            WHERE system_key IS NOT NULL AND deleted_at IS NULL
+            DO NOTHING
         RETURNING id
         """,
         str(uuid.uuid4()),
         user_id,
-        name,
+        default_name,
+        key.value,
     )
     if row is not None:
         return str(row["id"])
 
-    # Conflict path: another transaction created it concurrently.
+    # Conflict path: another transaction seeded it concurrently.
     row = await conn.fetchrow(
-        "SELECT id FROM expense_categories WHERE user_id = $1 AND name = $2 AND deleted_at IS NULL",
+        """
+        SELECT id FROM expense_categories
+        WHERE user_id = $1 AND system_key = $2 AND deleted_at IS NULL
+        """,
         user_id,
-        name,
+        key.value,
     )
     return str(row["id"])
 
@@ -59,6 +84,7 @@ async def ensure_system_category(conn: asyncpg.Connection, user_id: str, name: s
 async def create_category(
     conn: asyncpg.Connection,
     user_id: str,
+    category_id: UUID,
     name: str,
     color: str,
     sort_order: Optional[int],
@@ -66,7 +92,7 @@ async def create_category(
     """Validate uniqueness, insert, and log the creation.
 
     Raises:
-        conflict: a non-deleted category with the same name already exists.
+        conflict: a non-deleted category with the same name or id already exists.
     """
     existing = await conn.fetchrow(
         """
@@ -79,18 +105,22 @@ async def create_category(
     if existing is not None:
         raise conflict(f"A category named '{name}' already exists.")
 
-    row = await conn.fetchrow(
-        """
-        INSERT INTO expense_categories
-            (user_id, name, color, sort_order, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, now(), now())
-        RETURNING *
-        """,
-        user_id,
-        name,
-        color,
-        sort_order or 0,
-    )
+    try:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO expense_categories
+                (id, user_id, name, color, sort_order, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, now(), now())
+            RETURNING *
+            """,
+            category_id,
+            user_id,
+            name,
+            color,
+            sort_order or 0,
+        )
+    except asyncpg.UniqueViolationError:
+        raise conflict(f"A category with id '{category_id}' already exists.")
 
     response = category_from_row(row)
 
@@ -114,7 +144,6 @@ async def update_category(
 
     Raises:
         not_found: no active category with that id for this user.
-        forbidden: attempting to rename a system category.
         conflict: another non-deleted category already uses the new name.
     """
     # Empty update — return current state unchanged
@@ -135,10 +164,6 @@ async def update_category(
     )
     if before_row is None:
         raise not_found("category")
-
-    # System categories cannot be renamed
-    if before_row["is_system"] and "name" in fields:
-        raise forbidden(f"Cannot rename system category {before_row['name']}.")
 
     before = category_from_row(before_row)
 
@@ -226,6 +251,56 @@ async def delete_category(
 
     await write_activity_log(
         conn, user_id, "category", category_id, ActivityAction.DELETED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
+async def restore_category(
+    conn: asyncpg.Connection,
+    user_id: str,
+    category_id: str,
+) -> dict:
+    """Undo a soft-delete on a category and log the restoration.
+
+    Checks for name collisions with active categories before clearing
+    deleted_at — a user can delete a category and create a new one with
+    the same name, which would block restoration.
+
+    Raises:
+        not_found: no soft-deleted category with that id for this user.
+        conflict: an active category already uses the same name.
+    """
+    before_row = await conn.fetchrow(
+        "SELECT * FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL",
+        category_id,
+        user_id,
+    )
+    if before_row is None:
+        raise not_found("category")
+
+    dup = await conn.fetchrow(
+        """
+        SELECT id FROM expense_categories
+        WHERE user_id = $1 AND name = $2 AND id != $3 AND deleted_at IS NULL
+        """,
+        user_id,
+        before_row["name"],
+        category_id,
+    )
+    if dup is not None:
+        raise conflict(
+            f"Cannot restore category: an active category named '{before_row['name']}' already exists."
+        )
+
+    before = category_from_row(before_row)
+
+    after_row = await restore(conn, "expense_categories", category_id, user_id)
+    after = category_from_row(after_row)
+
+    await write_activity_log(
+        conn, user_id, "category", category_id, ActivityAction.RESTORED,
         before_snapshot=before,
         after_snapshot=after,
     )

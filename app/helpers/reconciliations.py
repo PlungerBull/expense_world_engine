@@ -8,22 +8,88 @@ See ``app/helpers/balance.py`` for the convention: these functions do NOT
 open their own ``conn.transaction()`` — callers own transaction boundaries.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
+from uuid import UUID
 
 import asyncpg
 
 from app.constants import ActivityAction, ReconciliationStatus
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
-from app.helpers.query_builder import dynamic_update, soft_delete
+from app.helpers.exchange_rate import get_rate
+from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.helpers.validation import validate_active_account
 from app.schemas.reconciliations import reconciliation_from_row
+
+
+async def resolve_home_rates(
+    conn: asyncpg.Connection,
+    user_id: str,
+    rows: list,
+) -> dict[str, Optional[float]]:
+    """Resolve the account-currency → home-currency rate for each reconciliation row.
+
+    Returns ``{reconciliation_id: rate|None}``. ``None`` means no rate is
+    available (main currency missing or no rate row), in which case the
+    serializer emits ``null`` for the ``_home_cents`` fields.
+
+    Deduplicates by ``(account_currency, date)`` so the rate helper is
+    hit once per distinct pair, not once per reconciliation. A list of
+    N reconciliations across K currencies produces at most K cache
+    lookups, not N.
+    """
+    if not rows:
+        return {}
+
+    settings_row = await conn.fetchrow(
+        "SELECT main_currency FROM user_settings WHERE user_id = $1", user_id
+    )
+    main_currency = settings_row["main_currency"] if settings_row else None
+    if main_currency is None:
+        return {str(row["id"]): None for row in rows}
+
+    # Pull currency for every referenced account in a single query.
+    account_ids = {str(row["account_id"]) for row in rows}
+    currency_rows = await conn.fetch(
+        "SELECT id, currency_code FROM expense_bank_accounts WHERE id = ANY($1::uuid[])",
+        list(account_ids),
+    )
+    currency_by_account = {str(r["id"]): r["currency_code"] for r in currency_rows}
+
+    today = datetime.now(timezone.utc).date()
+
+    # Cache per (currency, date) pair so cross-currency reconciliations
+    # on the same end-date reuse a single rate lookup.
+    rate_cache: dict[tuple[str, object], Optional[float]] = {}
+
+    async def _rate_for(currency: str, as_of) -> Optional[float]:
+        key = (currency, as_of)
+        if key in rate_cache:
+            return rate_cache[key]
+        if currency == main_currency:
+            rate_cache[key] = 1.0
+            return 1.0
+        result = await get_rate(conn, currency, main_currency, as_of)
+        value = result[0] if result is not None else None
+        rate_cache[key] = value
+        return value
+
+    out: dict[str, Optional[float]] = {}
+    for row in rows:
+        currency = currency_by_account.get(str(row["account_id"]))
+        if currency is None:
+            out[str(row["id"])] = None
+            continue
+        as_of = row["date_end"].date() if row["date_end"] is not None else today
+        out[str(row["id"])] = await _rate_for(currency, as_of)
+    return out
 
 
 async def create_reconciliation(
     conn: asyncpg.Connection,
     user_id: str,
+    reconciliation_id: UUID,
     account_id: str,
     name: str,
     date_start: Optional[datetime],
@@ -39,6 +105,7 @@ async def create_reconciliation(
 
     Raises:
         validation_error: account reference is invalid or name is empty.
+        conflict: a reconciliation with the same id already exists.
     """
     # Validate account_id via shared helper (raises 422 on invalid).
     await validate_active_account(conn, account_id, user_id)
@@ -67,24 +134,31 @@ async def create_reconciliation(
 
     ending = ending_balance_cents if ending_balance_cents is not None else 0
 
-    row = await conn.fetchrow(
-        """
-        INSERT INTO expense_reconciliations
-            (user_id, account_id, name, date_start, date_end, status,
-             beginning_balance_cents, ending_balance_cents, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, 1, $6, $7, now(), now())
-        RETURNING *
-        """,
-        user_id,
-        account_id,
-        name.strip(),
-        date_start,
-        date_end,
-        beginning,
-        ending,
-    )
+    try:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO expense_reconciliations
+                (id, user_id, account_id, name, date_start, date_end, status,
+                 beginning_balance_cents, ending_balance_cents, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, now(), now())
+            RETURNING *
+            """,
+            reconciliation_id,
+            user_id,
+            account_id,
+            name.strip(),
+            date_start,
+            date_end,
+            beginning,
+            ending,
+        )
+    except asyncpg.UniqueViolationError:
+        raise conflict(
+            f"A reconciliation with id '{reconciliation_id}' already exists."
+        )
 
-    response = reconciliation_from_row(row)
+    rate_by_id = await resolve_home_rates(conn, user_id, [row])
+    response = reconciliation_from_row(row, rate_by_id.get(str(row["id"])))
 
     await write_activity_log(
         conn, user_id, "reconciliation", str(row["id"]), ActivityAction.CREATED,
@@ -117,7 +191,8 @@ async def update_reconciliation(
         )
         if row is None:
             raise not_found("reconciliation")
-        return reconciliation_from_row(row)
+        rate_by_id = await resolve_home_rates(conn, user_id, [row])
+        return reconciliation_from_row(row, rate_by_id.get(str(row["id"])))
 
     # Validate name if changing
     if "name" in fields:
@@ -136,13 +211,15 @@ async def update_reconciliation(
     if before_row is None:
         raise not_found("reconciliation")
 
-    before = reconciliation_from_row(before_row)
+    before_rate = await resolve_home_rates(conn, user_id, [before_row])
+    before = reconciliation_from_row(before_row, before_rate.get(str(before_row["id"])))
 
     after_row = await dynamic_update(conn, "expense_reconciliations", fields, reconciliation_id, user_id)
     if after_row is None:
         raise not_found("reconciliation")
 
-    after = reconciliation_from_row(after_row)
+    after_rate = await resolve_home_rates(conn, user_id, [after_row])
+    after = reconciliation_from_row(after_row, after_rate.get(str(after_row["id"])))
 
     await write_activity_log(
         conn, user_id, "reconciliation", reconciliation_id, ActivityAction.UPDATED,
@@ -176,7 +253,8 @@ async def complete_reconciliation(
 
     # Already completed — return idempotently (no activity log)
     if row["status"] == ReconciliationStatus.COMPLETED:
-        return reconciliation_from_row(row)
+        rate_by_id = await resolve_home_rates(conn, user_id, [row])
+        return reconciliation_from_row(row, rate_by_id.get(str(row["id"])))
 
     # Must have at least one assigned transaction
     txn_count = await conn.fetchval(
@@ -193,7 +271,8 @@ async def complete_reconciliation(
             {"transactions": "At least one transaction must be assigned."},
         )
 
-    before = reconciliation_from_row(row)
+    before_rate = await resolve_home_rates(conn, user_id, [row])
+    before = reconciliation_from_row(row, before_rate.get(str(row["id"])))
 
     after_row = await conn.fetchrow(
         """
@@ -206,7 +285,8 @@ async def complete_reconciliation(
         user_id,
     )
 
-    after = reconciliation_from_row(after_row)
+    after_rate = await resolve_home_rates(conn, user_id, [after_row])
+    after = reconciliation_from_row(after_row, after_rate.get(str(after_row["id"])))
 
     await write_activity_log(
         conn, user_id, "reconciliation", reconciliation_id, ActivityAction.UPDATED,
@@ -239,9 +319,11 @@ async def revert_reconciliation(
 
     # Already draft — return idempotently (no activity log)
     if row["status"] == ReconciliationStatus.DRAFT:
-        return reconciliation_from_row(row)
+        rate_by_id = await resolve_home_rates(conn, user_id, [row])
+        return reconciliation_from_row(row, rate_by_id.get(str(row["id"])))
 
-    before = reconciliation_from_row(row)
+    before_rate = await resolve_home_rates(conn, user_id, [row])
+    before = reconciliation_from_row(row, before_rate.get(str(row["id"])))
 
     after_row = await conn.fetchrow(
         """
@@ -254,7 +336,8 @@ async def revert_reconciliation(
         user_id,
     )
 
-    after = reconciliation_from_row(after_row)
+    after_rate = await resolve_home_rates(conn, user_id, [after_row])
+    after = reconciliation_from_row(after_row, after_rate.get(str(after_row["id"])))
 
     await write_activity_log(
         conn, user_id, "reconciliation", reconciliation_id, ActivityAction.UPDATED,
@@ -286,11 +369,13 @@ async def delete_reconciliation(
     if row["status"] == ReconciliationStatus.COMPLETED:
         raise conflict("Cannot delete a completed reconciliation. Revert to draft first.")
 
-    before = reconciliation_from_row(row)
+    before_rate = await resolve_home_rates(conn, user_id, [row])
+    before = reconciliation_from_row(row, before_rate.get(str(row["id"])))
 
     after_row = await soft_delete(conn, "expense_reconciliations", reconciliation_id, user_id)
 
-    after = reconciliation_from_row(after_row)
+    after_rate = await resolve_home_rates(conn, user_id, [after_row])
+    after = reconciliation_from_row(after_row, after_rate.get(str(after_row["id"])))
 
     # Unassign all transactions from this batch
     await conn.execute(
@@ -305,6 +390,46 @@ async def delete_reconciliation(
 
     await write_activity_log(
         conn, user_id, "reconciliation", reconciliation_id, ActivityAction.DELETED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
+async def restore_reconciliation(
+    conn: asyncpg.Connection,
+    user_id: str,
+    reconciliation_id: str,
+) -> dict:
+    """Undo a soft-delete on a reconciliation and log the restoration.
+
+    The transactions that were unassigned during delete are NOT re-linked.
+    The restored reconciliation comes back empty and the user must
+    manually re-assign transactions if desired. Re-linking would risk
+    touching transactions that have since been reassigned to other
+    reconciliations or edited in ways that break the original balance
+    assumptions.
+
+    Raises:
+        not_found: no soft-deleted reconciliation with that id for this user.
+    """
+    before_row = await conn.fetchrow(
+        "SELECT * FROM expense_reconciliations WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL",
+        reconciliation_id,
+        user_id,
+    )
+    if before_row is None:
+        raise not_found("reconciliation")
+
+    before_rate = await resolve_home_rates(conn, user_id, [before_row])
+    before = reconciliation_from_row(before_row, before_rate.get(str(before_row["id"])))
+
+    after_row = await restore(conn, "expense_reconciliations", reconciliation_id, user_id)
+    after_rate = await resolve_home_rates(conn, user_id, [after_row])
+    after = reconciliation_from_row(after_row, after_rate.get(str(after_row["id"])))
+
+    await write_activity_log(
+        conn, user_id, "reconciliation", reconciliation_id, ActivityAction.RESTORED,
         before_snapshot=before,
         after_snapshot=after,
     )

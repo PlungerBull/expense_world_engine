@@ -68,6 +68,7 @@ async def test_completed_reconciliation_locks_transaction_fields(client, test_da
     txn_create = await client.post(
         "/v1/transactions",
         json={
+            "id": str(uuid.uuid4()),
             "title": f"recon-lock-{uuid.uuid4()}",
             "amount_cents": -500,
             "date": "2026-04-12T10:00:00Z",
@@ -83,6 +84,7 @@ async def test_completed_reconciliation_locks_transaction_fields(client, test_da
     recon_create = await client.post(
         "/v1/reconciliations",
         json={
+            "id": str(uuid.uuid4()),
             "account_id": test_data.account_id,
             "name": f"recon-lock-{uuid.uuid4()}",
             "beginning_balance_cents": 0,
@@ -179,6 +181,7 @@ async def test_reconciliation_transactions_cap_truncates_and_flags(
     recon_create = await client.post(
         "/v1/reconciliations",
         json={
+            "id": str(uuid.uuid4()),
             "account_id": test_data.account_id,
             "name": f"cap-test-{uuid.uuid4()}",
             "beginning_balance_cents": 0,
@@ -196,6 +199,7 @@ async def test_reconciliation_transactions_cap_truncates_and_flags(
             create = await client.post(
                 "/v1/transactions",
                 json={
+                    "id": str(uuid.uuid4()),
                     "title": f"cap-txn-{i}-{uuid.uuid4()}",
                     "amount_cents": -100,
                     "date": "2026-04-12T10:00:00Z",

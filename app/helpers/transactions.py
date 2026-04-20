@@ -40,8 +40,8 @@ from typing import Optional
 
 import asyncpg
 
-from app.constants import ActivityAction, TransactionType
-from app.errors import not_found, validation_error
+from app.constants import ActivityAction, ReconciliationStatus, TransactionType
+from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance, reverse_balance
 from app.helpers.exchange_rate import lookup_exchange_rate
@@ -72,6 +72,16 @@ async def _sync_hashtags(
     (the source of the junction row, not the parent table). Soft-deletes
     all existing rows for this transaction first, then inserts the new
     set. Idempotent as long as ``hashtag_ids`` is the desired final state.
+
+    Activity log — deliberate aggregation exception: junction rows are
+    mutated here (soft-delete + insert) without per-row ``activity_log``
+    entries. Instead, the parent transaction's UPDATED snapshot carries
+    the new ``hashtag_ids`` list, so the change IS captured — just at
+    parent-row granularity, not per link. This trade is intentional:
+    per-link entries would multiply the audit row count by the average
+    number of hashtags per transaction without adding answerable audit
+    questions. If a future forensic need emerges ("when exactly was
+    hashtag X unlinked from transaction Y?"), revisit this choice.
     """
     if hashtag_ids:
         valid = await conn.fetch(
@@ -166,6 +176,8 @@ async def create_transaction(
         primary_response, _sibling = await create_transfer_pair(
             conn=conn,
             user_id=user_id,
+            primary_id=body.id,
+            sibling_id=body.transfer.id,
             primary_title=body.title.strip(),
             primary_description=body.description,
             primary_amount_cents=body.amount_cents,
@@ -205,27 +217,31 @@ async def create_transaction(
     amount_home_cents = round(amount_cents * exchange_rate)
 
     # Insert
-    row = await conn.fetchrow(
-        """
-        INSERT INTO expense_transactions
-            (user_id, title, description, amount_cents, amount_home_cents,
-             transaction_type, date, account_id, category_id, exchange_rate,
-             cleared, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
-        RETURNING *
-        """,
-        user_id,
-        body.title.strip(),
-        body.description,
-        amount_cents,
-        amount_home_cents,
-        transaction_type,
-        body.date,
-        body.account_id,
-        body.category_id,
-        exchange_rate,
-        body.cleared if body.cleared is not None else False,
-    )
+    try:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO expense_transactions
+                (id, user_id, title, description, amount_cents, amount_home_cents,
+                 transaction_type, date, account_id, category_id, exchange_rate,
+                 cleared, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
+            RETURNING *
+            """,
+            body.id,
+            user_id,
+            body.title.strip(),
+            body.description,
+            amount_cents,
+            amount_home_cents,
+            transaction_type,
+            body.date,
+            body.account_id,
+            body.category_id,
+            exchange_rate,
+            body.cleared if body.cleared is not None else False,
+        )
+    except asyncpg.UniqueViolationError:
+        raise conflict(f"A transaction with id '{body.id}' already exists.")
 
     response = transaction_from_row(row)
 
@@ -608,17 +624,315 @@ async def delete_transaction(
         after_snapshot=after,
     )
 
-    # Reconciliation warning
-    response = after
+    # Warnings channel — always present (null-over-omission). Currently emits
+    # one value when the deleted row belonged to a completed reconciliation,
+    # but the list shape leaves room for future additions without changing
+    # the response contract.
+    warnings: list[str] = []
     if row["reconciliation_id"] is not None:
         recon = await conn.fetchrow(
             "SELECT status FROM expense_reconciliations WHERE id = $1",
             row["reconciliation_id"],
         )
         if recon and recon["status"] == 2:
-            response = {**after, "warning": "Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."}
+            warnings.append(
+                "Transaction belonged to a completed reconciliation. "
+                "Reconciliation totals may be stale."
+            )
 
-    return response
+    return {**after, "warnings": warnings}
+
+
+# ---------------------------------------------------------------------------
+# Restore
+# ---------------------------------------------------------------------------
+
+async def restore_transaction(
+    conn: asyncpg.Connection,
+    user_id: str,
+    transaction_id: str,
+) -> dict:
+    """Undo a soft-delete on a transaction, atomically with its sibling.
+
+    Inverse of ``delete_transaction``. Re-applies the balance impact,
+    re-activates the cascaded hashtag junction rows (matched by exact
+    ``deleted_at`` timestamp), and cascades to the transfer sibling for
+    transfer pairs. The whole flow is atomic — caller owns
+    ``conn.transaction()``.
+
+    **Reconciliation handling (per leg).** The transaction's
+    ``reconciliation_id`` survived the delete on the soft-deleted row.
+    On restore the link is conditionally cleared:
+
+      * recon is null                         → no action
+      * recon is missing or soft-deleted      → unlink, emit warning
+      * recon ``status = COMPLETED``          → unlink, emit warning
+      * recon is DRAFT and active             → keep the link
+
+    The COMPLETED case must unlink because completed reconciliations
+    lock four fields (``amount_cents``, ``account_id``, ``title``,
+    ``date``) on assigned transactions. Silently re-linking would
+    leave the restored row immutable, which the user wouldn't expect.
+    The DRAFT-and-active case is the user's good-path expectation —
+    they were reconciling, deleted by mistake, and want the row back
+    in the same batch without a re-assignment ceremony.
+
+    **Junction rows.** Restored precisely: ``WHERE deleted_at = $marker``
+    with ``$marker`` bound to the parent's pre-restore ``deleted_at``.
+    Because Postgres ``now()`` returns ``transaction_timestamp()`` (one
+    value per DB transaction), the cascade UPDATE inside ``delete_transaction``
+    set the junctions to the same timestamp as the parent. Exact match
+    catches only those rows, not pre-existing soft-deleted junctions
+    from earlier ``_sync_hashtags`` runs.
+
+    This intentionally differs from ``restore_hashtag`` /
+    ``restore_reconciliation`` which both opt NOT to cascade-restore.
+    The asymmetry is correct: hashtag-restore would silently re-tag
+    dozens of transactions (high blast radius), but transaction-restore
+    re-tags ONE transaction and matches the user's "undo the delete"
+    mental model.
+
+    Validation runs BEFORE any mutation, so a 422 leaves the soft-deleted
+    state untouched.
+
+    Raises:
+        not_found: no soft-deleted transaction with that id.
+        conflict: the row is part of a transfer pair but the sibling is
+            missing or no longer soft-deleted (integrity break — refuse
+            to restore an asymmetric pair).
+        validation_error: account/category (or sibling's) is no longer
+            active or non-archived. All field-level errors collected
+            into one ``fields`` dict before raising.
+    """
+    # 1. Lock the soft-deleted primary row.
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM expense_transactions
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL FOR UPDATE
+        """,
+        transaction_id,
+        user_id,
+    )
+    if row is None:
+        raise not_found("transaction")
+
+    is_transfer = row["transfer_transaction_id"] is not None
+
+    # 2. Lock the sibling (transfer case). Both must be soft-deleted —
+    #    refuse to restore one leg of a half-deleted pair, which would
+    #    be an integrity violation on the transfer invariant.
+    sibling_row = None
+    sibling_id: Optional[str] = None
+    if is_transfer:
+        sibling_id = str(row["transfer_transaction_id"])
+        sibling_row = await conn.fetchrow(
+            """
+            SELECT * FROM expense_transactions
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL FOR UPDATE
+            """,
+            sibling_id,
+            user_id,
+        )
+        if sibling_row is None:
+            raise conflict(
+                "Transfer sibling row could not be located in a soft-deleted "
+                "state. Refusing to restore one leg of an asymmetric pair."
+            )
+
+    # 3. Validate prerequisites (collect-all-failures pattern).
+    errors: dict = {}
+
+    primary_account = await conn.fetchrow(
+        """
+        SELECT id FROM expense_bank_accounts
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
+        """,
+        row["account_id"],
+        user_id,
+    )
+    if primary_account is None:
+        errors["account_id"] = "Must reference an active, non-archived account."
+
+    primary_category = await conn.fetchrow(
+        "SELECT id FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+        row["category_id"],
+        user_id,
+    )
+    if primary_category is None:
+        errors["category_id"] = "Must reference an active category."
+
+    if is_transfer and sibling_row is not None:
+        sibling_account = await conn.fetchrow(
+            """
+            SELECT id FROM expense_bank_accounts
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
+            """,
+            sibling_row["account_id"],
+            user_id,
+        )
+        if sibling_account is None:
+            errors["transfer.account_id"] = "Must reference an active, non-archived account."
+
+        sibling_category = await conn.fetchrow(
+            "SELECT id FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+            sibling_row["category_id"],
+            user_id,
+        )
+        if sibling_category is None:
+            errors["transfer.category_id"] = "Must reference an active category."
+
+    if errors:
+        raise validation_error(
+            "Cannot restore transaction: prerequisites failed.", errors
+        )
+
+    # 4. Resolve the reconciliation decision per leg.
+    async def _resolve_recon_unlink(recon_id) -> tuple[bool, Optional[str]]:
+        if recon_id is None:
+            return False, None
+        recon = await conn.fetchrow(
+            "SELECT status, deleted_at FROM expense_reconciliations WHERE id = $1",
+            recon_id,
+        )
+        if recon is None or recon["deleted_at"] is not None:
+            return True, (
+                "Transaction's previous reconciliation no longer exists. "
+                "Link removed on restore."
+            )
+        if recon["status"] == ReconciliationStatus.COMPLETED:
+            return True, (
+                "Transaction's previous reconciliation is completed. "
+                "Link removed on restore — reassign manually if needed."
+            )
+        return False, None
+
+    primary_unlink, primary_warning = await _resolve_recon_unlink(row["reconciliation_id"])
+    sibling_unlink = False
+    sibling_warning: Optional[str] = None
+    if is_transfer and sibling_row is not None:
+        sibling_unlink, sibling_warning = await _resolve_recon_unlink(
+            sibling_row["reconciliation_id"]
+        )
+
+    # 5. Restore primary row (conditionally clearing reconciliation_id).
+    before = transaction_from_row(row)
+    primary_deleted_at = row["deleted_at"]
+
+    if primary_unlink:
+        after_row = await conn.fetchrow(
+            """
+            UPDATE expense_transactions
+            SET deleted_at = NULL, reconciliation_id = NULL,
+                updated_at = now(), version = version + 1
+            WHERE id = $1 AND user_id = $2
+            RETURNING *
+            """,
+            transaction_id,
+            user_id,
+        )
+    else:
+        after_row = await conn.fetchrow(
+            """
+            UPDATE expense_transactions
+            SET deleted_at = NULL, updated_at = now(), version = version + 1
+            WHERE id = $1 AND user_id = $2
+            RETURNING *
+            """,
+            transaction_id,
+            user_id,
+        )
+    after = transaction_from_row(after_row)
+
+    # 6. Re-apply primary balance.
+    await apply_balance(
+        conn, str(row["account_id"]), user_id,
+        row["amount_cents"], row["transaction_type"],
+        transfer_direction=row["transfer_direction"],
+    )
+
+    # 7. Re-activate cascaded junction rows on the primary.
+    await conn.execute(
+        """
+        UPDATE expense_transaction_hashtags
+        SET deleted_at = NULL, updated_at = now(), version = version + 1
+        WHERE transaction_id = $1 AND transaction_source = 1
+          AND user_id = $2 AND deleted_at = $3
+        """,
+        transaction_id,
+        user_id,
+        primary_deleted_at,
+    )
+
+    # 8. Sibling cascade (mirror steps 5-7).
+    if is_transfer and sibling_row is not None and sibling_id is not None:
+        sibling_before = transaction_from_row(sibling_row)
+        sibling_deleted_at = sibling_row["deleted_at"]
+
+        if sibling_unlink:
+            sibling_after_row = await conn.fetchrow(
+                """
+                UPDATE expense_transactions
+                SET deleted_at = NULL, reconciliation_id = NULL,
+                    updated_at = now(), version = version + 1
+                WHERE id = $1 AND user_id = $2
+                RETURNING *
+                """,
+                sibling_id,
+                user_id,
+            )
+        else:
+            sibling_after_row = await conn.fetchrow(
+                """
+                UPDATE expense_transactions
+                SET deleted_at = NULL, updated_at = now(), version = version + 1
+                WHERE id = $1 AND user_id = $2
+                RETURNING *
+                """,
+                sibling_id,
+                user_id,
+            )
+        sibling_after = transaction_from_row(sibling_after_row)
+
+        await apply_balance(
+            conn, str(sibling_row["account_id"]), user_id,
+            sibling_row["amount_cents"], sibling_row["transaction_type"],
+            transfer_direction=sibling_row["transfer_direction"],
+        )
+
+        await conn.execute(
+            """
+            UPDATE expense_transaction_hashtags
+            SET deleted_at = NULL, updated_at = now(), version = version + 1
+            WHERE transaction_id = $1 AND transaction_source = 1
+              AND user_id = $2 AND deleted_at = $3
+            """,
+            sibling_id,
+            user_id,
+            sibling_deleted_at,
+        )
+
+        # Sibling activity log first (matches delete_transaction's order).
+        await write_activity_log(
+            conn, user_id, "transaction", sibling_id, ActivityAction.RESTORED,
+            before_snapshot=sibling_before,
+            after_snapshot=sibling_after,
+        )
+
+    # 9. Primary activity log.
+    await write_activity_log(
+        conn, user_id, "transaction", transaction_id, ActivityAction.RESTORED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+
+    # 10. Build warnings list (always present; empty when restore is clean).
+    warnings: list[str] = []
+    if primary_warning is not None:
+        warnings.append(primary_warning)
+    if sibling_warning is not None:
+        warnings.append("Transfer sibling: " + sibling_warning)
+
+    return {**after, "warnings": warnings}
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +1011,7 @@ async def create_batch(
     valid_category_ids = {str(r["id"]) for r in valid_category_rows}
 
     all_errors = []
+    seen_ids: set[str] = set()
     for i, item in enumerate(body.transactions):
         item_errors: dict = {}
 
@@ -712,6 +1027,11 @@ async def create_batch(
 
         if item.category_id not in valid_category_ids:
             item_errors["category_id"] = "Must reference an active category."
+
+        item_id_str = str(item.id)
+        if item_id_str in seen_ids:
+            item_errors["id"] = "Duplicate id within batch."
+        seen_ids.add(item_id_str)
 
         if item_errors:
             all_errors.append({"index": i, "fields": item_errors})
@@ -735,27 +1055,31 @@ async def create_batch(
             exchange_rate = await lookup_exchange_rate(conn, item.account_id, item.date, user_id)
         amount_home_cents = round(amount_cents * exchange_rate)
 
-        row = await conn.fetchrow(
-            """
-            INSERT INTO expense_transactions
-                (user_id, title, description, amount_cents, amount_home_cents,
-                 transaction_type, date, account_id, category_id, exchange_rate,
-                 cleared, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
-            RETURNING *
-            """,
-            user_id,
-            item.title.strip(),
-            item.description,
-            amount_cents,
-            amount_home_cents,
-            transaction_type,
-            item.date,
-            item.account_id,
-            item.category_id,
-            exchange_rate,
-            item.cleared if item.cleared is not None else False,
-        )
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO expense_transactions
+                    (id, user_id, title, description, amount_cents, amount_home_cents,
+                     transaction_type, date, account_id, category_id, exchange_rate,
+                     cleared, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
+                RETURNING *
+                """,
+                item.id,
+                user_id,
+                item.title.strip(),
+                item.description,
+                amount_cents,
+                amount_home_cents,
+                transaction_type,
+                item.date,
+                item.account_id,
+                item.category_id,
+                exchange_rate,
+                item.cleared if item.cleared is not None else False,
+            )
+        except asyncpg.UniqueViolationError:
+            raise conflict(f"A transaction with id '{item.id}' already exists.")
 
         response = transaction_from_row(row)
         created.append(response)

@@ -9,6 +9,16 @@ Three passes:
   3. Pending inbox items — recompute exchange_rate for future promotions.
 
 Returns a summary dict for the activity log.
+
+Activity log — deliberate aggregation exception: the per-row mutations
+(bulk UPDATEs on expense_transactions and expense_transaction_inbox) do
+NOT write individual ``activity_log`` entries. Instead, the triggering
+call in ``helpers/auth.py::update_settings`` writes a single UPDATED
+entry on ``user_settings`` carrying a ``recalculation`` summary block
+(rows touched per pass). A full recalc on a busy user can rewrite tens
+of thousands of rows in a single request; per-row entries would inflate
+``activity_log`` by orders of magnitude without answering useful audit
+questions. The triggering user_settings entry is the canonical record.
 """
 from __future__ import annotations
 

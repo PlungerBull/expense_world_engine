@@ -9,6 +9,8 @@ from fastapi import APIRouter, Header, Query
 from app import db
 from app.deps import CurrentUser
 from app.errors import validation_error
+from app.helpers.formatting import apply_debit_as_negative, apply_debit_as_negative_inbox
+from app.helpers.reconciliations import resolve_home_rates
 from app.helpers.sync import (
     WILDCARD_TOKEN,
     fetch_delta,
@@ -52,6 +54,7 @@ def _transaction_with_hashtags(row) -> dict:
 async def sync(
     auth_user: CurrentUser,
     sync_token: str = Query(..., description="'*' for full fetch, or a token from a prior sync."),
+    debit_as_negative: bool = Query(False),
     x_client_id: Optional[str] = Header(None, alias="X-Client-Id"),
 ):
     if not _is_valid_uuid(x_client_id):
@@ -76,17 +79,34 @@ async def sync(
                 conn, auth_user.id, x_client_id, snapshot_at
             )
 
-        # Serialization happens after the transaction commits — `*_from_row`
-        # helpers are pure transforms and don't touch the DB. Account home
-        # balances are intentionally null in sync responses; clients that need
-        # them call /dashboard, which is the canonical place for derived values.
+        # Reconciliation home-balances are computed AFTER the REPEATABLE READ
+        # transaction ends — `resolve_home_rates` reads account currencies and
+        # exchange rates via the module-level rate cache, so keeping it outside
+        # the snapshot doesn't risk delta/rate skew for the client (rates are
+        # effectively-dated, not snapshot-tied).
+        rate_by_id = await resolve_home_rates(
+            conn, auth_user.id, list(deltas["reconciliations"])
+        )
+
+        # Account home balances are intentionally null in sync responses;
+        # clients that need them call /dashboard, which is the canonical place
+        # for derived account-level values.
+        inbox_rows = [inbox_from_row(r) for r in deltas["inbox"]]
+        transaction_rows = [_transaction_with_hashtags(r) for r in deltas["transactions"]]
+        if debit_as_negative:
+            inbox_rows = [apply_debit_as_negative_inbox(d) for d in inbox_rows]
+            transaction_rows = [apply_debit_as_negative(d) for d in transaction_rows]
+
         return {
             "sync_token": new_token,
             "accounts": [account_from_row(r) for r in deltas["accounts"]],
             "categories": [category_from_row(r) for r in deltas["categories"]],
             "hashtags": [hashtag_from_row(r) for r in deltas["hashtags"]],
-            "inbox": [inbox_from_row(r) for r in deltas["inbox"]],
-            "transactions": [_transaction_with_hashtags(r) for r in deltas["transactions"]],
-            "reconciliations": [reconciliation_from_row(r) for r in deltas["reconciliations"]],
+            "inbox": inbox_rows,
+            "transactions": transaction_rows,
+            "reconciliations": [
+                reconciliation_from_row(r, rate_by_id.get(str(r["id"])))
+                for r in deltas["reconciliations"]
+            ],
             "settings": settings_from_row(settings_row) if settings_row else None,
         }

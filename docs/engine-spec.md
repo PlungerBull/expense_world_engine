@@ -12,13 +12,15 @@
 
 **Authentication:** Every request requires `Authorization: Bearer <token>`. The engine validates the Supabase JWT, extracts `user_id`, and passes it to all downstream logic. Unauthenticated requests return `401`.
 
-**Idempotency:** Write operations (`POST`, `PUT`, `DELETE`) should include `X-Idempotency-Key: <uuid>`. The engine deduplicates against `idempotency_keys` table. Duplicate requests return the stored response verbatim.
+**Client-supplied UUIDs:** Every `POST` that creates a resource requires an `id: UUID` field in the request body. The client generates the UUID locally (e.g., `uuid4()`) before making the call — the server never picks the id. This enables offline-first clients to reference a resource before the request completes, and makes idempotent retries trivial: a second POST with the same `id` returns `409 CONFLICT` (existing resource), not a duplicate.
+
+**Idempotency:** Write operations (`POST`, `PUT`, `DELETE`) should include `X-Idempotency-Key: <uuid>`. The engine records `(user_id, key) → (response_body, response_status)` in `idempotency_keys` and acquires a transaction-scoped advisory lock on every incoming request to serialize concurrent retries with the same key at the DB. Duplicate requests return the stored response **verbatim, including the original HTTP status code** — no per-route drift. TTL is 24 hours.
 
 **Sign convention — requests:** `amount_cents` in request bodies uses a signed convention. The engine infers `transaction_type` from the sign — the caller never fills it in manually. Negative = expense/outflow (subtracts from balance). Positive = income/inflow (adds to balance). Transfers are identified by the presence of a `transfer` field in the request body, not by sign.
 
 **Sign convention — storage:** Internally, `amount_cents` is always stored as a positive integer. `transaction_type` (1=expense, 2=income, 3=transfer) and `transfer_direction` (1=debit, 2=credit) are set by the engine based on the inferred direction. Callers never interact with these fields on writes.
 
-**Sign convention — responses:** `amount_cents` in responses is always positive. `transaction_type` tells the client the direction. Pass `?debit_as_negative=true` on any read endpoint to receive negative amounts for expenses and outflows — useful for clients that prefer signed display.
+**Sign convention — responses:** `amount_cents` in responses is always positive. `transaction_type` tells the client the direction. Pass `?debit_as_negative=true` on any amount-bearing read endpoint to receive negative amounts for expenses and outflows — useful for clients that prefer signed display. Supported on: `/transactions` list + detail, `/inbox` list + detail, `/reconciliations/{id}`, `/sync`. Accepted but a no-op on `/dashboard` and `/reports/monthly`, whose aggregates are already signed by construction (category spent is positive for income and negative for expense; totals return split positive inflow/outflow).
 
 **Null over omission:** All optional fields are always present in responses, set to `null` when empty. The response shape never changes based on data presence.
 
@@ -33,9 +35,15 @@
 }
 ```
 
-**Pagination:** List endpoints accept `?limit=50&offset=0`. Default limit: 50. Max limit: 200. Response includes `total`, `limit`, `offset`.
+**`fields` semantics:** On `VALIDATION_ERROR` responses, `fields` is always an object (possibly empty) — never `null`. Clients can uniformly iterate `Object.keys(error.fields)` without a null check. On non-validation errors (`UNAUTHORIZED`, `NOT_FOUND`, `FORBIDDEN`, `CONFLICT`, `INTERNAL_ERROR`, etc.), `fields` is `null` — those errors aren't field-scoped. The envelope key is still present in every response.
+
+**Global exception coverage:** Four handlers are registered: `AppError` (canonical raises from domain code), `RequestValidationError` (Pydantic), `StarletteHTTPException` (routing-level 404/405/413/415/429), and a catch-all `Exception` handler returning `500 INTERNAL_ERROR` after logging the traceback server-side. Tracebacks never leak to clients; every error response carries the canonical envelope.
+
+**Pagination:** List endpoints accept `?limit=50&offset=0`. FastAPI rejects out-of-range values at the query layer (`limit` must be `[1, 200]`, `offset` must be `≥0`) with `422 VALIDATION_ERROR` before the handler runs. Response shape: `{items, total, limit, offset}`.
 
 **Soft-deleted records:** Excluded from all list responses by default. Pass `?include_deleted=true` to include them.
+
+**Restore semantics:** Every resource with a delete endpoint also exposes `POST /{resource}/{id}/restore`. Restores clear `deleted_at` and write a `RESTORED` activity log entry. See per-resource sections for collision rules (e.g., restoring a category whose name now collides with an active one returns `409`).
 
 **Optimistic locking:** All mutable resources include a `version` field in responses, incremented on every update. Clients can use this for conflict detection.
 
@@ -67,7 +75,9 @@ Infrastructure endpoint. Returns `200` if the engine is running. No authenticati
 ## Auth & User Bootstrap
 
 ### `POST /auth/bootstrap`
-Called by any client immediately after a successful Supabase sign-in, on every new device. Creates the `users` and `user_settings` rows if they don't exist (idempotent). Returns the full user profile.
+Called by any client immediately after a successful Supabase sign-in, on every new device. Creates the `users` and `user_settings` rows if they don't exist (idempotent upsert). Returns the full user profile.
+
+**Status code:** Returns `200`, not `201`. Bootstrap has upsert semantics — first call creates the rows, subsequent calls bump `last_login_at` on the existing rows. First-call and replay statuses are both 200.
 
 **Request body:**
 ```json
@@ -76,6 +86,8 @@ Called by any client immediately after a successful Supabase sign-in, on every n
   "timezone": "America/Lima"
 }
 ```
+
+Note: `/auth/bootstrap` does **not** take a client-supplied `id` — the `users.id` is always the Supabase JWT `sub` claim.
 
 **Response:** `user` object + `user_settings` object.
 
@@ -102,7 +114,9 @@ Updates `user_settings`. Partial update — only supplied fields are changed. If
 2. **Transfer pairs** (`transfer_transaction_id IS NOT NULL`): reapply the dominant-side rule — the leg whose account currency matches the new `main_currency` is dominant (`amount_home_cents = amount_cents`, `exchange_rate = 1.0`); the other leg's `amount_home_cents` is forced to match so the pair nets to zero.
 3. **Pending inbox items** (`status = 1`, `account_id IS NOT NULL`): recompute `exchange_rate` so future promotions use the correct home currency.
 
-`current_balance_home_cents` on accounts does **not** need updating — it is computed at read time, not stored. Every updated transaction row bumps `version + updated_at` so `/sync` surfaces the changes. A **single** `activity_log` entry records the currency change plus the recalculation summary (rows touched per pass). Individual transaction updates are not logged — bulk recalculation is one audit event, not thousands. No-op when `main_currency` doesn't actually change. Synchronous in Phase 1; a future async variant with `recalculation_job_id` polling can be added when volumes require it. See [roadmap.md Step 9.1](../docs/roadmap.md).
+`current_balance_home_cents` on accounts does **not** need updating — it is computed at read time, not stored. Every updated transaction row bumps `version + updated_at` so `/sync` surfaces the changes. A **single** `activity_log` entry records the currency change plus the recalculation summary (rows touched per pass). Individual transaction updates are **not** logged — this is a deliberate aggregate-exception to the "every mutation gets an activity_log entry" rule. A full recalc on a busy user can rewrite tens of thousands of rows in a single request; per-row entries would inflate `activity_log` by orders of magnitude without answering useful audit questions. The single `user_settings` UPDATED entry is the canonical record. No-op when `main_currency` doesn't actually change. Synchronous in Phase 1; a future async variant with `recalculation_job_id` polling can be added when volumes require it. See [roadmap.md Step 9.1](../docs/roadmap.md).
+
+**Settings preconditions:** Endpoints that read `user_settings` (dashboard, reports, recalc) return `422 SETTINGS_MISSING` with `fields: {"user_settings": "Must be provisioned via POST /v1/auth/bootstrap."}` if the user has not completed bootstrap. This is a precondition-unmet state, not a conflict.
 
 ---
 
@@ -114,16 +128,17 @@ Returns all active bank accounts. Includes `is_person = false` accounts only. Us
 Each account response includes `current_balance_cents` and `current_balance_home_cents` (balance converted to `main_currency`).
 
 ### `POST /accounts`
-Creates a new bank account.
+Creates a new bank account (real account only — `is_person = false`).
 
-**Required:** `name`, `currency_code`
+**Required:** `id` (client-supplied UUID), `name`, `currency_code`
 **Optional:** `color`, `sort_order`
-**Forbidden:** `is_person` — person accounts are created automatically by the transfer engine when a person account is involved in a transfer. They cannot be created directly via this endpoint.
+**Forbidden:** `is_person`, and any unknown field. Person accounts are **not** created through this endpoint; they are created explicitly via the People API (see **People / Person Accounts** below). Requests that include `is_person` (with any value) or any other unknown field return `422 VALIDATION_ERROR`.
 
 **Validation:**
 - `name` must be unique per `(user_id, currency_code)`.
 - `currency_code` must exist in `global_currencies`.
 - `currency_code` is immutable after creation — any subsequent `PUT` that includes it returns `422`.
+- `id` must not collide with an existing account — returns `409 CONFLICT` if taken.
 
 ### `GET /accounts/{id}`
 ### `PUT /accounts/{id}`
@@ -134,8 +149,31 @@ Fields that can be updated: `name`, `color`, `sort_order`.
 ### `DELETE /accounts/{id}`
 Soft-deletes the account (`deleted_at = now()`). Returns `409` if the account has any non-deleted transactions — the client must archive instead.
 
+### `POST /accounts/{id}/restore`
+Undoes a soft-delete by clearing `deleted_at`. Returns `404` if no soft-deleted account with that id exists. Writes a `RESTORED` activity log entry with before/after snapshots.
+
 ### `POST /accounts/{id}/archive`
 Sets `is_archived = true`. The account disappears from all pickers and entry flows but all historical transactions remain intact and participate in reports.
+
+---
+
+## People / Person Accounts
+
+Person accounts (`is_person = true`) represent people the user lends to or borrows from (debt tracking). They share the `expense_bank_accounts` table with real accounts but are created, listed, and managed through a dedicated People API.
+
+**Design rule:** Person accounts are **only** created via the explicit People API described below. They are **never** auto-created as a side effect of creating a transfer, promoting an inbox item, or any other action. A transfer targeting a non-existent person returns `422 VALIDATION_ERROR`; the client must create the person first, then retry the transfer with the resolved `account_id`.
+
+**Rationale:** Explicit creation keeps the user in control of their people list, avoids mystery rows, and prevents race conditions where two devices initiating a transfer to the same new person create duplicate person accounts.
+
+### `POST /people` *(Phase 4 — planned, not yet implemented)*
+Creates a person account.
+
+**Required:** `id` (client-supplied UUID), `name`, `currency_code`
+**Optional:** `color`, `sort_order`
+
+Response shape is identical to a bank account with `is_person = true`.
+
+Until this endpoint ships, person accounts cannot be created through the API. The data path is ready (reads, balances, dashboard segregation, `@Debt` auto-categorization on transfers) — only the creation endpoint is pending.
 
 ---
 
@@ -145,7 +183,7 @@ Sets `is_archived = true`. The account disappears from all pickers and entry flo
 Returns all active categories, sorted by `sort_order`. System categories (`is_system = true`) are always included and always appear first. Supports standard pagination. Use `?include_deleted=true` to include soft-deleted categories.
 
 ### `POST /categories`
-**Required:** `name`, `color`
+**Required:** `id` (client-supplied UUID), `name`, `color`
 **Optional:** `sort_order`
 
 Categories carry no type restriction. The same category can be used on expenses, income, and transfers — including refunds (same category as the original expense, positive amount).
@@ -153,13 +191,16 @@ Categories carry no type restriction. The same category can be used on expenses,
 **Auto-creation (engine-side, not via this endpoint):**
 - `@Debt` — auto-created the first time a person account is involved in a transaction.
 - `@Transfer` — auto-created the first time a real-account transfer is created.
-Both are created with `is_system = true`.
+Both are created with `is_system = true` and a stable `system_key` column (`"debt"` / `"transfer"`) — the engine looks them up by `system_key`, not by display name. This means users can freely rename the display text without breaking future transfer pipelines (which was a bug before the `system_key` column was added).
 
 ### `PUT /categories/{id}`
-Cannot rename or delete system categories (`is_system = true`). Returns `403`.
+System categories (`is_system = true`) CAN be renamed — the engine identifies them by `system_key`, not by `name`. Any other field is also editable. Returns `404` if the category is missing.
 
 ### `DELETE /categories/{id}`
-Soft-delete. Returns `409` if the category is referenced by any non-deleted transaction (inbox or ledger). System categories always return `403`.
+Soft-delete. Returns `409` if the category is referenced by any non-deleted transaction (inbox or ledger). System categories (`is_system = true`) always return `403` — they must remain available for the transfer pipeline.
+
+### `POST /categories/{id}/restore`
+Undoes a soft-delete. Returns `404` if no soft-deleted category with that id exists. Returns `409` if an active category already uses the same name (the name collision check prevents silent duplicates). Writes a `RESTORED` activity log entry.
 
 ---
 
@@ -169,12 +210,15 @@ Soft-delete. Returns `409` if the category is referenced by any non-deleted tran
 Returns all active hashtags, sorted by `sort_order`. Supports standard pagination. Use `?include_deleted=true` to include soft-deleted hashtags.
 
 ### `POST /hashtags`
-**Required:** `name`
+**Required:** `id` (client-supplied UUID), `name`
 **Optional:** `sort_order`
 
 ### `PUT /hashtags/{id}`
 ### `DELETE /hashtags/{id}`
-Soft-delete. Removes all `expense_transaction_hashtags` rows for this hashtag atomically.
+Soft-delete. Cascades: soft-deletes all `expense_transaction_hashtags` junction rows for this hashtag and bumps each affected parent transaction's `version + updated_at` so the next `/sync` delta carries the hashtag_ids change. Writes a single `DELETED` activity log entry for the hashtag itself; per-junction-row entries are deliberately NOT written (see "Activity log aggregate exceptions" below).
+
+### `POST /hashtags/{id}/restore`
+Undoes a soft-delete of the hashtag row itself. Does NOT automatically restore the cascaded junction rows — the restored hashtag comes back as an empty label that the user can re-apply manually to transactions. Silently re-tagging could surprise users. Returns `404` if no soft-deleted hashtag with that id exists. Returns `409` if an active hashtag already uses the same name.
 
 ---
 
@@ -186,42 +230,68 @@ Returns all active inbox items (`status = 1`, `deleted_at IS NULL`).
 Optional filters: `?ready=true` (only items ready to promote — all required fields present and `date ≤ now()`), `?overdue=true` (items with `date` in the past).
 
 ### `POST /inbox`
-Creates a new inbox item. All fields optional except `user_id` (from JWT). Missing required promotion fields are fine — the item is just not ready to promote yet.
+Creates a new inbox item.
+
+**Required:** `id` (client-supplied UUID). All other fields are optional — the engine accepts sparse inbox rows and waits for later edits to complete them.
 
 `amount_cents` follows the standard sign convention: negative = expense, positive = income. The engine infers `transaction_type` from the sign and stores `amount_cents` as positive (same as the ledger). `transaction_type` is stored on the inbox row so direction is preserved through to promotion.
 
-Auto-populates `exchange_rate` from `exchange_rates` table for the transaction's `date` and `account_id.currency_code` if both are present. Falls back to most recent available rate for that pair if no exact date match.
+Auto-populates `exchange_rate` from `exchange_rates` table for the transaction's `date` and `account_id.currency_code` if both are present. Falls back to `1.0` if no rate row exists.
+
+**Response shape:** Inbox rows include both native AND home-currency amounts:
+- `amount_cents` + `amount_home_cents` — computed as `amount_cents × exchange_rate` at read time.
+- `transfer_amount_cents` + `transfer_amount_home_cents` — same computation, using the stored (signed) transfer amount.
+
+Pass `?debit_as_negative=true` on `GET /inbox` or `GET /inbox/{id}` to have the primary `amount_cents` and `amount_home_cents` returned negated for EXPENSE items and for the outflow leg of transfer items. `transfer_amount_cents` is left as-stored (it's already signed on purpose — the promote flow uses it for zero-sum validation).
 
 ### `GET /inbox/{id}`
 ### `PUT /inbox/{id}`
 Partial update. Re-evaluates promotion readiness after every update. If `date` changes and `account_id` is set, re-fetches and updates `exchange_rate` automatically (user can still override).
 
 ### `DELETE /inbox/{id}`
-Soft-delete.
+Soft-delete. Sets `deleted_at = now()` without touching `status`, so the row remains `status = 1` (PENDING) + `deleted_at IS NOT NULL` — distinct from the PROMOTED end-state (`status = 2` + `deleted_at IS NOT NULL`).
+
+### `POST /inbox/{id}/restore`
+Undoes a soft-delete on a **pending** inbox item (`status = 1`). Clears `deleted_at` and writes a `RESTORED` activity log entry.
+
+Returns `409 CONFLICT` if the row is soft-deleted but `status != 1` — promoted inbox items are not restorable here because the ledger transaction they created still exists, and restoring the inbox side would leave the user one promote-click away from a duplicate ledger row. The error message points the client at the ledger: to undo a promotion, delete the ledger transaction instead.
+
+Returns `404 NOT_FOUND` if no soft-deleted inbox row with that id exists (including "row exists but is still active" — use that route's natural affordances instead).
 
 ### `POST /inbox/{id}/promote`
 Promotes a ready inbox item to the ledger.
+
+**Request body (required):**
+```json
+{
+  "id": "<uuid>",
+  "transfer_id": "<uuid or null>"
+}
+```
+
+- `id` — the client-supplied UUID for the newly-created ledger `expense_transactions` row.
+- `transfer_id` — the client-supplied UUID for the paired sibling ledger row when promoting a transfer inbox item. Required when the inbox row has `transfer_account_id` + `transfer_amount_cents` set; must be `null` (or omitted) otherwise. Returns `422` if mismatched.
 
 **Validation (engine enforces, not the client):**
 - `title` is present and not `'UNTITLED'`
 - `amount_cents` is present and not zero
 - `date` is present and `≤ now()`
 - `account_id` is present and references an active, non-archived account
-- `category_id` is present and references an active category
+- `category_id` is present and references an active category (non-transfer items only — transfer items auto-assign the system category)
 
 If any condition fails, returns `422` with the specific failing fields.
 
 **On success (atomic):**
-1. Creates `expense_transactions` row with `inbox_id` pointing back to this inbox item. Copies `transaction_type` from the inbox row. Computes `amount_home_cents` from `amount_cents × exchange_rate`.
+1. Creates `expense_transactions` row(s) using the client-supplied `id` (and `transfer_id` for the sibling). `inbox_id` points back to this inbox item. Copies `transaction_type` from the inbox row. Computes `amount_home_cents` from `amount_cents × exchange_rate`.
 2. Sets `status = 2` (promoted) on the inbox row.
 3. Sets `deleted_at` on the inbox row (soft delete).
 4. Updates `current_balance_cents` on the account (decrements for expenses, increments for income).
-5. Writes `activity_log` entry (action=1 created) for the new transaction.
-6. Writes `activity_log` entry (action=3 deleted) for the inbox item.
+5. Writes `activity_log` entry (action=1 CREATED) for the new transaction(s).
+6. Writes `activity_log` entry (action=3 DELETED) for the inbox item.
 
-`status = 2` distinguishes a promoted inbox item from a dismissed one (`status = 3`) — both end up soft-deleted, but the reason is preserved.
+`status = 2` distinguishes a promoted inbox item from a dismissed one (which stays at `status = 1` with `deleted_at` set) — both end up soft-deleted, but the reason is preserved via the status column. Only the PENDING + deleted combination is restorable via `POST /inbox/{id}/restore`.
 
-Returns the newly created `expense_transactions` object.
+Returns the newly created `expense_transactions` object (primary leg for transfer promotions).
 
 ---
 
@@ -241,10 +311,25 @@ Returns all active ledger transactions. Supports filtering:
 ### `POST /transactions`
 Creates a transaction directly in the ledger, bypassing the inbox. Used by the CLI for fast entry when all required fields are known.
 
-**Required:** `title`, `amount_cents`, `date`, `account_id`, `category_id`
-**Optional:** `description`, `exchange_rate` (auto-populated if omitted), `cleared`
+**Required:** `id` (client-supplied UUID), `title`, `amount_cents`, `date`, `account_id`, `category_id`
+**Optional:** `description`, `exchange_rate` (auto-populated if omitted), `cleared`, `hashtag_ids`, `transfer`
 
-Auto-populates `exchange_rate` and computes `amount_home_cents` same as inbox.
+For transfer requests, the `transfer` object additionally requires its own `id` field — the UUID of the sibling ledger row. Both `id` and `transfer.id` must be distinct and client-generated. Example:
+
+```json
+{
+  "id": "<primary_uuid>",
+  "title": "BCP to Chase",
+  "amount_cents": -6000,
+  "transfer": {
+    "id": "<sibling_uuid>",
+    "account_id": "<chase_usd_id>",
+    "amount_cents": 1500
+  }
+}
+```
+
+Auto-populates `exchange_rate` and computes `amount_home_cents` same as inbox. Returns `409 CONFLICT` if `id` or `transfer.id` already exists.
 
 **On success (atomic):**
 1. Creates `expense_transactions` row.
@@ -266,12 +351,37 @@ Partial update.
 ### `DELETE /transactions/{id}`
 Soft-delete. Updates `current_balance_cents` on the account atomically.
 
-If the transaction belongs to a completed reconciliation, returns a warning in the response body but still allows deletion. The reconciliation's totals become stale — the engine does not auto-adjust them.
+**Response shape:** Always includes a `warnings: list[str]` field. Empty list when the delete is clean; populated with one or more strings when something notable happened. Currently the only warning emitted is `"Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."` — the delete is still allowed (the engine does not auto-adjust the reconciliation's totals); the field surfaces the staleness so clients can render a notice.
 
 If the transaction has a `transfer_transaction_id`, both the transaction and its paired sibling are soft-deleted atomically.
 
+### `POST /transactions/{id}/restore`
+Undoes a soft-delete on a transaction. Re-applies the balance impact on the account, re-activates the cascaded hashtag junction rows, and atomically restores the transfer sibling if the row is part of a pair. Returns the restored transaction with the same `warnings: list[str]` envelope as DELETE (empty when restore is clean).
+
+**Reconciliation handling:** The transaction's `reconciliation_id` survives on the soft-deleted row. On restore, the link is conditionally cleared:
+
+| Recon state at restore time | Action | Warning |
+|---|---|---|
+| `reconciliation_id` is null | nothing | no |
+| Recon missing or soft-deleted | unlink (`reconciliation_id = null`) | yes |
+| Recon `status = 2` (completed) | unlink | yes |
+| Recon `status = 1` (draft) and active | **link preserved** | no |
+
+Completed reconciliations lock four fields (`amount_cents`, `account_id`, `title`, `date`) on assigned transactions — silently re-linking would leave the restored row with frozen fields the user can't edit, so the engine forces an unlink and emits a warning. The DRAFT-and-active case is the user's good-path expectation: deleted by mistake mid-reconciliation, restoring back into the same batch is the natural undo.
+
+This is intentionally asymmetric to `restore_reconciliation` (which never re-links transactions). The asymmetry is appropriate: restoring a single transaction is a small-blast-radius user undo where preserving the link in the common case matches expectations; restoring a reconciliation could re-touch many transactions that have since been edited or moved.
+
+**Hashtag junctions:** Re-activated precisely. The cascade-restore `WHERE` clause matches junction rows whose `deleted_at` exactly equals the parent's pre-restore `deleted_at`, which (because `now()` returns one value per Postgres transaction) catches only the rows that the original delete cascade soft-deleted — not pre-existing soft-deleted junctions from earlier hashtag edits. This intentionally differs from `restore_hashtag` (which doesn't re-link junctions) because hashtag-restore touches MANY transactions while transaction-restore touches ONE.
+
+**Failure modes:**
+- `404 NOT_FOUND` — no soft-deleted row with that id (including "row exists but is already active").
+- `422 VALIDATION_ERROR` — the row's `account_id` or `category_id` (or the transfer sibling's) is no longer active and non-archived. All blockers reported in a single `fields` dict before any mutation, so a 422 leaves the soft-deleted row untouched.
+- `409 CONFLICT` — the row is part of a transfer pair but the sibling is missing or no longer soft-deleted (refusing to restore an asymmetric pair).
+
 ### `POST /transactions/batch`
 Batch create. Array of transaction objects, processed as a single database transaction — all succeed or all fail.
+
+Every item in the batch must carry its own client-supplied `id`. Duplicate ids within a single batch are rejected up front with `422 VALIDATION_ERROR` (`fields.items[i].id = "Duplicate id within batch."`). Transfers are not supported in batch creates; include a `transfer` field on any item and the whole batch is rejected.
 
 **Use cases:** Bulk historical entry. CSV import is a later phase — when implemented, it will also use this endpoint.
 
@@ -306,6 +416,7 @@ Include a `transfer` object on any transaction create request:
 3. Links both via `transfer_transaction_id` (each row points to the other).
 4. Auto-assigns categories: if either account `is_person = true`, that side gets `@Debt`; both real accounts get `@Transfer`. These override any `category_id` passed in the request.
 5. Auto-creates `@Debt` or `@Transfer` system categories if they don't exist yet.
+   - **Note:** The transfer engine does **not** auto-create person accounts. Both `account_id` values in the request must reference accounts that already exist and are non-archived. If `transfer.account_id` references a non-existent or archived person, the request returns `422 VALIDATION_ERROR`. Callers create person accounts explicitly via the People API before initiating a transfer to that person.
 6. **Zero-sum validation:** The engine does not enforce that the two `amount_cents` values are equal in raw number — they may be in different currencies. It does enforce that the two transactions are directionally opposite (one negative, one positive). Returns `422` if both are the same sign. **Explicit decision:** No magnitude equality check is performed even when both accounts share the same currency. This keeps the logic simple and allows users to record unequal amounts intentionally (e.g., fees absorbed during transfer).
 7. **Home currency zero-sum (cross-currency transfers):** For transfers between accounts in different currencies, the engine uses the **implied rate from the entered amounts** (the rate the user actually got), not the market rate, when computing `amount_home_cents`. The side whose currency matches `main_currency` is dominant — its home value equals its native amount. The other side's `amount_home_cents` is forced to equal the dominant side's by direct assignment, and its `exchange_rate` is derived from that (stored for audit/display). This guarantees the pair nets to zero in home currency by construction, matching how production fintech systems (Stripe, Wise, QuickBooks Online) treat the execution rate as the historical spot rate for the transaction. No separate FX gain/loss is recognized at transaction time — that's a period-end remeasurement concern handled elsewhere (if ever).
 8. Updates `current_balance_cents` on both accounts.
@@ -321,8 +432,10 @@ Returns all reconciliation batches for the user.
 ### `POST /reconciliations`
 Creates a new draft reconciliation batch.
 
-**Required:** `account_id`, `name`
+**Required:** `id` (client-supplied UUID), `account_id`, `name`
 **Optional:** `date_start`, `date_end`, `beginning_balance_cents`, `ending_balance_cents`
+
+**Response shape:** Every reconciliation response includes `beginning_balance_home_cents` and `ending_balance_home_cents` alongside the native fields. The engine converts using the account's currency and the exchange rate at `date_end` (or today if `date_end` is null). Values are `null` only when no rate is available for the pair; list endpoints deduplicate rate lookups by `(currency, date_end)` so a page of N reconciliations produces at most K rate reads where K = distinct currency/date pairs.
 
 ### `GET /reconciliations/{id}`
 Returns the reconciliation plus all transactions currently assigned to it.
@@ -339,7 +452,10 @@ Marks the reconciliation as complete (`status = 2`). From this point, the four l
 Reverts status to draft (`status = 1`). Unlocks all fields on assigned transactions.
 
 ### `DELETE /reconciliations/{id}`
-Soft-delete. Only allowed if `status = 1` (draft). Returns `409` if status is completed — revert first.
+Soft-delete. Only allowed if `status = 1` (draft). Returns `409` if status is completed — revert first. Cascade-unassigns every transaction that was linked to this batch (`reconciliation_id` set back to `null` with `version + updated_at` bumps).
+
+### `POST /reconciliations/{id}/restore`
+Undoes a soft-delete on the reconciliation row. The transactions that were unassigned during delete are NOT re-linked — they may have since been assigned elsewhere or edited in ways that break the original balance assumptions. The restored reconciliation comes back empty and the user re-assigns manually. Returns `404` if no soft-deleted reconciliation with that id exists.
 
 ---
 
@@ -356,6 +472,7 @@ Delta sync endpoint. Returns every record that has changed since the client's la
 **Query params:**
 - `sync_token=*` — full fetch. Returns every non-deleted record for the user, no tombstones, and creates a fresh checkpoint. First-launch behavior.
 - `sync_token=<uuid>` — delta fetch. Returns only records whose `updated_at` is newer than the checkpoint, including soft-deleted rows as tombstones.
+- `debit_as_negative=true` (optional) — applies to every `transactions[]` row and every `inbox[]` row in the response, using the same semantics as the single-resource endpoints. Reconciliation balances don't negate (they're signed balances, not directional amounts). Account rows are unaffected.
 
 The token is opaque to the client — never parse it, just store it and send it back. Server-side the token maps to a `last_sync_at` timestamp in `sync_checkpoints`; the delta query is `WHERE updated_at > last_sync_at`. All reads and the checkpoint write happen inside one Postgres `REPEATABLE READ` transaction so the snapshot is consistent across every table — a concurrent mutation either lands entirely in this sync or entirely in the next.
 
@@ -373,7 +490,7 @@ The token is opaque to the client — never parse it, just store it and send it 
 }
 ```
 
-**Row shapes:** every row matches the same schema returned by the resource's individual list/get endpoints — `version`, `updated_at`, `deleted_at`, and all native + home-currency fields. `accounts` rows return `current_balance_home_cents: null` in sync responses; clients that need home-currency balances call `/dashboard`, which is the canonical place for derived values.
+**Row shapes:** every row matches the same schema returned by the resource's individual list/get endpoints — `version`, `updated_at`, `deleted_at`, and all native + home-currency fields. `accounts` rows return `current_balance_home_cents: null` in sync responses; clients that need home-currency balances call `/dashboard`, which is the canonical place for derived values. `inbox` rows include `amount_home_cents` / `transfer_amount_home_cents` computed from the stored `exchange_rate`. `reconciliations` rows include `beginning_balance_home_cents` / `ending_balance_home_cents` computed from the account's currency at `date_end` (resolved via a deduplicated batched rate lookup).
 
 **Transactions and `hashtag_ids`:** every transaction row in the sync response includes a `hashtag_ids: [uuid, ...]` array (sorted ascending) listing every hashtag attached to that transaction. The junction table `expense_transaction_hashtags` is internal storage and never appears on the wire. When a hashtag is added or removed from a transaction — even with no other field change — the parent transaction's `version` and `updated_at` are bumped in the same DB transaction, so the next delta sync surfaces the change.
 
@@ -425,17 +542,17 @@ Returns the current calendar month overview. Single endpoint, one call, everythi
       "spent_home_cents": 50000,
       "hashtag_breakdown": [
         {
-          "hashtag_combination": ["<lunch_id>", "<work_id>"],
+          "hashtag_ids": ["<lunch_id>", "<work_id>"],
           "spent_cents": 30000,
           "spent_home_cents": 30000
         },
         {
-          "hashtag_combination": ["<groceries_id>"],
+          "hashtag_ids": ["<groceries_id>"],
           "spent_cents": 15000,
           "spent_home_cents": 15000
         },
         {
-          "hashtag_combination": [],
+          "hashtag_ids": [],
           "spent_cents": 5000,
           "spent_home_cents": 5000
         }
@@ -458,10 +575,12 @@ Returns the current calendar month overview. Single endpoint, one call, everythi
 - `bank_accounts` includes only `is_person = false`, `is_archived = false`, `deleted_at IS NULL`. Sorted by `sort_order`.
 - `people` includes only `is_person = true`, `deleted_at IS NULL`. Same shape as `bank_accounts`, separated for client convenience.
 - `categories` includes every non-deleted category, even if `spent_cents = 0` (so the client can render the full category list without a second call). Sorted by `sort_order`.
-- **`hashtag_breakdown`** — array of `{ hashtag_combination, spent_cents, spent_home_cents }` rows. Aggregation is `GROUP BY (category_id, sorted_array_of_hashtag_ids)`. The hashtag set is sorted by `id` before grouping so `[#a, #b]` and `[#b, #a]` collapse to the same row. Transactions with no hashtags appear as a row with `hashtag_combination: []`. **The sum of all `hashtag_breakdown` rows under a category equals that category's `spent_cents` exactly** — no double-counting, no orphaned amounts.
+- **`hashtag_breakdown`** — array of `{ hashtag_ids, spent_cents, spent_home_cents }` rows. Aggregation is `GROUP BY (category_id, sorted_array_of_hashtag_ids)`. The hashtag set is sorted by `id` before grouping so `[#a, #b]` and `[#b, #a]` collapse to the same row. Transactions with no hashtags appear as a row with `hashtag_ids: []`. **The sum of all `hashtag_breakdown` rows under a category equals that category's `spent_cents` exactly** — no double-counting, no orphaned amounts.
 - `totals.inflow_cents` / `outflow_cents` are the sum of all positive and negative transactions in the current month, expressed in `main_currency`. Native-currency totals are not meaningful when accounts span currencies, so only `_home_cents` is authoritative; the non-home fields are provided for single-currency users.
 - All `*_home_cents` fields are pre-converted by the engine. Clients never compute currency conversions.
+- `bank_accounts[].current_balance_home_cents` and `people[].current_balance_home_cents` are `Optional[int]`. They are always populated for same-currency accounts (identity rate). For cross-currency accounts, they are `null` only when no exchange rate is available from the account's currency to `main_currency` for today's date — in that case, clients should display the native balance as a fallback.
 - "Current month" means `[first_day_of_month, last_day_of_month]` in the user's `display_timezone`.
+- `?debit_as_negative=true` is accepted for API consistency with other read endpoints but is a no-op here — dashboard aggregates are already signed by construction (per-category `spent_cents` is positive for income and negative for expense; totals return split positive `inflow_cents`/`outflow_cents` with `net_cents` as their difference).
 
 ### `GET /reports/monthly`
 
@@ -479,9 +598,9 @@ Returns flow data (what happened) for any historical month or month range. **Doe
       "spent_cents": 50000,
       "spent_home_cents": 50000,
       "hashtag_breakdown": [
-        { "hashtag_combination": ["<lunch_id>", "<work_id>"], "spent_cents": 30000, "spent_home_cents": 30000 },
-        { "hashtag_combination": ["<groceries_id>"], "spent_cents": 15000, "spent_home_cents": 15000 },
-        { "hashtag_combination": [], "spent_cents": 5000, "spent_home_cents": 5000 }
+        { "hashtag_ids": ["<lunch_id>", "<work_id>"], "spent_cents": 30000, "spent_home_cents": 30000 },
+        { "hashtag_ids": ["<groceries_id>"], "spent_cents": 15000, "spent_home_cents": 15000 },
+        { "hashtag_ids": [], "spent_cents": 5000, "spent_home_cents": 5000 }
       ]
     }
   ],
@@ -496,7 +615,7 @@ Returns flow data (what happened) for any historical month or month range. **Doe
 }
 ```
 
-`categories` and `hashtag_breakdown` follow the exact same rules as `/dashboard` (every non-deleted category included, breakdown rows sum to the parent category total, `hashtag_combination: []` for transactions with no hashtags). `totals` uses the same inflow/outflow/net structure.
+`categories` and `hashtag_breakdown` follow the exact same rules as `/dashboard` (every non-deleted category included, breakdown rows sum to the parent category total, `hashtag_ids: []` for transactions with no hashtags). `totals` uses the same inflow/outflow/net structure.
 
 **Query params:**
 - `year`, `month` — single month. Returns the shape above.
@@ -519,6 +638,22 @@ The two query forms are mutually exclusive. Passing both → `422`. Passing neit
 
 ### `GET /activity`
 Returns the activity log for the user. Supports filtering by `resource_type` and `resource_id`. Sorted by `created_at` descending. Useful for debugging and audit.
+
+### Action codes
+| Value | Name | Emitted when |
+|---|---|---|
+| 1 | `CREATED` | Any resource is inserted |
+| 2 | `UPDATED` | Any mutable field on an existing resource changes |
+| 3 | `DELETED` | A resource is soft-deleted (`deleted_at` set) |
+| 4 | `RESTORED` | A soft-deleted resource is restored via `POST /{resource}/{id}/restore` |
+
+### Aggregate exceptions
+
+The "every mutation gets an activity_log row" rule has three deliberate exceptions. Each is documented where the mutation happens so future readers can trace the decision:
+
+1. **Junction-row mutations on `expense_transaction_hashtags`** are NOT logged per-link. The parent transaction's `UPDATED` snapshot carries the new `hashtag_ids` list, so the change is captured at parent granularity. Per-link entries would multiply audit row count by the average hashtags per transaction without answering useful questions.
+2. **`recalculate_home_currency` bulk UPDATEs** on `expense_transactions` and `expense_transaction_inbox` are NOT logged per-row. A single `UPDATED` row on `user_settings` carries a `recalculation` summary block (rows touched per pass) and is the canonical audit record. Per-row entries would inflate `activity_log` by orders of magnitude for a single user request.
+3. **`users.last_login_at` bumps** on repeat bootstrap calls are NOT logged. Login bumps are operational metadata, not user actions worth auditing. If session-level audit becomes a requirement, the right home is a dedicated `auth_sessions` table, not inflated `activity_log`.
 
 ---
 

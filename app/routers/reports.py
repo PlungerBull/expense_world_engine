@@ -61,7 +61,18 @@ async def get_monthly_report(
     from_month: Optional[int] = Query(None, ge=1, le=12),
     to_year: Optional[int] = Query(None, ge=1900, le=2100),
     to_month: Optional[int] = Query(None, ge=1, le=12),
+    debit_as_negative: bool = Query(
+        False,
+        description=(
+            "Accepted for API consistency with other read endpoints. Monthly "
+            "report aggregates are already signed by construction (per-category "
+            "spent_cents is positive for income and negative for expense; "
+            "totals return split positive inflow/outflow). The flag is a no-op."
+        ),
+    ),
 ):
+    # debit_as_negative is intentionally unused here — see parameter docstring.
+    del debit_as_negative
     single_count = sum(v is not None for v in (year, month))
     range_count = sum(v is not None for v in (from_year, from_month, to_year, to_month))
 
@@ -76,7 +87,15 @@ async def get_monthly_report(
     if single_count == 0 and range_count == 0:
         raise validation_error(
             "Missing query parameters. Use (year, month) for a single month or "
-            "(from_year, from_month, to_year, to_month) for a range."
+            "(from_year, from_month, to_year, to_month) for a range.",
+            {
+                "year": "required (single-month form)",
+                "month": "required (single-month form)",
+                "from_year": "required (range form)",
+                "from_month": "required (range form)",
+                "to_year": "required (range form)",
+                "to_month": "required (range form)",
+            },
         )
     if single_count == 1:
         raise validation_error(

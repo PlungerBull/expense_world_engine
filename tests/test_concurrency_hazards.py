@@ -34,6 +34,7 @@ async def _new_expense(client, account_id: str, category_id: str, amount: int) -
     r = await client.post(
         "/v1/transactions",
         json={
+            "id": str(uuid.uuid4()),
             "title": f"hazard-{uuid.uuid4()}",
             "amount_cents": -amount,  # negative = expense
             "date": "2026-04-12T12:00:00Z",
@@ -200,12 +201,14 @@ async def test_transfer_pair_is_created_atomically(client, test_data):
         r = await client.post(
             "/v1/transactions",
             json={
+                "id": str(uuid.uuid4()),
                 "title": f"transfer-{uuid.uuid4()}",
                 "amount_cents": -2500,  # outflow from primary account
                 "date": "2026-04-12T12:00:00Z",
                 "account_id": test_data.account_id,
                 "category_id": test_data.category_id,  # ignored for transfers
                 "transfer": {
+                    "id": str(uuid.uuid4()),
                     "account_id": second_account_id,
                     "amount_cents": 2500,  # inflow to secondary account
                 },

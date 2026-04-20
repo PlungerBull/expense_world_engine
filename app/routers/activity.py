@@ -5,7 +5,7 @@ from fastapi import APIRouter, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.helpers.pagination import clamp_limit, paginated_response
+from app.helpers.pagination import paginated_response
 from app.schemas.activity import ActivityLogResponse
 
 router = APIRouter(prefix="/activity", tags=["activity"])
@@ -38,12 +38,9 @@ async def list_activity(
     auth_user: CurrentUser,
     resource_type: Optional[str] = Query(None),
     resource_id: Optional[str] = Query(None),
-    limit: int = Query(50),
-    offset: int = Query(0),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
-    limit = clamp_limit(limit)
-    if offset < 0:
-        offset = 0
 
     conditions = ["user_id = $1"]
     params: list = [auth_user.id]

@@ -7,15 +7,20 @@ DELETE, POST /promote) delegate to helpers.inbox.
 from typing import Optional
 
 from fastapi import APIRouter, Header, Query
-from fastapi.responses import JSONResponse
 
 from app import db
 from app.deps import CurrentUser
 from app.errors import not_found
 from app.helpers import inbox as inbox_service
-from app.helpers.idempotency import check_idempotency, store_idempotency
-from app.helpers.pagination import clamp_limit, paginated_response
-from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
+from app.helpers.formatting import apply_debit_as_negative_inbox
+from app.helpers.idempotency import run_idempotent
+from app.helpers.pagination import paginated_response
+from app.schemas.inbox import (
+    InboxCreateRequest,
+    InboxPromoteRequest,
+    InboxUpdateRequest,
+    inbox_from_row,
+)
 
 router = APIRouter(prefix="/inbox", tags=["inbox"])
 
@@ -29,11 +34,10 @@ async def list_inbox(
     ready: bool = Query(False),
     overdue: bool = Query(False),
     include_deleted: bool = Query(False),
-    limit: int = Query(50),
-    offset: int = Query(0),
+    debit_as_negative: bool = Query(False),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
-    limit = clamp_limit(limit)
-
     async with db.pool.acquire() as conn:
         conditions = ["i.user_id = $1", "i.status = 1"]
         params: list = [auth_user.id]
@@ -84,6 +88,8 @@ async def list_inbox(
         )
 
         data = [inbox_from_row(row) for row in rows]
+        if debit_as_negative:
+            data = [apply_debit_as_negative_inbox(d) for d in data]
         return paginated_response(data, total, limit, offset)
 
 
@@ -96,25 +102,25 @@ async def create_inbox_item(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached, status_code=201)
-
-        async with conn.transaction():
-            response = await inbox_service.create_inbox_item(
-                conn, auth_user.id, body,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return JSONResponse(content=response, status_code=201)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=201,
+        work=lambda conn: inbox_service.create_inbox_item(
+            conn, auth_user.id, body,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
 # GET /inbox/{inbox_id}
 # ---------------------------------------------------------------------------
 @router.get("/{inbox_id}")
-async def get_inbox_item(inbox_id: str, auth_user: CurrentUser):
+async def get_inbox_item(
+    inbox_id: str,
+    auth_user: CurrentUser,
+    debit_as_negative: bool = Query(False),
+):
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM expense_transaction_inbox WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
@@ -123,7 +129,10 @@ async def get_inbox_item(inbox_id: str, auth_user: CurrentUser):
         )
         if row is None:
             raise not_found("inbox item")
-        return inbox_from_row(row)
+        data = inbox_from_row(row)
+        if debit_as_negative:
+            data = apply_debit_as_negative_inbox(data)
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -136,18 +145,14 @@ async def update_inbox_item(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
-
-        async with conn.transaction():
-            response = await inbox_service.update_inbox_item(
-                conn, auth_user.id, inbox_id, body,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: inbox_service.update_inbox_item(
+            conn, auth_user.id, inbox_id, body,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -159,18 +164,33 @@ async def delete_inbox_item(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: inbox_service.delete_inbox_item(
+            conn, auth_user.id, inbox_id,
+        ),
+    )
 
-        async with conn.transaction():
-            response = await inbox_service.delete_inbox_item(
-                conn, auth_user.id, inbox_id,
-            )
 
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+# ---------------------------------------------------------------------------
+# POST /inbox/{inbox_id}/restore
+# ---------------------------------------------------------------------------
+@router.post("/{inbox_id}/restore")
+async def restore_inbox_item(
+    inbox_id: str,
+    auth_user: CurrentUser,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: inbox_service.restore_inbox_item(
+            conn, auth_user.id, inbox_id,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -179,18 +199,15 @@ async def delete_inbox_item(
 @router.post("/{inbox_id}/promote")
 async def promote_inbox_item(
     inbox_id: str,
+    body: InboxPromoteRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
-
-        async with conn.transaction():
-            response = await inbox_service.promote_inbox_item(
-                conn, auth_user.id, inbox_id,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: inbox_service.promote_inbox_item(
+            conn, auth_user.id, inbox_id, body.id, body.transfer_id,
+        ),
+    )

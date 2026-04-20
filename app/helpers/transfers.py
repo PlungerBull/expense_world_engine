@@ -1,10 +1,16 @@
 from datetime import datetime
 from typing import Optional
+from uuid import UUID
 
 import asyncpg
 
-from app.constants import ActivityAction, TransactionType, TransferDirection
-from app.errors import validation_error
+from app.constants import (
+    ActivityAction,
+    SystemCategoryKey,
+    TransactionType,
+    TransferDirection,
+)
+from app.errors import conflict, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
 from app.helpers.categories import ensure_system_category
@@ -15,6 +21,8 @@ from app.schemas.transactions import transaction_from_row
 async def create_transfer_pair(
     conn: asyncpg.Connection,
     user_id: str,
+    primary_id: UUID,
+    sibling_id: UUID,
     primary_title: str,
     primary_description: Optional[str],
     primary_amount_cents: int,
@@ -89,15 +97,16 @@ async def create_transfer_pair(
     primary_is_person = primary_account["is_person"]
     transfer_is_person = transfer_account["is_person"]
 
-    if primary_is_person:
-        primary_category_id = await ensure_system_category(conn, user_id, "@Debt")
-    else:
-        primary_category_id = await ensure_system_category(conn, user_id, "@Transfer")
-
-    if transfer_is_person:
-        sibling_category_id = await ensure_system_category(conn, user_id, "@Debt")
-    else:
-        sibling_category_id = await ensure_system_category(conn, user_id, "@Transfer")
+    primary_category_id = await ensure_system_category(
+        conn,
+        user_id,
+        SystemCategoryKey.DEBT if primary_is_person else SystemCategoryKey.TRANSFER,
+    )
+    sibling_category_id = await ensure_system_category(
+        conn,
+        user_id,
+        SystemCategoryKey.DEBT if transfer_is_person else SystemCategoryKey.TRANSFER,
+    )
 
     # ------------------------------------------------------------------
     # 5. Normalize amounts and determine transfer_direction
@@ -168,59 +177,74 @@ async def create_transfer_pair(
             primary_home = sibling_home
             primary_exchange_rate = primary_home / primary_abs
 
+    if primary_id == sibling_id:
+        raise validation_error(
+            "Transfer id collision.",
+            {"transfer.id": "Must differ from the primary transaction id."},
+        )
+
     # ------------------------------------------------------------------
     # 7. Insert primary transaction
     # ------------------------------------------------------------------
-    primary_row = await conn.fetchrow(
-        """
-        INSERT INTO expense_transactions
-            (user_id, title, description, amount_cents, amount_home_cents,
-             transaction_type, transfer_direction, date, account_id, category_id,
-             exchange_rate, cleared, inbox_id, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, 3, $6, $7, $8, $9, $10, $11, $12, now(), now())
-        RETURNING *
-        """,
-        user_id,
-        primary_title,
-        primary_description,
-        primary_abs,
-        primary_home,
-        primary_direction,
-        primary_date,
-        primary_account_id,
-        primary_category_id,
-        primary_exchange_rate,
-        primary_cleared,
-        inbox_id,
-    )
-    primary_id = str(primary_row["id"])
+    try:
+        primary_row = await conn.fetchrow(
+            """
+            INSERT INTO expense_transactions
+                (id, user_id, title, description, amount_cents, amount_home_cents,
+                 transaction_type, transfer_direction, date, account_id, category_id,
+                 exchange_rate, cleared, inbox_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 3, $7, $8, $9, $10, $11, $12, $13, now(), now())
+            RETURNING *
+            """,
+            primary_id,
+            user_id,
+            primary_title,
+            primary_description,
+            primary_abs,
+            primary_home,
+            primary_direction,
+            primary_date,
+            primary_account_id,
+            primary_category_id,
+            primary_exchange_rate,
+            primary_cleared,
+            inbox_id,
+        )
+    except asyncpg.UniqueViolationError:
+        raise conflict(f"A transaction with id '{primary_id}' already exists.")
 
     # ------------------------------------------------------------------
     # 8. Insert sibling transaction (linked to primary)
     # ------------------------------------------------------------------
-    sibling_row = await conn.fetchrow(
-        """
-        INSERT INTO expense_transactions
-            (user_id, title, description, amount_cents, amount_home_cents,
-             transaction_type, transfer_direction, date, account_id, category_id,
-             exchange_rate, cleared, transfer_transaction_id, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, 3, $6, $7, $8, $9, $10, $11, $12, now(), now())
-        RETURNING *
-        """,
-        user_id,
-        primary_title,
-        primary_description,
-        sibling_abs,
-        sibling_home,
-        sibling_direction,
-        primary_date,
-        transfer_account_id,
-        sibling_category_id,
-        sibling_exchange_rate,
-        primary_cleared,
-        primary_id,
-    )
-    sibling_id = str(sibling_row["id"])
+    try:
+        sibling_row = await conn.fetchrow(
+            """
+            INSERT INTO expense_transactions
+                (id, user_id, title, description, amount_cents, amount_home_cents,
+                 transaction_type, transfer_direction, date, account_id, category_id,
+                 exchange_rate, cleared, transfer_transaction_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 3, $7, $8, $9, $10, $11, $12, $13, now(), now())
+            RETURNING *
+            """,
+            sibling_id,
+            user_id,
+            primary_title,
+            primary_description,
+            sibling_abs,
+            sibling_home,
+            sibling_direction,
+            primary_date,
+            transfer_account_id,
+            sibling_category_id,
+            sibling_exchange_rate,
+            primary_cleared,
+            primary_id,
+        )
+    except asyncpg.UniqueViolationError:
+        raise conflict(f"A transaction with id '{sibling_id}' already exists.")
+
+    primary_id_str = str(primary_id)
+    sibling_id_str = str(sibling_id)
 
     # ------------------------------------------------------------------
     # 9. Link primary → sibling
@@ -268,11 +292,11 @@ async def create_transfer_pair(
     # 12. Activity logs — one per transaction
     # ------------------------------------------------------------------
     await write_activity_log(
-        conn, user_id, "transaction", primary_id, ActivityAction.CREATED,
+        conn, user_id, "transaction", primary_id_str, ActivityAction.CREATED,
         after_snapshot=primary_response,
     )
     await write_activity_log(
-        conn, user_id, "transaction", sibling_id, ActivityAction.CREATED,
+        conn, user_id, "transaction", sibling_id_str, ActivityAction.CREATED,
         after_snapshot=sibling_response,
     )
 

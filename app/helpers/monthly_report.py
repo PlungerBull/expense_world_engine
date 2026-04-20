@@ -22,20 +22,20 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from app.errors import AppError
+from app.errors import settings_missing
 
 
 async def get_user_report_settings(
     conn: asyncpg.Connection,
     user_id: str,
 ) -> dict:
-    """Load main_currency + display_timezone for a user, or 409 if they haven't bootstrapped."""
+    """Load main_currency + display_timezone for a user, or 422 if they haven't bootstrapped."""
     row = await conn.fetchrow(
         "SELECT main_currency, display_timezone FROM user_settings WHERE user_id = $1",
         user_id,
     )
     if row is None:
-        raise AppError(409, "SETTINGS_MISSING", "User settings not found. Call /auth/bootstrap first.")
+        raise settings_missing()
     return {"main_currency": row["main_currency"], "display_timezone": row["display_timezone"]}
 
 
@@ -145,7 +145,7 @@ async def compute_month_flow(
         cat_id = str(row["category_id"])
         breakdowns_by_category.setdefault(cat_id, []).append(
             {
-                "hashtag_combination": list(row["hashtag_ids"]),
+                "hashtag_ids": list(row["hashtag_ids"]),
                 "spent_cents": int(row["spent_cents"]),
                 "spent_home_cents": int(row["spent_home_cents"]),
             }

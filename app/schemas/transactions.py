@@ -1,15 +1,18 @@
 from datetime import datetime
 from typing import Optional
+from uuid import UUID
 
 from pydantic import BaseModel
 
 
 class TransferField(BaseModel):
+    id: UUID  # sibling transaction's client-supplied uuid
     account_id: str
     amount_cents: int  # signed: negative=outflow, positive=inflow
 
 
 class TransactionCreateRequest(BaseModel):
+    id: UUID
     title: str
     amount_cents: int  # signed: negative=expense, positive=income
     date: datetime

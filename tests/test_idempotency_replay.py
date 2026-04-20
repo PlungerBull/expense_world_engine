@@ -36,6 +36,7 @@ async def test_create_transaction_replay_returns_identical_response(client, test
     """
     idempotency_key = str(uuid.uuid4())
     payload = {
+        "id": str(uuid.uuid4()),
         "title": f"idempotent-{uuid.uuid4()}",
         "amount_cents": -750,
         "date": "2026-04-12T10:00:00Z",

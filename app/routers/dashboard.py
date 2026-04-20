@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import asyncpg
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from app import db
 from app.deps import CurrentUser
@@ -81,7 +81,20 @@ async def _load_accounts(
 
 
 @router.get("")
-async def get_dashboard(auth_user: CurrentUser):
+async def get_dashboard(
+    auth_user: CurrentUser,
+    debit_as_negative: bool = Query(
+        False,
+        description=(
+            "Accepted for API consistency with other read endpoints. Dashboard "
+            "aggregates are already signed by construction (per-category "
+            "spent_cents is positive for income and negative for expense; "
+            "totals return split positive inflow/outflow). The flag is a no-op."
+        ),
+    ),
+):
+    # debit_as_negative is intentionally unused here — see docstring above.
+    del debit_as_negative
     async with db.pool.acquire() as conn:
         settings = await get_user_report_settings(conn, auth_user.id)
         year, month, start_utc, end_utc = compute_month_bounds(settings["display_timezone"])

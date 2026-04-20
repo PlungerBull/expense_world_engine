@@ -2,9 +2,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import db
-from app.errors import AppError, app_error_handler, validation_error_handler
+from app.errors import (
+    AppError,
+    app_error_handler,
+    starlette_http_exception_handler,
+    unhandled_exception_handler,
+    validation_error_handler,
+)
 from app.routers import (
     accounts,
     activity,
@@ -37,6 +44,8 @@ app = FastAPI(
 
 app.add_exception_handler(AppError, app_error_handler)
 app.add_exception_handler(RequestValidationError, validation_error_handler)
+app.add_exception_handler(StarletteHTTPException, starlette_http_exception_handler)
+app.add_exception_handler(Exception, unhandled_exception_handler)
 
 app.include_router(health.router)
 app.include_router(auth.router, prefix="/v1")

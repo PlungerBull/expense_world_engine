@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Optional
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -7,6 +8,7 @@ from app.schemas.transactions import TransactionResponse
 
 
 class ReconciliationCreateRequest(BaseModel):
+    id: UUID
     account_id: str
     name: str
     date_start: Optional[datetime] = None
@@ -32,14 +34,26 @@ class ReconciliationResponse(BaseModel):
     date_end: Optional[datetime] = None
     status: int
     beginning_balance_cents: int
+    beginning_balance_home_cents: Optional[int] = None
     ending_balance_cents: int
+    ending_balance_home_cents: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     version: int
     deleted_at: Optional[datetime] = None
 
 
-def reconciliation_from_row(row) -> dict:
+def reconciliation_from_row(row, rate: Optional[float] = None) -> dict:
+    """Serialize a reconciliation row.
+
+    ``rate`` is the account's currency → user's home currency conversion
+    factor at the reconciliation's ``date_end`` (or ``now()`` if not set).
+    When ``rate`` is None (e.g. main_currency not configured or no rate
+    row available), both home-cents fields serialize as ``null`` so the
+    response shape stays stable.
+    """
+    begin = row["beginning_balance_cents"]
+    end = row["ending_balance_cents"]
     return ReconciliationResponse(
         id=str(row["id"]),
         user_id=str(row["user_id"]),
@@ -48,8 +62,10 @@ def reconciliation_from_row(row) -> dict:
         date_start=row["date_start"],
         date_end=row["date_end"],
         status=row["status"],
-        beginning_balance_cents=row["beginning_balance_cents"],
-        ending_balance_cents=row["ending_balance_cents"],
+        beginning_balance_cents=begin,
+        beginning_balance_home_cents=round(begin * rate) if rate is not None else None,
+        ending_balance_cents=end,
+        ending_balance_home_cents=round(end * rate) if rate is not None else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         version=row["version"],

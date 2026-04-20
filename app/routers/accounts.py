@@ -4,15 +4,15 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Header, Query
-from fastapi.responses import JSONResponse
 
 from app import db
 from app.deps import CurrentUser
 from app.errors import not_found
 from app.helpers import accounts as accounts_service
 from app.helpers.exchange_rate import batch_get_rates
-from app.helpers.idempotency import check_idempotency, store_idempotency
-from app.helpers.pagination import clamp_limit, paginated_response
+from app.helpers.idempotency import run_idempotent
+from app.helpers.pagination import paginated_response
+from app.helpers.validation import extract_update_fields
 from app.schemas.accounts import AccountCreateRequest, AccountUpdateRequest, account_from_row
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -24,11 +24,9 @@ async def list_accounts(
     include_people: bool = Query(False),
     include_archived: bool = Query(False),
     include_deleted: bool = Query(False),
-    limit: int = Query(50),
-    offset: int = Query(0),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
-    limit = clamp_limit(limit)
-
     async with db.pool.acquire() as conn:
         conditions = ["user_id = $1"]
         params: list = [auth_user.id]
@@ -99,18 +97,14 @@ async def create_account(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached, status_code=201)
-
-        async with conn.transaction():
-            response = await accounts_service.create_account(
-                conn, auth_user.id, body.name, body.currency_code, body.color, body.sort_order,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return JSONResponse(content=response, status_code=201)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=201,
+        work=lambda conn: accounts_service.create_account(
+            conn, auth_user.id, body.id, body.name, body.currency_code, body.color, body.sort_order,
+        ),
+    )
 
 
 @router.get("/{account_id}")
@@ -137,20 +131,15 @@ async def update_account(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    fields = body.model_dump(exclude_none=True)
-
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
-
-        async with conn.transaction():
-            response = await accounts_service.update_account(
-                conn, auth_user.id, account_id, fields,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+    fields = extract_update_fields(body)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: accounts_service.update_account(
+            conn, auth_user.id, account_id, fields,
+        ),
+    )
 
 
 @router.delete("/{account_id}")
@@ -159,18 +148,30 @@ async def delete_account(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: accounts_service.delete_account(
+            conn, auth_user.id, account_id,
+        ),
+    )
 
-        async with conn.transaction():
-            response = await accounts_service.delete_account(
-                conn, auth_user.id, account_id,
-            )
 
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+@router.post("/{account_id}/restore")
+async def restore_account(
+    account_id: str,
+    auth_user: CurrentUser,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: accounts_service.restore_account(
+            conn, auth_user.id, account_id,
+        ),
+    )
 
 
 @router.post("/{account_id}/archive")
@@ -179,15 +180,11 @@ async def archive_account(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    async with db.pool.acquire() as conn:
-        cached = await check_idempotency(conn, auth_user.id, x_idempotency_key)
-        if cached is not None:
-            return JSONResponse(content=cached)
-
-        async with conn.transaction():
-            response = await accounts_service.archive_account(
-                conn, auth_user.id, account_id,
-            )
-
-        await store_idempotency(conn, auth_user.id, x_idempotency_key, response)
-        return response
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: accounts_service.archive_account(
+            conn, auth_user.id, account_id,
+        ),
+    )

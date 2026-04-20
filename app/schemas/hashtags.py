@@ -1,10 +1,12 @@
 from datetime import datetime
 from typing import Optional
+from uuid import UUID
 
 from pydantic import BaseModel
 
 
 class HashtagCreateRequest(BaseModel):
+    id: UUID
     name: str
     sort_order: Optional[int] = None
 

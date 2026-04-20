@@ -1,10 +1,16 @@
 from datetime import datetime
 from typing import Optional
+from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class AccountCreateRequest(BaseModel):
+    # Reject unknown fields (including is_person) with 422 — person accounts
+    # are created via the dedicated People API, never through this endpoint.
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
     name: str
     currency_code: str
     color: Optional[str] = None
@@ -15,7 +21,7 @@ class AccountUpdateRequest(BaseModel):
     name: Optional[str] = None
     color: Optional[str] = None
     sort_order: Optional[int] = None
-    currency_code: Optional[str] = None  # accepted but rejected at router level
+    currency_code: Optional[str] = None  # accepted but rejected at service level
 
 
 class AccountResponse(BaseModel):
