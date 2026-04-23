@@ -10,7 +10,7 @@
 
 **Base URL:** `https://expense-world-engine.onrender.com/v1` (production) / `http://localhost:8000/v1` (local)
 
-**Authentication:** Every request requires `Authorization: Bearer <token>`. The engine validates the Supabase JWT, extracts `user_id`, and passes it to all downstream logic. Unauthenticated requests return `401`.
+**Authentication:** Every request requires `Authorization: Bearer <token>`. The token is either a Supabase JWT (iOS app) or a Personal Access Token (CLI, web integrations) — both resolve to the same `user_id`. PATs are recognized by the `ewe_pat_` prefix; any other token is parsed as a JWT. Unauthenticated, invalid, expired, or revoked tokens return `401`.
 
 **Client-supplied UUIDs:** Every `POST` that creates a resource requires an `id: UUID` field in the request body. The client generates the UUID locally (e.g., `uuid4()`) before making the call — the server never picks the id. This enables offline-first clients to reference a resource before the request completes, and makes idempotent retries trivial: a second POST with the same `id` returns `409 CONFLICT` (existing resource), not a duplicate.
 
@@ -119,6 +119,46 @@ Updates `user_settings`. Partial update — only supplied fields are changed. If
 **Settings preconditions:** Endpoints that read `user_settings` (dashboard, reports, recalc) return `422 SETTINGS_MISSING` with `fields: {"user_settings": "Must be provisioned via POST /v1/auth/bootstrap."}` if the user has not completed bootstrap. This is a precondition-unmet state, not a conflict.
 
 **Exchange-rate preconditions:** Any write that needs to compute `amount_home_cents` for a cross-currency account (`POST /transactions`, `PUT /transactions/{id}` with a `date` change, `POST /transactions/batch`, `POST /inbox`, `PUT /inbox/{id}` with a `date` change) returns `422 RATE_UNAVAILABLE` with `fields: {"exchange_rate": "No rate on or before <date> for <from>-><to>. Wait for the daily fetch or supply an explicit exchange_rate."}` when no `exchange_rates` row exists on or before the transaction's `date`. No silent `1.0` fallback — a missing rate fails loudly so `amount_home_cents` cannot be corrupted. Clients can either retry after the daily FX cron runs (see [TODO.md](../TODO.md)) or bypass the lookup by supplying an explicit `exchange_rate` on the request. Same-currency accounts short-circuit to the identity rate and never hit this path.
+
+### `POST /auth/pat`
+Mints a new Personal Access Token for the authenticated caller. Long-lived, non-expiring; used by clients that can't do interactive JWT refresh (CLI, scripts, scheduled jobs).
+
+**Request body:**
+```json
+{ "name": "laptop" }
+```
+`name` is optional and nullable — a freeform label users can set to distinguish tokens in a future management UI. No length or character restrictions in v1.
+
+**Response (`201 Created`):**
+```json
+{
+  "id": "…uuid…",
+  "user_id": "…uuid…",
+  "token": "ewe_pat_<~43-char urlsafe-base64 suffix>",
+  "token_prefix": "ewe_pat_a3f9",
+  "name": "laptop",
+  "created_at": "2026-04-21T15:04:05Z",
+  "revoked_at": null
+}
+```
+
+The plaintext `token` is returned **exactly once**. The engine stores only its SHA-256 hash; losing the plaintext means the user must mint a new token and revoke the old one. The `token_prefix` (first 12 chars) is kept in cleartext for display.
+
+**Design notes:**
+- **Unlimited tokens per user.** Each device/integration can carry its own token; revoking one doesn't affect others. Matches GitHub/Stripe.
+- **Activity log:** a single `CREATED` entry under `resource_type = "personal_access_token"`. The snapshot records `id`, `token_prefix`, `name`, and timestamps — never the hash, never the plaintext.
+- **Callable by either token type.** A JWT-authenticated session or an existing PAT can both mint new PATs. RLS scopes the new row to the caller's `user_id`.
+
+### `DELETE /auth/pat/{pat_id}`
+Revokes (soft-deletes) an active PAT. The token stops authenticating on the very next request.
+
+Returns `200` with the revoked row (including `revoked_at` set). Returns `404` if the id is unknown to the caller or the token is already revoked (soft-deleted rows are excluded from the lookup, matching the codebase's soft-delete convention).
+
+A PAT may revoke itself — that's fine; the row lookup succeeds, the `UPDATE` runs, and the next request with that token returns `401`.
+
+**Not shipped in v1:**
+- `GET /auth/pat` (list endpoint). Defer until a web dashboard needs a management UI.
+- `last_used_at` tracking. Dropped to avoid a per-request DB write on every authenticated call.
 
 ---
 

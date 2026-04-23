@@ -215,6 +215,42 @@ activity_log
 
 ---
 
+### personal_access_tokens
+
+Long-lived engine-issued credentials for CLI and scripted clients. A PAT carries the same authority as a Supabase JWT; the middleware in `app/deps.py` resolves either kind of token into an `AuthUser` and every downstream endpoint is unaware of which one was presented. Added in sql/016.
+
+Security model: only the SHA-256 hash is stored. The plaintext is returned once on creation and never recoverable. Revocation is a soft-delete (`revoked_at`), and the active-lookup index filters revoked rows out so a revoked PAT stops authenticating on the very next request.
+
+```
+personal_access_tokens
+  - id            UUID, primary key, default uuid_generate_v4()
+  - user_id       UUID, NOT NULL, FK → users
+  - token_hash    text, NOT NULL, UNIQUE
+                  — SHA-256 hex digest of the plaintext token. The engine
+                    hashes incoming Authorization headers the same way and
+                    looks up by this column.
+  - token_prefix  text, NOT NULL
+                  — first 12 chars of the plaintext ('ewe_pat_' + 4 random).
+                    Stored cleartext for display in a future management UI
+                    and for GitHub/GitGuardian-style leak scanners.
+  - name          text, nullable
+                  — optional user-supplied label ('laptop', 'render-cron').
+  - created_at    timestamptz, NOT NULL, default now()
+  - revoked_at    timestamptz, nullable
+                  — soft-delete marker. NULL = active. Non-null = revoked
+                    and no longer resolves in auth.
+
+Indexes:
+  - idx_pat_token_hash_active (token_hash) WHERE revoked_at IS NULL
+    Partial index backing the per-request auth lookup.
+
+RLS: auth.uid() = user_id
+```
+
+No `version` or `updated_at`: PATs are immutable between creation and revocation; they are never edited in place.
+
+---
+
 ## Expense Tables
 
 ### expense_bank_accounts
