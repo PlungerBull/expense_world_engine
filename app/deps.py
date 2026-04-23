@@ -8,12 +8,22 @@ from app import db
 from app.config import settings
 from app.errors import unauthorized
 from app.helpers.auth_token import PAT_PREFIX, hash_pat
+from app.helpers.jwks import get_jwk
 
 
 @dataclass
 class AuthUser:
     id: str
     email: Optional[str]
+
+
+# Algorithms the engine is willing to verify. ES256 is what modern
+# Supabase projects issue by default; HS256 remains supported so
+# legacy projects and our own test-generated tokens keep working. If
+# an unrecognised alg arrives, we reject rather than silently trying
+# to coerce it.
+_ASYMMETRIC_ALGS = {"ES256", "RS256"}
+_SYMMETRIC_ALGS = {"HS256"}
 
 
 async def get_current_user(
@@ -40,13 +50,35 @@ async def get_current_user(
             raise unauthorized("Invalid or revoked token.")
         return AuthUser(id=str(row["user_id"]), email=None)
 
-    # JWT path: Supabase-issued session token. Verified against the
-    # shared HS256 secret; the sub claim carries the user_id.
+    # JWT path: alg-aware. Read the unverified header to pick the
+    # right verification key before trusting any claims. Reading the
+    # header is safe — it's not trusted, it only tells us which key
+    # the signer *says* they used. The subsequent jwt.decode() is
+    # what actually proves the signature.
+    try:
+        unverified_header = jwt.get_unverified_header(token)
+    except JWTError:
+        raise unauthorized("Invalid token format.")
+
+    alg = unverified_header.get("alg")
+
+    if alg in _SYMMETRIC_ALGS:
+        key = settings.supabase_jwt_secret
+    elif alg in _ASYMMETRIC_ALGS:
+        kid = unverified_header.get("kid")
+        if not kid:
+            raise unauthorized("Token missing key id.")
+        key = get_jwk(kid)
+        if key is None:
+            raise unauthorized("Unknown signing key.")
+    else:
+        raise unauthorized("Unsupported signing algorithm.")
+
     try:
         payload = jwt.decode(
             token,
-            settings.supabase_jwt_secret,
-            algorithms=["HS256"],
+            key,
+            algorithms=[alg],
             options={"verify_aud": False},
         )
     except JWTError:
