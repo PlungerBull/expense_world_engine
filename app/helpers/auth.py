@@ -186,3 +186,45 @@ async def update_settings(
     )
 
     return after
+
+
+async def update_profile(
+    conn: asyncpg.Connection,
+    user_id: str,
+    fields: dict,
+) -> dict:
+    """Apply identity-field updates to ``users`` (v1: display_name only).
+
+    Empty ``fields`` raises 422. Unlike ``update_settings``, profile has a
+    single mutable field in v1, so empty-body is a client bug, not a fetch.
+    """
+    if not fields:
+        raise validation_error(
+            "No fields to update.",
+            {"display_name": "Pass at least one field to update."},
+        )
+
+    before_row = await conn.fetchrow(
+        "SELECT * FROM users WHERE id = $1", user_id
+    )
+    if before_row is None:
+        raise not_found("user")
+    before = user_from_row(before_row)
+
+    set_clauses = []
+    params = [user_id]
+    for i, (key, value) in enumerate(fields.items(), start=2):
+        set_clauses.append(f"{key} = ${i}")
+        params.append(value)
+    set_clauses.append("updated_at = now()")
+
+    query = f"UPDATE users SET {', '.join(set_clauses)} WHERE id = $1 RETURNING *"
+    after_row = await conn.fetchrow(query, *params)
+    after = user_from_row(after_row)
+
+    await write_activity_log(
+        conn, user_id, "user", user_id, ActivityAction.UPDATED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after

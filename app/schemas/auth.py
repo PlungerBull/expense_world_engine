@@ -50,6 +50,10 @@ class SettingsUpdateRequest(BaseModel):
     sidebar_show_categories: Optional[bool] = None
 
 
+class ProfileUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+
+
 def user_from_row(row) -> dict:
     return UserResponse(
         id=str(row["id"]),

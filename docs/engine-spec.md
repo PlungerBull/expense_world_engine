@@ -120,6 +120,28 @@ Updates `user_settings`. Partial update — only supplied fields are changed. If
 
 **Exchange-rate preconditions:** Any write that needs to compute `amount_home_cents` for a cross-currency account (`POST /transactions`, `PUT /transactions/{id}` with a `date` change, `POST /transactions/batch`, `POST /inbox`, `PUT /inbox/{id}` with a `date` change) returns `422 RATE_UNAVAILABLE` with `fields: {"exchange_rate": "No rate on or before <date> for <from>-><to>. Wait for the daily fetch or supply an explicit exchange_rate."}` when no `exchange_rates` row exists on or before the transaction's `date`. No silent `1.0` fallback — a missing rate fails loudly so `amount_home_cents` cannot be corrupted. Clients can either retry after the daily FX cron runs (see [TODO.md](../TODO.md)) or bypass the lookup by supplying an explicit `exchange_rate` on the request. Same-currency accounts short-circuit to the identity rate and never hit this path.
 
+### `PUT /auth/profile`
+Partial update of identity fields on the `users` row. This is the single post-bootstrap path for changing `display_name` — `POST /auth/bootstrap` sets `display_name` only on the first call and never overwrites it on subsequent logins, and `PUT /auth/settings` mutates `user_settings`, not `users`.
+
+**Request body:**
+```json
+{ "display_name": "Alex" }
+```
+
+All fields are optional; the endpoint is forward-compatible so future identity fields (e.g. `avatar_url`) can be added to `ProfileUpdateRequest` without changing the route or helper.
+
+**Response (`200 OK`):** `UserResponse` shape — `id`, `email`, `display_name`, `last_login_at`, `created_at`, `updated_at`.
+
+**Business logic:**
+- Empty body → `422 VALIDATION_ERROR` with `fields: {"display_name": "Pass at least one field to update."}`. Unlike `PUT /auth/settings` (which has 8 fields and treats empty-as-fetch), profile has one mutable field in v1, so empty-body is a client bug. Fail-fast.
+- Explicit `"display_name": null` → `422 VALIDATION_ERROR` with `fields: {"display_name": "Must not be null."}`. Clearing the display name is not part of v1 scope.
+- Mutable in v1: `display_name` only. `id`, `email`, and `last_login_at` are returned for context but are **read-only** — `email` lives in Supabase Auth (out of scope here) and `last_login_at` is owned by the bootstrap flow.
+- Only `updated_at` and the supplied fields are touched in the UPDATE. `last_login_at` is explicitly preserved so the profile endpoint cannot masquerade as a login event.
+
+**Idempotency:** `X-Idempotency-Key` with 24h TTL. Standard replay semantics — same key returns the stored response verbatim regardless of a differing body.
+
+**Activity log:** one `UPDATED` entry under `resource_type = "user"`, `resource_id = user_id`, with full `UserResponse`-shaped before/after snapshots.
+
 ### `POST /auth/pat`
 Mints a new Personal Access Token for the authenticated caller. Long-lived, non-expiring; used by clients that can't do interactive JWT refresh (CLI, scripts, scheduled jobs).
 

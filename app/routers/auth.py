@@ -13,7 +13,9 @@ from app.helpers.validation import extract_update_fields
 from app.schemas.auth import (
     BootstrapRequest,
     BootstrapResponse,
+    ProfileUpdateRequest,
     SettingsUpdateRequest,
+    UserResponse,
     UserSettingsResponse,
     settings_from_row,
     user_from_row,
@@ -79,6 +81,23 @@ async def update_settings(
         x_idempotency_key,
         status_code=200,
         work=lambda conn: auth_service.update_settings(
+            conn, auth_user.id, fields,
+        ),
+    )
+
+
+@router.put("/profile", response_model=UserResponse)
+async def update_profile(
+    body: ProfileUpdateRequest,
+    auth_user: CurrentUser,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    fields = extract_update_fields(body)
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: auth_service.update_profile(
             conn, auth_user.id, fields,
         ),
     )
