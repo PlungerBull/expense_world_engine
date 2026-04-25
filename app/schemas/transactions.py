@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel
 
 
 class TransferField(BaseModel):
@@ -15,7 +15,7 @@ class TransactionCreateRequest(BaseModel):
     id: UUID
     title: str
     amount_cents: int  # signed: negative=expense, positive=income
-    date: datetime
+    date: AwareDatetime
     account_id: str
     category_id: str
     description: Optional[str] = None
@@ -28,7 +28,7 @@ class TransactionCreateRequest(BaseModel):
 class TransactionUpdateRequest(BaseModel):
     title: Optional[str] = None
     amount_cents: Optional[int] = None  # signed: negative=expense, positive=income
-    date: Optional[datetime] = None
+    date: Optional[AwareDatetime] = None
     account_id: Optional[str] = None
     category_id: Optional[str] = None
     description: Optional[str] = None

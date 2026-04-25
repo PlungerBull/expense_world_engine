@@ -47,6 +47,8 @@
 
 **Optimistic locking:** All mutable resources include a `version` field in responses, incremented on every update. Clients can use this for conflict detection.
 
+**Datetime inputs:** All datetime fields in request bodies must be RFC 3339 with a timezone offset. Accepted: `2026-04-25T16:30:00Z`, `2026-04-25T16:30:00+00:00`, `2026-04-25T11:30:00-05:00`. Rejected with `422 VALIDATION_ERROR`: naive datetimes (`2026-04-25T16:30:00`, `2026-04-25 16:30`, `2026-04-25`). Clients are responsible for resolving the user's local timezone and emitting canonical RFC 3339 — the engine never guesses a timezone for unqualified input. Response datetimes are always emitted in UTC with a `Z` suffix.
+
 ---
 
 ## Build Phases (Engine)
