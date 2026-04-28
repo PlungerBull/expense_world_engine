@@ -516,16 +516,52 @@ Include a `transfer` object on any transaction create request:
 
 ## Reconciliations
 
+### Ordering
+
+Each reconciliation carries a per-account `sort_order` (integer). The user controls it; the engine never decides which reconciliation "follows" which based on dates, names, or creation timestamps. New reconciliations append by default (`max(sort_order) + 1` for that account, or `1` if none). Soft-deleted rows keep their `sort_order` value but are skipped for chaining and ordering — restoring a deleted row reclaims its original position.
+
+`GET /reconciliations?account_id=<id>` is sorted `sort_order ASC, created_at ASC`. Without `account_id` the list falls back to `created_at DESC` (a single `sort_order` value across accounts is meaningless).
+
+Reordering is done through the dedicated bulk endpoint `PUT /accounts/{account_id}/reconciliations/order` (see below). `sort_order` cannot be edited via `PUT /reconciliations/{id}` — single-row sort edits would skip the chained-balance cascade and corrupt downstream rows.
+
+### Beginning balance source
+
+Every reconciliation row records *where its `beginning_balance_cents` came from*:
+
+- **`manual`** — the user typed a value. The engine treats it as sacred and never silently rewrites it. Reordering, cascades, and deletes leave it untouched.
+- **`chained`** — the value is derived from the previous reconciliation in `sort_order` (the "previous chained neighbor", skipping soft-deleted rows). When that neighbor's `ending_balance_cents` changes, this row recalculates automatically.
+
+`POST /reconciliations` infers the source from the request:
+
+- Body includes `beginning_balance_cents` → source is `manual`, value stored verbatim.
+- Body omits `beginning_balance_cents` → source is `chained`, value computed from the previous neighbor's `ending_balance_cents` (or `0` if no neighbor exists).
+
+`PUT /reconciliations/{id}` lets the user toggle:
+
+- Sending `beginning_balance_cents: <number>` switches source to `manual` and freezes the value.
+- Sending `beginning_balance_source: "chained"` (without a value) re-derives from the current previous neighbor. If there is no previous neighbor, the existing value is left alone — never silently rewritten to `0`.
+- Sending `beginning_balance_source: "manual"` (without a value) freezes the current computed value as manual.
+
+### Cascade rule
+
+Whenever a reconciliation's `ending_balance_cents` changes — via `PUT /reconciliations/{id}`, the bulk reorder endpoint, soft-delete, or restore — the engine walks downstream rows in `sort_order ASC` (skipping soft-deleted) and recomputes `beginning_balance_cents` for any row with `beginning_balance_source = "chained"`. The walk stops early at the first row whose computed value didn't change, since a no-op there means no further downstream row will change either. All recalculations happen in the same DB transaction as the originating mutation. Each recalculated row writes its own `UPDATED` activity log entry with before/after snapshots; rows skipped because they are `manual` (or because the value didn't change) write nothing.
+
+`POST .../complete` does **not** trigger a cascade — completing a reconciliation never changes its `ending_balance_cents`. `POST .../revert` does not cascade either; the cascade fires only on the subsequent `PUT` that actually edits the value.
+
 ### `GET /reconciliations`
-Returns all reconciliation batches for the user.
+Returns reconciliation batches for the user. Default sort is `sort_order ASC, created_at ASC` when filtered by `account_id`; otherwise `created_at DESC`. Standard pagination via `limit` / `offset`.
 
 ### `POST /reconciliations`
 Creates a new draft reconciliation batch.
 
 **Required:** `id` (client-supplied UUID), `account_id`, `name`
-**Optional:** `date_start`, `date_end`, `beginning_balance_cents`, `ending_balance_cents`
+**Optional:** `date_start`, `date_end`, `beginning_balance_cents`, `ending_balance_cents`, `sort_order`
 
-**Response shape:** Every reconciliation response includes `beginning_balance_home_cents` and `ending_balance_home_cents` alongside the native fields. The engine converts using the account's currency and the exchange rate at `date_end` (or today if `date_end` is null). Values are `null` only when no rate is available for the pair; list endpoints deduplicate rate lookups by `(currency, date_end)` so a page of N reconciliations produces at most K rate reads where K = distinct currency/date pairs.
+**Beginning balance prefill:** when `beginning_balance_cents` is omitted, source is set to `chained` and the value is computed from the previous chained neighbor in `sort_order` for this account (skipping soft-deleted rows). Defaults to `0` when no neighbor exists. When the field is provided, source is set to `manual` and the value is stored verbatim. See *Beginning balance source* above.
+
+**Sort position:** when `sort_order` is omitted, the new row is appended (`max(sort_order) + 1` for the account, or `1` if none). When provided, the engine inserts at that position and shifts every existing row at or above it by `+1` to make room (single transaction). Subsequent reorders use the dedicated bulk endpoint.
+
+**Response shape:** Every reconciliation response includes `beginning_balance_home_cents` and `ending_balance_home_cents` alongside the native fields, plus `sort_order`, `beginning_balance_source` (`"manual"` or `"chained"`), and `chained_from_reconciliation_id` (UUID of the previous neighbor when source is `chained` and a neighbor exists, else `null`). The engine converts home-currency using the account's currency and the exchange rate at `date_end` (or today if `date_end` is null). Values are `null` only when no rate is available for the pair; list endpoints deduplicate rate lookups by `(currency, date_end)` so a page of N reconciliations produces at most K rate reads where K = distinct currency/date pairs.
 
 ### `GET /reconciliations/{id}`
 Returns the reconciliation plus a **paged window** of its assigned transactions.
@@ -545,9 +581,42 @@ Returns the reconciliation plus a **paged window** of its assigned transactions.
 For large reconciliations, the paged list endpoint `GET /transactions?reconciliation_id={id}` is a standalone escape hatch that supports the full filter surface (date range, category, hashtag, search).
 
 ### `PUT /reconciliations/{id}`
-Updates metadata fields. Cannot update `status` directly — use the complete/revert endpoints.
+Updates metadata fields. Cannot update `status` directly — use the complete/revert endpoints. Cannot update `sort_order` directly — use the bulk reorder endpoint.
 
-**Field locking on COMPLETED status:** Once `status = 2`, the following fields are frozen: `beginning_balance_cents`, `ending_balance_cents`, `date_start`, `date_end`. Any attempt to edit them returns `422 VALIDATION_ERROR` with a `fields` map naming each attempted locked key (`"Locked while reconciliation is completed."`). To edit these fields, call `POST /reconciliations/{id}/revert` first. `name` stays editable on completed batches so archived reconciliations can be re-labelled.
+**Field locking on COMPLETED status:** Once `status = 2`, the following fields are frozen: `beginning_balance_cents`, `ending_balance_cents`, `date_start`, `date_end`, `beginning_balance_source`. Any attempt to edit them returns `422 VALIDATION_ERROR` with a `fields` map naming each attempted locked key (`"Locked while reconciliation is completed."`). To edit these fields, call `POST /reconciliations/{id}/revert` first. `name` stays editable on completed batches so archived reconciliations can be re-labelled.
+
+**Source toggle:** `beginning_balance_source` can be set to `"manual"` (freezes the current value) or `"chained"` (re-derives from the current previous neighbor in `sort_order`). When `"chained"` is requested but no previous neighbor exists, the existing value is left alone — the engine never silently rewrites a stored balance to `0`. Sending `beginning_balance_cents` in the same body forces the source to `"manual"` regardless of an explicit `beginning_balance_source` value.
+
+**`sort_order` rejection:** any attempt to set `sort_order` returns `422 VALIDATION_ERROR` with `{"sort_order": "Use PUT /accounts/{id}/reconciliations/order to reorder."}`. Single-row sort edits would skip the chained-balance cascade across affected rows.
+
+**Cascade on edit:** when `ending_balance_cents` changes, downstream chained rows recalculate per the cascade rule above, in the same transaction.
+
+### `PUT /accounts/{account_id}/reconciliations/order`
+Bulk reorder endpoint. Atomically renumbers a subset of an account's reconciliations and runs the chained-balance cascade on affected rows.
+
+**Body:** `{ "ordered_ids": [uuid, uuid, ...] }`. The array is the desired final order for the rows it lists. The engine reuses the `sort_order` slots currently held by the submitted rows (sorted ASC) and reassigns them in the new order; rows not in the array are untouched.
+
+**Validation (returns `422 VALIDATION_ERROR` with field-scoped messages on `ordered_ids`):**
+- Every UUID in `ordered_ids` belongs to `account_id` and the authenticated user. Mismatches return `{"ordered_ids": "Reconciliation <id> does not belong to this account."}`.
+- No UUID in `ordered_ids` is soft-deleted. Returns `{"ordered_ids": "Reconciliation <id> is soft-deleted and cannot be reordered."}`.
+- No duplicates in `ordered_ids`. Returns `{"ordered_ids": "Duplicate id <id> in ordered_ids."}`.
+- `ordered_ids` is not empty (FastAPI rejects via Pydantic `min_length=1`).
+
+The `account_id` itself must reference an active, non-archived account (standard `validate_active_account` check).
+
+**Behaviour:**
+1. Renumber: each submitted row gets a `sort_order` from the existing slots, in the new order. Single transaction.
+2. Cascade: starting at the smallest affected `sort_order`, walk downstream chained rows and recompute `beginning_balance_cents`. Stop early when a row's value doesn't change.
+3. Activity log: one `UPDATED` entry per reconciliation row whose `sort_order` or `beginning_balance_cents` actually changed (with full before/after snapshots), plus one bulk `UPDATED` entry on the account row carrying `{ "ordered_ids": [...] }` in the after-snapshot so the audit trail records the user's intent at request granularity.
+
+**Response:**
+```json
+{
+  "reconciliations": [ /* every affected row, full ReconciliationResponse, sorted by sort_order ASC */ ],
+  "recalculated_count": 3
+}
+```
+`recalculated_count` is the number of chained rows whose `beginning_balance_cents` was actually rewritten by the cascade (excludes the explicit reorder bumps and the manual-source rows). Standard `X-Idempotency-Key` and JWT requirements.
 
 ### `POST /reconciliations/{id}/complete`
 Marks the reconciliation as complete (`status = 2`). From this point, the four locked fields (`amount_cents`, `account_id`, `title`, `date`) become read-only on all assigned transactions, and the reconciliation's own balance/date fields are locked (see `PUT` above).

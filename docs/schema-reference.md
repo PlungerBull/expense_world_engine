@@ -515,27 +515,52 @@ Batch reconciliation records. Each batch belongs to one account and covers a dat
 
 ```
 expense_reconciliations
-  - id                       UUID, primary key, default uuid_generate_v4()
-  - user_id                  UUID, NOT NULL, FK → users
-  - account_id               UUID, NOT NULL, FK → expense_bank_accounts
-  - name                     text, NOT NULL
-  - date_start               timestamptz, nullable
-  - date_end                 timestamptz, nullable
-  - status                   smallint, NOT NULL, default 1
-                             — 1=draft, 2=completed
-  - beginning_balance_cents  bigint, NOT NULL, default 0
-                             — pre-filled from the previous reconciliation's ending_balance_cents.
-                             — if no prior reconciliation exists, defaults to 0.
-                             — always user-editable in case of discrepancy.
-  - ending_balance_cents     bigint, NOT NULL, default 0
-                             — user-entered from the bank statement. Always editable.
-  - created_at               timestamptz, NOT NULL, default now()
-  - updated_at               timestamptz, NOT NULL, default now()
-  - version                  integer, NOT NULL, default 1
-  - deleted_at               timestamptz, nullable
+  - id                        UUID, primary key, default uuid_generate_v4()
+  - user_id                   UUID, NOT NULL, FK → users
+  - account_id                UUID, NOT NULL, FK → expense_bank_accounts
+  - name                      text, NOT NULL
+  - date_start                timestamptz, nullable
+  - date_end                  timestamptz, nullable
+  - status                    smallint, NOT NULL, default 1
+                              — 1=draft, 2=completed
+  - sort_order                integer, NOT NULL, default 0
+                              — per-(user_id, account_id) ordering integer, ASC.
+                              — user-controlled via PUT /accounts/{id}/reconciliations/order.
+                              — new rows append (max(sort_order)+1) unless an explicit
+                                position is supplied on POST.
+                              — soft-deleted rows keep their value but are skipped for
+                                ordering and chaining. Restoring a row reclaims its slot.
+  - beginning_balance_cents   bigint, NOT NULL, default 0
+                              — value depends on beginning_balance_source.
+                              — manual: user-entered, never silently rewritten.
+                              — chained: derived from the previous chained neighbor's
+                                ending_balance_cents (skipping soft-deleted), defaulting
+                                to 0 only when no neighbor exists.
+                              — recalculates automatically when an upstream
+                                ending_balance_cents changes (cascade rule, see engine-spec).
+  - beginning_balance_source  smallint, NOT NULL, default 1
+                              — 1=manual (sacred, never overwritten by the engine),
+                              — 2=chained (derived from the previous neighbor by sort_order).
+                              — set on POST from whether beginning_balance_cents was provided
+                                (provided=manual, omitted=chained). Toggleable via PUT.
+                              — backfill: existing rows are 1=manual to preserve current
+                                stored values verbatim.
+  - ending_balance_cents      bigint, NOT NULL, default 0
+                              — user-entered from the bank statement. Always editable
+                                while status=draft. Edits trigger the chained-balance
+                                cascade on downstream rows.
+  - created_at                timestamptz, NOT NULL, default now()
+  - updated_at                timestamptz, NOT NULL, default now()
+  - version                   integer, NOT NULL, default 1
+  - deleted_at                timestamptz, nullable
+
+  — partial index for chained-neighbor lookups:
+  - INDEX (user_id, account_id, sort_order) WHERE deleted_at IS NULL
 ```
 
-**Field locking on completion:** When `status = 2` (completed), four fields lock on every transaction in the batch: `amount_cents`, `account_id`, `title`, `date`. Un-reconciling (reverting to `status = 1`) unlocks all fields.
+**Field locking on completion:** When `status = 2` (completed), four fields lock on every transaction in the batch: `amount_cents`, `account_id`, `title`, `date`. The reconciliation row itself locks `beginning_balance_cents`, `ending_balance_cents`, `date_start`, `date_end`, and `beginning_balance_source` on `PUT /reconciliations/{id}`. Un-reconciling (reverting to `status = 1`) unlocks all fields.
+
+**Sort order is not editable via PUT /reconciliations/{id}** — the dedicated bulk endpoint `PUT /accounts/{account_id}/reconciliations/order` is the only path that mutates `sort_order`, because reordering must run the chained-balance cascade atomically across multiple rows.
 
 ---
 

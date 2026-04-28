@@ -50,11 +50,20 @@ async def list_reconciliations(
             f"SELECT count(*) FROM expense_reconciliations WHERE {where}", *params
         )
 
+        # Per-account lists are ordered by user-controlled sort_order (ASC).
+        # Cross-account lists fall back to created_at DESC since sort_order
+        # values across accounts are independent sequences.
+        order_clause = (
+            "ORDER BY sort_order ASC, created_at ASC"
+            if account_id is not None
+            else "ORDER BY created_at DESC"
+        )
+
         rows = await conn.fetch(
             f"""
             SELECT * FROM expense_reconciliations
             WHERE {where}
-            ORDER BY created_at DESC
+            {order_clause}
             LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
             """,
             *params,
@@ -62,10 +71,32 @@ async def list_reconciliations(
             offset,
         )
 
+        rows_list = list(rows)
         rate_by_id = await reconciliations_service.resolve_home_rates(
-            conn, auth_user.id, list(rows)
+            conn, auth_user.id, rows_list,
         )
-        data = [reconciliation_from_row(row, rate_by_id.get(str(row["id"]))) for row in rows]
+        # Resolve chained-from neighbor per row for chained sources.
+        # Manual rows always emit null. Walking sort_order on the same
+        # rows we already fetched would require building a neighbor map
+        # in Python; per-row neighbor lookups are cheap (indexed) and
+        # keep the response shape consistent with detail/create.
+        data = []
+        for row in rows_list:
+            chained_from = None
+            if row["beginning_balance_source"] == 2:  # CHAINED
+                neighbor = await reconciliations_service._previous_chained_neighbor(
+                    conn, auth_user.id, str(row["account_id"]),
+                    row["sort_order"], exclude_id=str(row["id"]),
+                )
+                if neighbor is not None:
+                    chained_from = str(neighbor["id"])
+            data.append(
+                reconciliation_from_row(
+                    row,
+                    rate_by_id.get(str(row["id"])),
+                    chained_from_reconciliation_id=chained_from,
+                )
+            )
         return paginated_response(data, total, limit, offset)
 
 
@@ -92,6 +123,7 @@ async def create_reconciliation(
             body.date_end,
             body.beginning_balance_cents,
             body.ending_balance_cents,
+            body.sort_order,
         ),
     )
 
@@ -138,10 +170,11 @@ async def get_reconciliation(
             offset,
         )
 
-        rate_by_id = await reconciliations_service.resolve_home_rates(
-            conn, auth_user.id, [row]
+        # Resolve chained_from neighbor for the chained-source case so
+        # the detail response matches the create/list shape.
+        recon = await reconciliations_service._serialize_with_neighbor(
+            conn, auth_user.id, row,
         )
-        recon = reconciliation_from_row(row, rate_by_id.get(str(row["id"])))
         txns = [transaction_from_row(r) for r in txn_rows]
         if debit_as_negative:
             txns = [apply_debit_as_negative(t) for t in txns]

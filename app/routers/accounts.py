@@ -9,11 +9,13 @@ from app import db
 from app.deps import CurrentUser
 from app.errors import not_found
 from app.helpers import accounts as accounts_service
+from app.helpers import reconciliations as reconciliations_service
 from app.helpers.exchange_rate import batch_get_rates
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
 from app.helpers.validation import extract_update_fields
 from app.schemas.accounts import AccountCreateRequest, AccountUpdateRequest, account_from_row
+from app.schemas.reconciliations import ReconciliationReorderRequest
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
@@ -202,5 +204,30 @@ async def unarchive_account(
         status_code=200,
         work=lambda conn: accounts_service.unarchive_account(
             conn, auth_user.id, account_id,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PUT /accounts/{account_id}/reconciliations/order
+#
+# Bulk-reorder this account's reconciliations and run the chained-balance
+# cascade in one DB transaction. Lives here (not on /reconciliations) so
+# the URL reflects the parent-scope semantics: an order is meaningful
+# only within one account.
+# ---------------------------------------------------------------------------
+@router.put("/{account_id}/reconciliations/order")
+async def reorder_account_reconciliations(
+    account_id: str,
+    body: ReconciliationReorderRequest,
+    auth_user: CurrentUser,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=200,
+        work=lambda conn: reconciliations_service.reorder_reconciliations(
+            conn, auth_user.id, account_id, body.ordered_ids,
         ),
     )

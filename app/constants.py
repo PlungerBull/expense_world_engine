@@ -51,6 +51,17 @@ class ReconciliationStatus(IntEnum):
     COMPLETED = 2
 
 
+class BeginningBalanceSource(IntEnum):
+    """How a reconciliation's ``beginning_balance_cents`` is sourced.
+
+    ``MANUAL`` values are sacred — the engine never silently overwrites them.
+    ``CHAINED`` values are derived from the previous neighbor by ``sort_order``
+    and recompute automatically when that neighbor's ending balance changes.
+    """
+    MANUAL = 1
+    CHAINED = 2
+
+
 class InboxStatus(IntEnum):
     PENDING = 1
     PROMOTED = 2
