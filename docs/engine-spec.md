@@ -538,9 +538,10 @@ Every reconciliation row records *where its `beginning_balance_cents` came from*
 
 `PUT /reconciliations/{id}` lets the user toggle:
 
-- Sending `beginning_balance_cents: <number>` switches source to `manual` and freezes the value.
+- Sending `beginning_balance_cents: <number>` switches source to `manual` and freezes the value. Optionally pairing it with `beginning_balance_source: "manual"` is fine (both keys agree).
 - Sending `beginning_balance_source: "chained"` (without a value) re-derives from the current previous neighbor. If there is no previous neighbor, the existing value is left alone — never silently rewritten to `0`.
 - Sending `beginning_balance_source: "manual"` (without a value) freezes the current computed value as manual.
+- Sending `beginning_balance_source: "chained"` together with `beginning_balance_cents: <number>` is **rejected** with `422 VALIDATION_ERROR` — chained mode has no slot for a user-supplied value, so the combination is contradictory. See the *Ambiguity guard* under `PUT /reconciliations/{id}` below for the exact error shape.
 
 ### Cascade rule
 
