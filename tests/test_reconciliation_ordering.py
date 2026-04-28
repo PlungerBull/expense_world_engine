@@ -361,6 +361,88 @@ async def test_put_source_manual_freezes_current_value(client, test_data):
 
 
 @pytest.mark.asyncio
+async def test_put_rejects_chained_source_with_explicit_beginning_balance(
+    client, test_data,
+):
+    """The combination source='chained' + beginning_balance_cents is
+    contradictory (chained has no slot for a user-supplied value).
+    Engine returns 422 with field-scoped errors on both keys, no
+    silent precedence. The stored row is unchanged."""
+    created: list[str] = []
+    try:
+        a = await _create_recon(
+            client, test_data.account_id, f"ambig-a-{uuid.uuid4()}",
+            beginning_balance_cents=0, ending_balance_cents=500,
+        )
+        created.append(a["id"])
+        b = await _create_recon(
+            client, test_data.account_id, f"ambig-b-{uuid.uuid4()}",
+            ending_balance_cents=900,
+        )
+        created.append(b["id"])
+        # b is currently chained, beginning=500.
+        assert b["beginning_balance_source"] == "chained"
+        assert b["beginning_balance_cents"] == 500
+
+        bad = await client.put(
+            f"/v1/reconciliations/{b['id']}",
+            json={
+                "beginning_balance_source": "chained",
+                "beginning_balance_cents": 99999,
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert bad.status_code == 422, bad.text
+        err = bad.json()["error"]
+        fields = err.get("fields") or {}
+        assert "beginning_balance_cents" in fields
+        assert "beginning_balance_source" in fields
+
+        # Stored row is unchanged — neither field was applied.
+        b_after = (await client.get(f"/v1/reconciliations/{b['id']}")).json()
+        assert b_after["beginning_balance_source"] == "chained"
+        assert b_after["beginning_balance_cents"] == 500
+    finally:
+        await _hard_cleanup_recons(created, test_data.user_id)
+
+
+@pytest.mark.asyncio
+async def test_put_allows_explicit_value_with_explicit_manual_source(
+    client, test_data,
+):
+    """The non-ambiguous combo source='manual' + beginning_balance_cents
+    is fine — both express the same intent. Engine accepts it and
+    stores source=manual with the supplied value."""
+    created: list[str] = []
+    try:
+        a = await _create_recon(
+            client, test_data.account_id, f"explicit-a-{uuid.uuid4()}",
+            beginning_balance_cents=0, ending_balance_cents=500,
+        )
+        created.append(a["id"])
+        b = await _create_recon(
+            client, test_data.account_id, f"explicit-b-{uuid.uuid4()}",
+            ending_balance_cents=900,
+        )
+        created.append(b["id"])
+
+        ok = await client.put(
+            f"/v1/reconciliations/{b['id']}",
+            json={
+                "beginning_balance_source": "manual",
+                "beginning_balance_cents": 12345,
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert ok.status_code == 200, ok.text
+        body = ok.json()
+        assert body["beginning_balance_source"] == "manual"
+        assert body["beginning_balance_cents"] == 12345
+    finally:
+        await _hard_cleanup_recons(created, test_data.user_id)
+
+
+@pytest.mark.asyncio
 async def test_put_sort_order_in_body_is_rejected(client, test_data):
     """sort_order edits via single-row PUT are rejected with 422 +
     field-level guidance toward the bulk reorder endpoint."""

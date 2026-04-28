@@ -571,8 +571,24 @@ async def update_reconciliation(
     explicit_value = "beginning_balance_cents" in fields
     source_label = fields.pop("beginning_balance_source", None)
 
+    # Ambiguity rule: "source=chained" + an explicit beginning_balance is
+    # contradictory — chained mode has no slot for a user-supplied value.
+    # Reject the combo with a field-scoped 422 instead of silently
+    # picking a winner. The CLI/web should surface this as a clear
+    # "remove one of these" prompt.
+    if explicit_value and source_label == "chained":
+        raise validation_error(
+            "Cannot set beginning_balance_cents while source is 'chained'.",
+            {
+                "beginning_balance_cents": "Remove this field, or set beginning_balance_source to 'manual'.",
+                "beginning_balance_source": "Cannot be 'chained' while beginning_balance_cents is set.",
+            },
+        )
+
     if explicit_value:
-        # Explicit value always wins — source becomes MANUAL.
+        # Explicit value always wins (source_label is None or "manual"
+        # at this point — the chained+value combo was rejected above).
+        # Source becomes MANUAL.
         fields["beginning_balance_source"] = int(BeginningBalanceSource.MANUAL)
     elif source_label is not None:
         if source_label == "manual":
