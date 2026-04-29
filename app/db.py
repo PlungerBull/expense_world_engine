@@ -13,6 +13,12 @@ async def connect() -> None:
         settings.supabase_db_url,
         min_size=settings.db_pool_min_size,
         max_size=settings.db_pool_max_size,
+        # pgBouncer transaction mode hands a different backend connection to
+        # each transaction, so client-side prepared statement caches reference
+        # OIDs that may not exist on the next checkout. Disabling the cache
+        # makes us pgBouncer-safe; cost is negligible since round-trip latency
+        # dominates parse cost for our query sizes.
+        statement_cache_size=0,
     )
 
 

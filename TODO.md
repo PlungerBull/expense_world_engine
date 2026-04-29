@@ -10,7 +10,9 @@ Operational / deployment tasks that are not part of normal code review. Each ent
 
 **When it becomes blocking:** the moment any user holds an account in a currency other than their `main_currency`. Until then, same-currency writes succeed and nothing is corrupted — but the first cross-currency write 422s until the cron populates a rate row.
 
-**Steps (one-time, via Render dashboard):**
+**Status (2026-04-28):** Registration deferred. Render Cron Jobs are a paid-only resource type — both `render services create --type cron_job ...` and the dashboard "New + → Cron Job" path return `402 Payment information is required` until a card is on file at https://dashboard.render.com/billing. Cheapest cron tier ≈ $1/month. **Decision:** the user (PlungerBull) will add billing and register the cron at the end of operational hardening, once the rest of the pre-mobile-launch checklist is verified working in production. Until then, the platform stays on Render's free tier and this remains the only piece of operational config not yet wired. Everything else is ready: job code is shipped, `SUPABASE_DB_URL` already points at the Supabase pgBouncer transaction-mode pooler, asyncpg is configured `statement_cache_size=0` for pgBouncer safety, and the test suite has been validated against the pooler config.
+
+**Steps (one-time, via Render dashboard, AFTER billing is added):**
 
 1. Render dashboard → **New +** → **Cron Job**
 2. Connect the same GitHub repo as the web service
