@@ -9,6 +9,7 @@ from app.deps import CurrentUser
 from app.errors import not_found
 from app.helpers import reconciliations as reconciliations_service
 from app.helpers.formatting import apply_debit_as_negative
+from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
 from app.helpers.validation import extract_update_fields
@@ -176,6 +177,7 @@ async def get_reconciliation(
             conn, auth_user.id, row,
         )
         txns = [transaction_from_row(r) for r in txn_rows]
+        await attach_hashtag_ids(conn, txns)
         if debit_as_negative:
             txns = [apply_debit_as_negative(t) for t in txns]
 

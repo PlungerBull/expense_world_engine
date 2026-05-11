@@ -37,6 +37,7 @@ from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
 from app.helpers.exchange_rate import lookup_exchange_rate
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
+from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.validation import extract_update_fields
 from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
 from app.schemas.transactions import infer_transaction_type, transaction_from_row
@@ -523,5 +524,10 @@ async def promote_inbox_item(
         before_snapshot=inbox_before,
         after_snapshot=inbox_after,
     )
+
+    # Promoted transactions are freshly created — no junctions exist yet,
+    # so this resolves to []. Attaching uniformly is still the right call
+    # so the wire shape matches every other transaction-returning endpoint.
+    await attach_hashtag_ids(conn, txn_response)
 
     return txn_response

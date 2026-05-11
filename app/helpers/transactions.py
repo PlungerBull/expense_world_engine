@@ -57,6 +57,60 @@ from app.schemas.transactions import (
 
 
 # ---------------------------------------------------------------------------
+# hashtag_ids attach helpers (shared by every transaction-returning endpoint)
+# ---------------------------------------------------------------------------
+
+async def fetch_hashtag_ids_map(
+    conn: asyncpg.Connection,
+    transaction_ids: list[str],
+) -> dict[str, list[str]]:
+    """Resolve active hashtag IDs for a set of ledger transactions.
+
+    Returns ``{transaction_id: [hashtag_id, ...]}`` with each list sorted
+    ascending by UUID (matches the ``/sync`` convention). Soft-deleted
+    junction rows are excluded — when a transaction is soft-deleted its
+    junctions cascade-soft-delete, so deleted transactions resolve to ``[]``.
+
+    Returns an empty mapping for an empty input — never queries.
+    """
+    if not transaction_ids:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT transaction_id, hashtag_id
+        FROM expense_transaction_hashtags
+        WHERE transaction_id = ANY($1::uuid[])
+          AND transaction_source = 1
+          AND deleted_at IS NULL
+        ORDER BY transaction_id, hashtag_id
+        """,
+        transaction_ids,
+    )
+    result: dict[str, list[str]] = {tid: [] for tid in transaction_ids}
+    for r in rows:
+        result.setdefault(str(r["transaction_id"]), []).append(str(r["hashtag_id"]))
+    return result
+
+
+async def attach_hashtag_ids(conn: asyncpg.Connection, payload) -> None:
+    """Mutate one transaction dict (or a list of them) to include ``hashtag_ids``.
+
+    Per api-design-principles.md §3a, every transaction-returning endpoint
+    flattens the junction relationship to an embedded array. Call this at
+    each response site after building the transaction dict via
+    ``transaction_from_row``. One query covers a whole list — list endpoints
+    pay a single round trip regardless of page size.
+    """
+    items = [payload] if isinstance(payload, dict) else list(payload)
+    if not items:
+        return
+    ids = [item["id"] for item in items]
+    hashtag_map = await fetch_hashtag_ids_map(conn, ids)
+    for item in items:
+        item["hashtag_ids"] = hashtag_map.get(item["id"], [])
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
@@ -202,6 +256,7 @@ async def create_transaction(
         if body.hashtag_ids:
             await _sync_hashtags(conn, primary_response["id"], user_id, body.hashtag_ids)
 
+        await attach_hashtag_ids(conn, primary_response)
         return primary_response
 
     # ----- Normal (non-transfer) branch -----
@@ -260,6 +315,10 @@ async def create_transaction(
     # Hashtags
     if body.hashtag_ids:
         await _sync_hashtags(conn, str(row["id"]), user_id, body.hashtag_ids)
+
+    # Resolve hashtag_ids before snapshotting — the activity-log after_snapshot
+    # carries the new hashtag set per §6 aggregate exception #1.
+    await attach_hashtag_ids(conn, response)
 
     # Activity log
     await write_activity_log(
@@ -325,7 +384,9 @@ async def update_transaction(
         )
         if row is None:
             raise not_found("transaction")
-        return transaction_from_row(row)
+        response = transaction_from_row(row)
+        await attach_hashtag_ids(conn, response)
+        return response
 
     # Fetch before-state under a row-level lock. Without FOR UPDATE a
     # concurrent update could change `amount_cents` between our read
@@ -341,6 +402,9 @@ async def update_transaction(
         raise not_found("transaction")
 
     before = transaction_from_row(before_row)
+    # Capture pre-mutation hashtag_ids — activity-log before_snapshot must
+    # reflect the prior state per §6 aggregate exception #1.
+    await attach_hashtag_ids(conn, before)
 
     # Field locking check — reconciliation completed
     if before_row["reconciliation_id"] is not None:
@@ -509,6 +573,9 @@ async def update_transaction(
         )
 
     after = transaction_from_row(after_row)
+    # Post-mutation hashtag_ids — applies whether hashtag_ids was rewritten
+    # this PUT or not (other field edits still surface the current set).
+    await attach_hashtag_ids(conn, after)
 
     # Activity log
     await write_activity_log(
@@ -557,6 +624,10 @@ async def delete_transaction(
         raise not_found("transaction")
 
     before = transaction_from_row(row)
+    # Pre-delete hashtag_ids — must be captured BEFORE the junction-row
+    # cascade-soft-delete below, otherwise the snapshot is empty and the
+    # audit trail can't tell what was attached prior to delete.
+    await attach_hashtag_ids(conn, before)
 
     # Soft-delete
     after_row = await conn.fetchrow(
@@ -600,6 +671,7 @@ async def delete_transaction(
         )
         if sibling_row is not None:
             sibling_before = transaction_from_row(sibling_row)
+            await attach_hashtag_ids(conn, sibling_before)
 
             sibling_after_row = await conn.fetchrow(
                 """
@@ -628,12 +700,18 @@ async def delete_transaction(
                 sibling_id,
                 user_id,
             )
+            # Sibling after-snapshot — junctions are now soft-deleted, so
+            # this resolves to [] (matches the post-delete wire state).
+            await attach_hashtag_ids(conn, sibling_after)
 
             await write_activity_log(
                 conn, user_id, "transaction", sibling_id, ActivityAction.DELETED,
                 before_snapshot=sibling_before,
                 after_snapshot=sibling_after,
             )
+
+    # Primary after-snapshot — junctions soft-deleted above, resolves to [].
+    await attach_hashtag_ids(conn, after)
 
     # Activity log for primary transaction
     await write_activity_log(
@@ -840,6 +918,8 @@ async def restore_transaction(
 
     # 5. Restore primary row (conditionally clearing reconciliation_id).
     before = transaction_from_row(row)
+    # Soft-deleted state: cascade-soft-deleted junctions resolve to [] here.
+    await attach_hashtag_ids(conn, before)
     primary_deleted_at = row["deleted_at"]
 
     if primary_unlink:
@@ -890,6 +970,8 @@ async def restore_transaction(
     # 8. Sibling cascade (mirror steps 5-7).
     if is_transfer and sibling_row is not None and sibling_id is not None:
         sibling_before = transaction_from_row(sibling_row)
+        # Soft-deleted state → []; attach for §6 audit consistency.
+        await attach_hashtag_ids(conn, sibling_before)
         sibling_deleted_at = sibling_row["deleted_at"]
 
         if sibling_unlink:
@@ -934,6 +1016,8 @@ async def restore_transaction(
             user_id,
             sibling_deleted_at,
         )
+        # Post-restore: junctions are active again → resolves to the restored set.
+        await attach_hashtag_ids(conn, sibling_after)
 
         # Sibling activity log first (matches delete_transaction's order).
         await write_activity_log(
@@ -941,6 +1025,9 @@ async def restore_transaction(
             before_snapshot=sibling_before,
             after_snapshot=sibling_after,
         )
+
+    # Primary post-restore: junctions are active again → restored set.
+    await attach_hashtag_ids(conn, after)
 
     # 9. Primary activity log.
     await write_activity_log(
@@ -1143,5 +1230,8 @@ async def create_batch(
             acct_id,
             user_id,
         )
+
+    # Single round-trip resolves hashtag_ids for the whole batch.
+    await attach_hashtag_ids(conn, created)
 
     return {"created": created}

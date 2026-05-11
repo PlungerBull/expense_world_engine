@@ -46,6 +46,7 @@ async def get_transaction(
         if row is None:
             raise not_found("transaction")
         data = transaction_from_row(row)
+        await transactions_service.attach_hashtag_ids(conn, data)
         if debit_as_negative:
             data = apply_debit_as_negative(data)
         return data
@@ -135,6 +136,7 @@ async def list_transactions(
         )
 
         data = [transaction_from_row(row) for row in rows]
+        await transactions_service.attach_hashtag_ids(conn, data)
         if debit_as_negative:
             data = [apply_debit_as_negative(d) for d in data]
         return paginated_response(data, total, limit, offset)

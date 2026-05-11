@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel
+from pydantic import AwareDatetime, BaseModel, Field
 
 
 class TransferField(BaseModel):
@@ -64,9 +64,35 @@ class TransactionResponse(BaseModel):
     updated_at: datetime
     version: int
     deleted_at: Optional[datetime] = None
+    # Per api-design-principles.md §3a — junction tables are storage,
+    # the wire format flattens to an embedded array on every transaction
+    # representation returned by any read endpoint.
+    hashtag_ids: list[str] = Field(default_factory=list)
 
 
-def transaction_from_row(row) -> dict:
+def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
+    """Serialize a transaction row.
+
+    ``hashtag_ids`` is the resolved set of hashtag UUIDs to attach to the
+    response. Callers that surface this dict on the wire — or persist it
+    as an activity-log snapshot — MUST pass the actual list (see §3a /
+    §6 aggregate exception #1). When omitted, the field defaults to ``[]``.
+
+    The row may also carry a pre-aggregated ``hashtag_ids`` column (this
+    is how ``/sync`` already supplies the array via in-query ``array_agg``).
+    An explicit ``hashtag_ids`` argument takes precedence over a column
+    of the same name on the row.
+    """
+    resolved: list[str]
+    if hashtag_ids is not None:
+        resolved = [str(h) for h in hashtag_ids]
+    else:
+        try:
+            row_value = row["hashtag_ids"]
+        except (KeyError, TypeError):
+            row_value = None
+        resolved = [str(h) for h in row_value] if row_value else []
+
     return TransactionResponse(
         id=str(row["id"]),
         user_id=str(row["user_id"]),
@@ -89,6 +115,7 @@ def transaction_from_row(row) -> dict:
         updated_at=row["updated_at"],
         version=row["version"],
         deleted_at=row["deleted_at"],
+        hashtag_ids=resolved,
     ).model_dump(mode="json")
 
 

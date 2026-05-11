@@ -39,17 +39,6 @@ def _is_valid_uuid(value: Optional[str]) -> bool:
         return False
 
 
-def _transaction_with_hashtags(row) -> dict:
-    """Serialize a transaction row including its embedded hashtag_ids array.
-
-    The SQL query in `_fetch_transactions_with_hashtags` adds an aggregated
-    `hashtag_ids` column (uuid[]); asyncpg returns it as a list of UUIDs.
-    """
-    data = transaction_from_row(row)
-    data["hashtag_ids"] = [str(h) for h in row["hashtag_ids"]]
-    return data
-
-
 @router.get("")
 async def sync(
     auth_user: CurrentUser,
@@ -92,7 +81,9 @@ async def sync(
         # clients that need them call /dashboard, which is the canonical place
         # for derived account-level values.
         inbox_rows = [inbox_from_row(r) for r in deltas["inbox"]]
-        transaction_rows = [_transaction_with_hashtags(r) for r in deltas["transactions"]]
+        # `_fetch_transactions_with_hashtags` adds an aggregated `hashtag_ids`
+        # uuid[] column; `transaction_from_row` reads it off the row directly.
+        transaction_rows = [transaction_from_row(r) for r in deltas["transactions"]]
         if debit_as_negative:
             inbox_rows = [apply_debit_as_negative_inbox(d) for d in inbox_rows]
             transaction_rows = [apply_debit_as_negative(d) for d in transaction_rows]

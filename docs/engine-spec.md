@@ -387,7 +387,7 @@ Returns the newly created `expense_transactions` object (primary leg for transfe
 
 ## Transactions (Ledger)
 
-**Hashtag wire format:** every transaction returned by the sync endpoint includes a `hashtag_ids: [uuid, ...]` array (sorted ascending) listing every hashtag attached to it. The junction table `expense_transaction_hashtags` is internal storage only — clients never see junction rows. Mutations to a transaction's hashtag set bump the parent transaction's `version` and `updated_at` in the same DB transaction so delta sync always surfaces the change. Individual list/get endpoints return the same `version`/`updated_at` columns but do not currently embed `hashtag_ids` (clients fetching a single transaction can use `?hashtag_id=` filtered listings or the dedicated hashtag endpoints).
+**Hashtag wire format:** every transaction returned by any read endpoint includes a `hashtag_ids: [uuid, ...]` array (sorted ascending) listing every hashtag attached to it. This applies uniformly to `/sync`, `GET /transactions`, `GET /transactions/{id}`, the response body of `POST /transactions`, `PUT /transactions/{id}`, `DELETE /transactions/{id}`, `POST /transactions/{id}/restore`, `POST /transactions/batch`, `POST /inbox/{id}/promote`, and each embedded transaction inside `GET /reconciliations/{id}`. Transactions with no attached hashtags return `"hashtag_ids": []` (never `null`, never omitted). The junction table `expense_transaction_hashtags` is internal storage only — clients never see junction rows. Mutations to a transaction's hashtag set bump the parent transaction's `version` and `updated_at` in the same DB transaction so delta sync always surfaces the change.
 
 ### `GET /transactions`
 Returns all active ledger transactions. Supports filtering:
