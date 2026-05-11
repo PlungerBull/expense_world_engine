@@ -120,22 +120,40 @@ async def _sync_hashtags(
     user_id: str,
     hashtag_ids: Optional[list[str]],
 ) -> None:
-    """Validate hashtags and replace junction rows for a ledger transaction.
+    """Make the transaction's active hashtag set exactly ``hashtag_ids``.
 
-    Uses ``transaction_source = 1`` to identify ledger junction rows
-    (the source of the junction row, not the parent table). Soft-deletes
-    all existing rows for this transaction first, then inserts the new
-    set. Idempotent as long as ``hashtag_ids`` is the desired final state.
+    Replacement semantics, not delta semantics. The active set after this
+    call equals ``hashtag_ids`` regardless of what was attached before.
+    Uses ``transaction_source = 1`` to identify ledger junction rows.
+
+    Implementation: a narrowed soft-delete drops only the rows *leaving*
+    the active set, and an ``ON CONFLICT DO UPDATE`` upsert handles the
+    rows joining or staying. Two key properties fall out:
+
+      1. **Re-attach safety.** The junction table's
+         ``UNIQUE (transaction_id, hashtag_id)`` is unconditional —
+         soft-deleted rows still occupy the slot. The previous "soft-
+         delete-everything + plain INSERT" pattern hit a UNIQUE
+         violation any time the new set overlapped with the old set
+         (e.g. PUT ``[A]`` → ``[A, B]``) or re-attached a
+         previously-deleted hashtag. ``ON CONFLICT DO UPDATE`` flips
+         ``deleted_at`` back to NULL on the existing row instead.
+
+      2. **Stable junction IDs.** Attach → detach → re-attach cycles
+         keep the same junction row (one row per logical pair forever),
+         instead of accumulating N+1 rows per cycle. ``/sync`` deltas
+         see a single junction lifecycle, not phantom rows.
+
+    The ``DO UPDATE`` clause only fires on rows that were soft-deleted
+    (``WHERE expense_transaction_hashtags.deleted_at IS NOT NULL``), so
+    rows that are already active are left fully untouched — no
+    ``version`` or ``updated_at`` churn on no-op transitions.
 
     Activity log — deliberate aggregation exception: junction rows are
-    mutated here (soft-delete + insert) without per-row ``activity_log``
-    entries. Instead, the parent transaction's UPDATED snapshot carries
-    the new ``hashtag_ids`` list, so the change IS captured — just at
-    parent-row granularity, not per link. This trade is intentional:
-    per-link entries would multiply the audit row count by the average
-    number of hashtags per transaction without adding answerable audit
-    questions. If a future forensic need emerges ("when exactly was
-    hashtag X unlinked from transaction Y?"), revisit this choice.
+    mutated here without per-row ``activity_log`` entries. The parent
+    transaction's UPDATED snapshot carries the new ``hashtag_ids`` list,
+    so the change is captured at parent granularity. See
+    api-design-principles.md §6 exception #1.
     """
     if hashtag_ids:
         # Archived hashtags are filtered here too — same parity rule that
@@ -160,21 +178,30 @@ async def _sync_hashtags(
                 {"hashtag_ids": f"Invalid IDs: {', '.join(invalid)}"},
             )
 
-    # Soft-delete existing junction rows
+    # Step 1: soft-delete the junctions *leaving* the active set.
+    # ``hashtag_id <> ALL($3)`` skips rows that should stay attached,
+    # so they don't get a version/updated_at bump for nothing. An empty
+    # array makes ``<> ALL`` vacuously TRUE for every row — clearing all
+    # hashtags still works (the original "soft-delete everything" case).
     await conn.execute(
         """
         UPDATE expense_transaction_hashtags
         SET deleted_at = now(), updated_at = now(), version = version + 1
-        WHERE transaction_id = $1 AND transaction_source = 1 AND user_id = $2 AND deleted_at IS NULL
+        WHERE transaction_id = $1
+          AND transaction_source = 1
+          AND user_id = $2
+          AND deleted_at IS NULL
+          AND hashtag_id <> ALL($3::uuid[])
         """,
         transaction_id,
         user_id,
+        hashtag_ids or [],
     )
 
-    # Insert new rows in a single statement. Previously this was a
-    # per-hashtag INSERT loop — a transaction with 50 hashtags fired 50
-    # round-trips. Unnesting an array lets us batch to one round-trip
-    # regardless of count.
+    # Step 2: upsert the new set in one statement. ON CONFLICT re-activates
+    # rows that exist but were soft-deleted; rows that don't exist get
+    # plain INSERT semantics; rows that are already active are skipped via
+    # the WHERE on DO UPDATE (no churn).
     if hashtag_ids:
         await conn.execute(
             """
@@ -182,6 +209,11 @@ async def _sync_hashtags(
                 (transaction_id, transaction_source, hashtag_id, user_id, created_at, updated_at)
             SELECT $1, 1, hashtag_id, $2, now(), now()
             FROM unnest($3::uuid[]) AS hashtag_id
+            ON CONFLICT (transaction_id, hashtag_id) DO UPDATE
+            SET deleted_at = NULL,
+                updated_at = now(),
+                version = expense_transaction_hashtags.version + 1
+            WHERE expense_transaction_hashtags.deleted_at IS NOT NULL
             """,
             transaction_id,
             user_id,

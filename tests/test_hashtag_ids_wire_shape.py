@@ -190,53 +190,131 @@ async def test_create_with_no_hashtags_returns_empty_array(client, test_data):
 
 @pytest.mark.asyncio
 async def test_put_response_reflects_new_hashtag_set(client, test_data):
-    """PUT /v1/transactions/{id} response carries the post-PUT hashtag set,
-    including PUTs that only rewrite hashtag_ids (other fields untouched).
+    """PUT /v1/transactions/{id} response carries the post-PUT hashtag set —
+    including overlap PUTs, empty-body fast paths, and clear-to-empty.
 
-    Uses a non-overlapping replacement ([h_initial] → [h_replacement]) to
-    avoid an unrelated pre-existing engine bug where ``_sync_hashtags``
-    soft-deletes the old junction set and then re-INSERTs without an
-    ON CONFLICT clause — re-attaching a previously-attached hashtag in
-    the same row trips the unconditional ``UNIQUE (transaction_id,
-    hashtag_id)`` constraint. That bug is out of scope for the wire-
-    format change; this test stays in lanes that don't trigger it.
+    The overlap case ([A] → [A, B]) is the natural shape of "add a
+    hashtag to a transaction that already has one." Covered explicitly
+    because ``_sync_hashtags`` previously crashed on it (UNIQUE conflict
+    on the re-INSERT of an already-attached hashtag); now handled by an
+    ``ON CONFLICT DO UPDATE`` upsert.
     """
-    h_initial = await _create_hashtag(client, "put-initial")
-    h_replacement = await _create_hashtag(client, "put-replacement")
-    txn_id, _ = await _create_txn(client, test_data, hashtag_ids=[h_initial])
+    h_a = await _create_hashtag(client, "put-a")
+    h_b = await _create_hashtag(client, "put-b")
+    h_c = await _create_hashtag(client, "put-c")
+    txn_id, _ = await _create_txn(client, test_data, hashtag_ids=[h_a])
 
     try:
-        # Non-overlapping replacement.
+        # Overlap: keep h_a, add h_b.
         r = await client.put(
             f"/v1/transactions/{txn_id}",
-            json={"hashtag_ids": [h_replacement]},
+            json={"hashtag_ids": [h_a, h_b]},
             headers=_idem(),
         )
         assert r.status_code == 200, r.text
-        _assert_hashtag_ids_shape(r.json(), [h_replacement])
+        _assert_hashtag_ids_shape(r.json(), [h_a, h_b])
+
+        # Non-overlapping replacement: [h_a, h_b] → [h_c].
+        r2 = await client.put(
+            f"/v1/transactions/{txn_id}",
+            json={"hashtag_ids": [h_c]},
+            headers=_idem(),
+        )
+        assert r2.status_code == 200, r2.text
+        _assert_hashtag_ids_shape(r2.json(), [h_c])
 
         # PUT with empty body — fast path still embeds the field with
         # the current set.
-        r2 = await client.put(
+        r3 = await client.put(
             f"/v1/transactions/{txn_id}",
             json={},
             headers=_idem(),
         )
-        assert r2.status_code == 200, r2.text
-        _assert_hashtag_ids_shape(r2.json(), [h_replacement])
+        assert r3.status_code == 200, r3.text
+        _assert_hashtag_ids_shape(r3.json(), [h_c])
 
         # PUT clearing hashtags returns [].
-        r3 = await client.put(
+        r4 = await client.put(
             f"/v1/transactions/{txn_id}",
             json={"hashtag_ids": []},
             headers=_idem(),
         )
-        assert r3.status_code == 200, r3.text
-        _assert_hashtag_ids_shape(r3.json(), [])
+        assert r4.status_code == 200, r4.text
+        _assert_hashtag_ids_shape(r4.json(), [])
     finally:
         await _cleanup_txn(txn_id, test_data.user_id)
-        await _cleanup_hashtag(h_initial, test_data.user_id)
-        await _cleanup_hashtag(h_replacement, test_data.user_id)
+        for h in (h_a, h_b, h_c):
+            await _cleanup_hashtag(h, test_data.user_id)
+
+
+@pytest.mark.asyncio
+async def test_put_reattach_cycle_keeps_junction_id_stable(client, test_data):
+    """Attach → detach → re-attach a hashtag and verify the junction row's
+    UUID is stable across the cycle (one row per logical (txn, hashtag)
+    pair, not N+1 rows accumulating per cycle).
+
+    This is the second invariant of the ON CONFLICT DO UPDATE pattern:
+    a hashtag's lifecycle on a transaction collapses to a single
+    junction row that toggles ``deleted_at`` instead of producing new
+    rows on each re-attach.
+    """
+    h = await _create_hashtag(client, "reattach")
+    txn_id, _ = await _create_txn(client, test_data, hashtag_ids=[h])
+
+    async def _junction_id() -> str | None:
+        async with db.pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                SELECT id FROM expense_transaction_hashtags
+                WHERE transaction_id = $1 AND hashtag_id = $2
+                  AND user_id = $3
+                """,
+                txn_id, h, test_data.user_id,
+            )
+
+    try:
+        initial_id = await _junction_id()
+        assert initial_id is not None
+
+        # Detach
+        r = await client.put(
+            f"/v1/transactions/{txn_id}",
+            json={"hashtag_ids": []},
+            headers=_idem(),
+        )
+        assert r.status_code == 200, r.text
+        _assert_hashtag_ids_shape(r.json(), [])
+
+        # Re-attach
+        r2 = await client.put(
+            f"/v1/transactions/{txn_id}",
+            json={"hashtag_ids": [h]},
+            headers=_idem(),
+        )
+        assert r2.status_code == 200, r2.text
+        _assert_hashtag_ids_shape(r2.json(), [h])
+
+        # Junction UUID survived the cycle.
+        reattached_id = await _junction_id()
+        assert reattached_id == initial_id, (
+            f"junction id churned across re-attach: initial={initial_id} "
+            f"reattached={reattached_id}"
+        )
+
+        # And the (txn, hashtag) pair still has exactly one row in the
+        # table — no N+1 accumulation.
+        async with db.pool.acquire() as conn:
+            count = await conn.fetchval(
+                """
+                SELECT count(*) FROM expense_transaction_hashtags
+                WHERE transaction_id = $1 AND hashtag_id = $2 AND user_id = $3
+                """,
+                txn_id, h, test_data.user_id,
+            )
+        assert count == 1, f"expected 1 junction row, got {count}"
+    finally:
+        await _cleanup_txn(txn_id, test_data.user_id)
+        await _cleanup_hashtag(h, test_data.user_id)
 
 
 @pytest.mark.asyncio
