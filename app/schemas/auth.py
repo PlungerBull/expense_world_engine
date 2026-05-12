@@ -18,6 +18,14 @@ class UserResponse(BaseModel):
     updated_at: datetime
 
 
+class RecalculationSummary(BaseModel):
+    regular_transactions: int
+    transfer_transactions: int
+    orphan_transfer_legs: int
+    inbox_items: int
+    total: int
+
+
 class UserSettingsResponse(BaseModel):
     user_id: str
     theme: int
@@ -32,6 +40,7 @@ class UserSettingsResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     deleted_at: Optional[datetime]
+    recalculation: Optional[RecalculationSummary] = None
 
 
 class BootstrapResponse(BaseModel):

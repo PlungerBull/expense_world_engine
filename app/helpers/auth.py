@@ -116,10 +116,11 @@ async def update_settings(
     router behaviour of treating empty-update as a fetch).
 
     If ``main_currency`` actually changes, triggers a full home-currency
-    recalculation and records the summary on the activity log's after snapshot
-    (a documented exception to the normal snapshot schema). The returned
-    settings dict does NOT carry the recalculation summary — that augmentation
-    lives only on the activity log.
+    recalculation. The summary is returned on the response under the
+    ``recalculation`` key (or ``null`` when no recalc ran — see
+    ``UserSettingsResponse`` for the always-present-with-null contract)
+    and is also embedded into the activity log's after snapshot, which
+    remains the canonical audit record per engine-spec.md.
 
     Raises:
         not_found: the user_settings row does not exist.
@@ -185,7 +186,7 @@ async def update_settings(
         after_snapshot={**after, "recalculation": recalc_summary} if recalc_summary else after,
     )
 
-    return after
+    return {**after, "recalculation": recalc_summary}
 
 
 async def update_profile(

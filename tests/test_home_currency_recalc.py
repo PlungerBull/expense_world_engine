@@ -224,3 +224,63 @@ async def test_activity_log_written(client, test_data):
         assert count_after == count_before + 1
     finally:
         await _set_currency(client, "PEN")
+
+
+@pytest.mark.asyncio
+async def test_recalc_summary_in_response(client, test_data):
+    """When main_currency changes, the PUT response carries the recalc summary inline."""
+    try:
+        r = await _set_currency(client, "USD")
+        assert r.status_code == 200
+
+        body = r.json()
+        assert "recalculation" in body
+        summary = body["recalculation"]
+        assert summary is not None
+
+        for key in (
+            "regular_transactions",
+            "transfer_transactions",
+            "orphan_transfer_legs",
+            "inbox_items",
+            "total",
+        ):
+            assert key in summary
+            assert isinstance(summary[key], int)
+
+        assert summary["regular_transactions"] >= 1  # test_data seeds one regular tx
+        assert summary["total"] == (
+            summary["regular_transactions"]
+            + summary["transfer_transactions"]
+            + summary["inbox_items"]
+        )
+    finally:
+        await _set_currency(client, "PEN")
+
+
+@pytest.mark.asyncio
+async def test_recalculation_null_when_unchanged(client, test_data):
+    """When main_currency is unchanged, the response carries recalculation=null."""
+    await _set_currency(client, "PEN")
+
+    r = await _set_currency(client, "PEN")
+    assert r.status_code == 200
+
+    body = r.json()
+    assert "recalculation" in body, "recalculation field must always be present per null-over-omission"
+    assert body["recalculation"] is None
+
+
+@pytest.mark.asyncio
+async def test_recalculation_null_on_empty_update(client, test_data):
+    """Empty body PUT returns current settings with recalculation=null."""
+    r = await client.put(
+        "/v1/auth/settings",
+        json={},
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert r.status_code == 200
+
+    body = r.json()
+    assert "recalculation" in body
+    assert body["recalculation"] is None
