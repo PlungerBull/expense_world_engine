@@ -253,6 +253,13 @@ async def create_transaction(
     if body.amount_cents == 0:
         errors["amount_cents"] = "Must not be zero."
 
+    # category_id is required for normal transactions but ignored for
+    # transfers — the transfer engine auto-assigns @Transfer/@Debt and
+    # discards any category_id passed in. Only enforce it on the non-transfer
+    # path so callers aren't forced to send a value the engine throws away.
+    if body.transfer is None and not body.category_id:
+        errors["category_id"] = "Required for non-transfer transactions."
+
     # Date must be <= now() — use DB clock so we don't drift with app-server clock skew
     now = await conn.fetchval("SELECT now()")
     if body.date > now:
@@ -1126,7 +1133,12 @@ async def create_batch(
     # validate them in 2 queries. Membership is then checked in memory.
     # A 100-item batch drops from 200 validation queries to 2.
     requested_account_ids = {item.account_id for item in body.transactions}
-    requested_category_ids = {item.category_id for item in body.transactions}
+    # category_id may be None now that the schema makes it optional; drop None
+    # from the lookup set (missing-category items are caught by the presence
+    # check below) so we never pass NULL into the uuid[] membership query.
+    requested_category_ids = {
+        item.category_id for item in body.transactions if item.category_id
+    }
 
     valid_account_rows = await conn.fetch(
         """
@@ -1169,7 +1181,12 @@ async def create_batch(
         if item.account_id not in valid_account_ids:
             item_errors["account_id"] = "Must reference an active, non-archived account."
 
-        if item.category_id not in valid_category_ids:
+        # category_id is optional on the schema (transfers waive it), but batch
+        # rejects transfers, so it's always required here. Report a clean
+        # "required" message instead of a misleading referential error.
+        if not item.category_id:
+            item_errors["category_id"] = "Required for non-transfer transactions."
+        elif item.category_id not in valid_category_ids:
             item_errors["category_id"] = "Must reference an active, non-archived category."
 
         item_id_str = str(item.id)

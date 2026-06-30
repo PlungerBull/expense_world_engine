@@ -403,7 +403,7 @@ Returns all active ledger transactions. Supports filtering:
 ### `POST /transactions`
 Creates a transaction directly in the ledger, bypassing the inbox. Used by the CLI for fast entry when all required fields are known.
 
-**Required:** `id` (client-supplied UUID), `title`, `amount_cents`, `date`, `account_id`, `category_id`
+**Required:** `id` (client-supplied UUID), `title`, `amount_cents`, `date`, `account_id`, `category_id` (required for normal transactions; omit for transfers — the engine auto-assigns `@Transfer`/`@Debt` and discards any `category_id` passed alongside a `transfer` object)
 **Optional:** `description`, `exchange_rate` (auto-populated if omitted), `cleared`, `hashtag_ids`, `transfer`
 
 For transfer requests, the `transfer` object additionally requires its own `id` field — the UUID of the sibling ledger row. Both `id` and `transfer.id` must be distinct and client-generated. Example:

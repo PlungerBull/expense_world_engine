@@ -17,7 +17,10 @@ class TransactionCreateRequest(BaseModel):
     amount_cents: int  # signed: negative=expense, positive=income
     date: AwareDatetime
     account_id: str
-    category_id: str
+    # Required for normal transactions, ignored for transfers (the engine
+    # auto-assigns @Transfer/@Debt). Conditional requirement is enforced in
+    # create_transaction, not here, since it depends on the transfer field.
+    category_id: Optional[str] = None
     description: Optional[str] = None
     exchange_rate: Optional[float] = None
     cleared: Optional[bool] = None
