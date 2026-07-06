@@ -7,6 +7,7 @@ All tests and async fixtures share one session-scoped event loop (see
 pytest.ini), so the connection pool is created once per session instead of
 per test.
 """
+import os
 import uuid
 from dataclasses import dataclass
 
@@ -21,7 +22,11 @@ from app import db
 
 
 TEST_USER_ID = str(uuid.uuid4())
-TEST_EMAIL = "test-sync@expense-world.dev"
+# Worker-unique email: the orphan sweep in db_pool deletes every user with
+# this email except its own, so sharing one email across xdist workers would
+# let each worker delete the others' live test users.
+_XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "main")
+TEST_EMAIL = f"test-sync-{_XDIST_WORKER}@expense-world.dev"
 
 
 @dataclass
@@ -140,6 +145,13 @@ async def db_pool(test_data):
     `async with db.pool.acquire()` — pool.close() at teardown waits on
     outstanding connections.
     """
+    # .env points at the Supavisor session-mode pooler (port 5432), where
+    # every pool slot pins a real backend connection. The prod sizing
+    # (5..50 per process) targets the transaction pooler; 4 xdist workers
+    # at that size exhaust the project's backend pool cap. Tests never run
+    # more than 2 requests concurrently per worker, so a tiny pool suffices.
+    settings.db_pool_min_size = 1
+    settings.db_pool_max_size = 3
     await db.connect()
     async with db.pool.acquire() as conn:
         await _ensure_test_data(conn, test_data)
