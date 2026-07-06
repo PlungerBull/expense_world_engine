@@ -2,8 +2,11 @@
 
 Tests run against the real Supabase dev database. Auth is bypassed via FastAPI
 dependency override — no real JWT required.
+
+All tests and async fixtures share one session-scoped event loop (see
+pytest.ini), so the connection pool is created once per session instead of
+per test.
 """
-import asyncio
 import uuid
 from dataclasses import dataclass
 
@@ -32,38 +35,8 @@ class TestData:
     inbox_id: str
 
 
-_test_data_created = False
-_test_data_instance = None
-
-
-def _build_test_data() -> TestData:
-    global _test_data_instance
-    if _test_data_instance is None:
-        _test_data_instance = TestData(
-            user_id=TEST_USER_ID,
-            account_id=str(uuid.uuid4()),
-            category_id=str(uuid.uuid4()),
-            hashtag_id=str(uuid.uuid4()),
-            hashtag2_id=str(uuid.uuid4()),
-            transaction_id=str(uuid.uuid4()),
-            inbox_id=str(uuid.uuid4()),
-        )
-    return _test_data_instance
-
-
 async def _ensure_test_data(conn, data: TestData):
-    """Create test resources if they don't exist yet."""
-    global _test_data_created
-    if _test_data_created:
-        return
-
-    exists = await conn.fetchval(
-        "SELECT 1 FROM users WHERE id = $1", data.user_id
-    )
-    if exists:
-        _test_data_created = True
-        return
-
+    """Create the session's seed resources."""
     async with conn.transaction():
         await conn.execute(
             "INSERT INTO users (id, email, created_at, updated_at) VALUES ($1, $2, now(), now())",
@@ -126,44 +99,74 @@ async def _ensure_test_data(conn, data: TestData):
                VALUES ('USD', 'PEN', 3.75, CURRENT_DATE, now())
                ON CONFLICT (base_currency, target_currency, rate_date) DO NOTHING""",
         )
-    _test_data_created = True
 
 
-async def _cleanup_test_data(data: TestData):
-    """Remove all test resources from the DB."""
-    conn = await asyncpg.connect(settings.supabase_db_url)
+async def _cleanup_test_data(conn, user_id: str):
+    """Remove all resources belonging to one test user."""
+    async with conn.transaction():
+        await conn.execute("DELETE FROM idempotency_keys WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM activity_log WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM sync_checkpoints WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM expense_transaction_hashtags WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM expense_transactions WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM expense_transaction_inbox WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM expense_reconciliations WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM expense_bank_accounts WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM expense_categories WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM expense_hashtags WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM user_settings WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+
+
+@pytest.fixture(scope="session")
+def test_data():
+    return TestData(
+        user_id=TEST_USER_ID,
+        account_id=str(uuid.uuid4()),
+        category_id=str(uuid.uuid4()),
+        hashtag_id=str(uuid.uuid4()),
+        hashtag2_id=str(uuid.uuid4()),
+        transaction_id=str(uuid.uuid4()),
+        inbox_id=str(uuid.uuid4()),
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+async def db_pool(test_data):
+    """Session-wide connection pool + seed data.
+
+    ASGITransport never runs the app lifespan, so this fixture substitutes for
+    it (the lifespan is db.connect()/db.disconnect()). Tests must only use
+    `async with db.pool.acquire()` — pool.close() at teardown waits on
+    outstanding connections.
+    """
+    await db.connect()
+    async with db.pool.acquire() as conn:
+        await _ensure_test_data(conn, test_data)
+        # Sweep orphans from previous runs that were killed before teardown.
+        orphans = await conn.fetch(
+            "SELECT id FROM users WHERE email = $1 AND id != $2",
+            TEST_EMAIL, test_data.user_id,
+        )
+        for row in orphans:
+            await _cleanup_test_data(conn, str(row["id"]))
+
+    yield db.pool
+
     try:
-        async with conn.transaction():
-            await conn.execute("DELETE FROM idempotency_keys WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM activity_log WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM sync_checkpoints WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM expense_transaction_hashtags WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM expense_transactions WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM expense_transaction_inbox WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM expense_reconciliations WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM expense_bank_accounts WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM expense_categories WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM expense_hashtags WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM user_settings WHERE user_id = $1", data.user_id)
-            await conn.execute("DELETE FROM users WHERE id = $1", data.user_id)
+        # Cleanup on a fresh direct connection: it must succeed even if the
+        # pool is unhealthy by session end.
+        conn = await asyncpg.connect(settings.supabase_db_url)
+        try:
+            await _cleanup_test_data(conn, test_data.user_id)
+        finally:
+            await conn.close()
     finally:
-        await conn.close()
-
-
-def pytest_sessionfinish(session, exitstatus):
-    """Cleanup test data after all tests complete."""
-    data = _build_test_data()
-    if _test_data_created:
-        asyncio.get_event_loop().run_until_complete(_cleanup_test_data(data))
+        await db.disconnect()
 
 
 @pytest.fixture
-async def test_data():
-    return _build_test_data()
-
-
-@pytest.fixture
-async def client(test_data):
+async def client(test_data, db_pool):
     """Async HTTP client with auth bypassed to the test user."""
 
     async def mock_user():
@@ -171,16 +174,8 @@ async def client(test_data):
 
     app.dependency_overrides[get_current_user] = mock_user
 
-    # Each test runs on its own event loop, so the pool must be created fresh.
-    db.pool = await asyncpg.create_pool(settings.supabase_db_url)
-
-    async with db.pool.acquire() as conn:
-        await _ensure_test_data(conn, test_data)
-
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
 
     app.dependency_overrides.clear()
-    await db.pool.close()
-    db.pool = None
