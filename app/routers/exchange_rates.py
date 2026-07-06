@@ -7,7 +7,8 @@ from app import db
 from app.deps import CurrentUser
 from app.errors import not_found
 from app.helpers.exchange_rate import get_rate
-from app.schemas.exchange_rates import ExchangeRateResponse
+from app.helpers.pagination import paginated_response
+from app.schemas.exchange_rates import ExchangeRateHistoryItem, ExchangeRateResponse
 
 router = APIRouter(prefix="/exchange-rates", tags=["exchange-rates"])
 
@@ -42,3 +43,56 @@ async def get_exchange_rate(
         rate_date=rate_date,
         rate=rate,
     ).model_dump(mode="json")
+
+
+@router.get("/history")
+async def list_exchange_rate_history(
+    auth_user: CurrentUser,
+    date: Optional[date_type] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List stored exchange-rate rows, newest first.
+
+    Unlike the lookup above, this has no fallback semantics: it returns
+    exactly the rows that exist. A date with no rows is an empty page,
+    not an error. UNIQUE (base_currency, target_currency, rate_date)
+    guarantees one row per pair per day, so no server-side dedup is needed.
+    """
+    conditions = []
+    params: list = []
+
+    if date is not None:
+        conditions.append(f"rate_date = ${len(params) + 1}")
+        params.append(date)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    async with db.pool.acquire() as conn:
+        total = await conn.fetchval(
+            f"SELECT count(*) FROM exchange_rates {where}", *params
+        )
+
+        rows = await conn.fetch(
+            f"""
+            SELECT base_currency, target_currency, rate, rate_date
+            FROM exchange_rates
+            {where}
+            ORDER BY rate_date DESC, base_currency ASC, target_currency ASC
+            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+            """,
+            *params,
+            limit,
+            offset,
+        )
+
+    items = [
+        ExchangeRateHistoryItem(
+            base=row["base_currency"],
+            target=row["target_currency"],
+            rate_date=row["rate_date"],
+            rate=float(row["rate"]),
+        ).model_dump(mode="json")
+        for row in rows
+    ]
+    return paginated_response(items, total, limit, offset)

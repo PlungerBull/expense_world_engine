@@ -875,3 +875,18 @@ The "every mutation gets an activity_log row" rule has three deliberate exceptio
 Returns the rate for the given pair and date. Falls back to the most recent available rate if no exact match exists for the requested date.
 
 Used internally by the engine. Also exposed for CLI use.
+
+### `GET /exchange-rates/history`
+**Query params:** `date` (optional ISO date — exact-day filter), `limit` (`[1, 200]`, default 50), `offset` (`≥ 0`, default 0)
+
+Lists the stored `exchange_rates` rows, newest first, in the standard pagination envelope (`items` / `total` / `limit` / `offset`). Each item:
+
+```json
+{ "base": "USD", "target": "PEN", "rate_date": "2026-07-05", "rate": 3.6 }
+```
+
+- **Ordering:** `rate_date DESC, base ASC, target ASC` — pairs interleave deterministically within a day.
+- **No fallback semantics**, unlike the lookup above: this returns exactly the rows that exist. A `date` with no rows (or an empty table) returns `items: []` with `total: 0` — not an error.
+- `rate` = units of `target` per 1 `base`, serialized as a JSON number — same convention and serialization as the lookup.
+- The `UNIQUE (base_currency, target_currency, rate_date)` constraint guarantees one row per pair per day; clients render rows verbatim, no dedup on either side.
+- Read-only reference data (same posture as `GET /activity`): standard auth, standard error envelope, not part of the `/sync` payload.

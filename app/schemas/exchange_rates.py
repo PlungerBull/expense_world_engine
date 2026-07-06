@@ -9,3 +9,10 @@ class ExchangeRateResponse(BaseModel):
     date: date_type
     rate_date: date_type
     rate: float
+
+
+class ExchangeRateHistoryItem(BaseModel):
+    base: str
+    target: str
+    rate_date: date_type
+    rate: float
