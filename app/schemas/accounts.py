@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AwareDatetime, BaseModel, ConfigDict
 
 
 class AccountCreateRequest(BaseModel):
@@ -15,6 +15,19 @@ class AccountCreateRequest(BaseModel):
     currency_code: str
     color: Optional[str] = None
     sort_order: Optional[int] = None
+
+
+class OpeningBalanceRequest(BaseModel):
+    # Unknown fields 422 — same posture as AccountCreateRequest. The
+    # transaction id is client-supplied (UUID-first convention) so bulk
+    # importers get deterministic dedup on re-runs.
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_id: UUID
+    amount_cents: int  # signed: positive = money you had, negative = starting debt
+    date: AwareDatetime
+    title: Optional[str] = None  # defaults to "Opening balance"
+    exchange_rate: Optional[float] = None
 
 
 class AccountUpdateRequest(BaseModel):

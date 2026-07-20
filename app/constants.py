@@ -17,6 +17,7 @@ class SystemCategoryKey(str, Enum):
     """
     DEBT = "debt"
     TRANSFER = "transfer"
+    OPENING_BALANCE = "opening_balance"
 
 
 # Default display name for each system category key when the row is
@@ -25,6 +26,7 @@ class SystemCategoryKey(str, Enum):
 SYSTEM_CATEGORY_DEFAULT_NAMES: dict[SystemCategoryKey, str] = {
     SystemCategoryKey.DEBT: "@Debt",
     SystemCategoryKey.TRANSFER: "@Transfer",
+    SystemCategoryKey.OPENING_BALANCE: "@Opening",
 }
 
 

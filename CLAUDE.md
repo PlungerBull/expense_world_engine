@@ -75,6 +75,7 @@ Before writing a new helper, utility, or service function, check if one already 
 | 9.1 | Home Currency Recalculation | ✅ Done |
 | 9.2 | Personal Access Tokens (CLI auth) | ✅ Done |
 | 9.3 | Profile mutation (`PUT /auth/profile`) | ✅ Done |
+| 9.4 | Opening balances (`@Opening` + report exclusion) | ✅ Done |
 | — | **Engine feature-complete. All endpoints shipped + tested.** | ✅ Done |
 | 9.5 | Web Dashboard (read-only) | Pending (separate repo) |
 | 10 | CLI | Pending (separate repo) |

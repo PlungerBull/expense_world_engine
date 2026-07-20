@@ -276,6 +276,33 @@ When `PUT /auth/settings` detects that `main_currency` has actually changed (old
 
 ---
 
+## Step 9.4 — Opening Balances ✅ Shipped
+
+*Deliverable: `POST /accounts/{id}/opening-balance` seeds an account's starting balance as a transaction under the `@Opening` system category; flow reports exclude it entirely.*
+
+**Implementation:** `SystemCategoryKey.OPENING_BALANCE` + `@Opening` default name in `app/constants.py`; `OpeningBalanceRequest` in `app/schemas/accounts.py`; route in `app/routers/accounts.py`; `create_opening_balance` in `app/helpers/accounts.py` (validates real/active account, enforces one active opening per account with `409`, then delegates to `create_transaction` so validation, rate lookup, balance update, and activity log stay in one place); report exclusion in `app/helpers/monthly_report.py` (category panel + totals, keyed on `system_key = 'opening_balance'`). No SQL migration — the `system_key` column and partial unique index from `sql/010` accommodate the third key. 8 integration tests in `tests/test_opening_balance.py`.
+
+Depends on: Step 4 (accounts, categories, `ensure_system_category`), Step 6 (transactions), Step 9 Part A (reports).
+
+### Why
+
+`POST /accounts` has no balance field — every account starts at 0 and `current_balance_cents` is transaction-derived. Before this step, the only way to seed a starting balance was an ordinary income transaction under a user-invented category, which permanently inflated reported income with no way for the engine or any client to recognize it. Account initialisation with an opening balance was contemplated in the original design (`lessons-todoist.md` §7) but never shipped. The endpoint works for **existing** accounts (not just at creation) because real users adopt the product with live accounts; a creation-time `opening_balance_cents` param on `POST /accounts` remains a possible future convenience for onboarding flows.
+
+### Behavior
+
+- Seed = ordinary transaction (editable/deletable; balance atomically applied; appears in transaction lists and `/sync`), auto-assigned to `@Opening` (`system_key = 'opening_balance'`, auto-created on first use, renameable).
+- Flow reports (dashboard month panel + `/reports/monthly`): the `@Opening` row is hidden and its transactions contribute nothing to `inflow/outflow/net` — visible category rows sum exactly to `net_cents`. Account balances include seeds by construction.
+- Guards: one active opening balance per account (`409`); client-supplied `transaction_id` (`409` on collision) makes bulk-import re-runs converge; zero amount / future date / person account / archived account → `422`.
+
+### Verify
+
+- Seed a fresh account → `201`, balance updated, `@Opening` exists with `is_system = true`. Second seed on the same account → `409`. Replay with same idempotency key → stored response, balance applied once.
+- Monthly report for the seed month: no `@Opening` category row; totals unchanged by the seed. Rename `@Opening` → exclusion and guards still hold.
+
+**Commit:** `feat: opening balances — @Opening system category + report exclusion`
+
+---
+
 ## Step 9.5 — Web Dashboard (Read-Only)
 
 *Deliverable: a lightweight Next.js dashboard on Vercel that reads from the engine and shows you if you're on track.*

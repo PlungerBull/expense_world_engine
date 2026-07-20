@@ -15,6 +15,14 @@ inflow - outflow and is unaffected by internal movement volume.
 `spent_cents` on a category can therefore be negative — the field name is retained
 for spec-contract reasons but semantically it is "signed net flow through this
 category this month".
+
+Opening balances (transactions under the ``opening_balance`` system category) are
+excluded entirely: no category row in the panel, no contribution to totals. An
+opening balance is where tracking starts, not money that moved — including it
+would report phantom income in the seed month. Exclusion keys off ``system_key``,
+so renaming the @Opening display name never breaks it. Transfers, by contrast,
+ARE included: both legs carry signed amounts that cancel in ``net`` (gross
+inflow/outflow do include internal movement volume).
 """
 from datetime import datetime, timezone
 from typing import Optional
@@ -76,16 +84,19 @@ async def compute_month_flow(
 ) -> dict:
     """Run the monthly flow queries for a user and return {categories, totals}.
 
-    - categories: every non-deleted category, sorted by sort_order, with hashtag_breakdown
-      rows that sum exactly to the category's spent_cents (invariant enforced by construction
-      — the category total is computed from the breakdown, not separately).
-    - totals: inflow/outflow/net in both native and home currency. Transfers excluded.
+    - categories: every non-deleted category except the opening_balance system row,
+      sorted by sort_order, with hashtag_breakdown rows that sum exactly to the
+      category's spent_cents (invariant enforced by construction — the category
+      total is computed from the breakdown, not separately).
+    - totals: inflow/outflow/net in both native and home currency. Transfers are
+      included (legs cancel in net); opening-balance transactions are excluded.
     """
     categories_rows = await conn.fetch(
         """
         SELECT id, name, sort_order
         FROM expense_categories
         WHERE user_id = $1 AND deleted_at IS NULL
+          AND system_key IS DISTINCT FROM 'opening_balance'
         ORDER BY sort_order ASC, name ASC
         """,
         user_id,
@@ -125,6 +136,11 @@ async def compute_month_flow(
               AND t.deleted_at IS NULL
               AND t.date >= $2
               AND t.date <  $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM expense_categories c
+                  WHERE c.id = t.category_id
+                    AND c.system_key = 'opening_balance'
+              )
         )
         SELECT
             category_id,
@@ -190,6 +206,11 @@ async def compute_month_flow(
               AND t.deleted_at IS NULL
               AND t.date >= $2
               AND t.date <  $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM expense_categories c
+                  WHERE c.id = t.category_id
+                    AND c.system_key = 'opening_balance'
+              )
         )
         SELECT
             COALESCE(SUM(CASE WHEN signed_cents      > 0 THEN  signed_cents      ELSE 0 END), 0)::bigint AS inflow_cents,

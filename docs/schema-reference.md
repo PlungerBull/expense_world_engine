@@ -330,8 +330,9 @@ expense_categories
 **System categories (auto-seeded on first use, `is_system = true`):**
 - `@Transfer` (`system_key = 'transfer'`) — auto-assigned to both legs of a transfer between the user's own real accounts. Cannot be manually assigned to other transactions.
 - `@Debt` (`system_key = 'debt'`) — auto-assigned to transactions on person accounts (both the receivable entry and the settlement). Represents money owed to or from people.
+- `@Opening` (`system_key = 'opening_balance'`) — assigned to opening-balance seed transactions created via `POST /accounts/{id}/opening-balance`. Transactions under this category are excluded from flow reports (dashboard month panel + monthly report), and the category row itself is hidden from those panels.
 
-Both display names are user-renameable; the engine's transfer pipeline always resolves them by `system_key`.
+All display names are user-renameable; the engine always resolves system categories by `system_key`.
 
 **Category on transfers:** `category_id` is NOT NULL on all transactions, including transfers. Own-account transfers auto-receive `@Transfer`. Person-account transactions auto-receive `@Debt`. This enforces completeness without requiring the user to choose a category manually for these flows.
 

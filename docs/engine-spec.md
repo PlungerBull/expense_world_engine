@@ -208,6 +208,21 @@ Creates a new bank account (real account only — `is_person = false`).
 - `currency_code` is immutable after creation — any subsequent `PUT` that includes it returns `422`.
 - `id` must not collide with an existing account — returns `409 CONFLICT` if taken.
 
+### `POST /accounts/{id}/opening-balance`
+Seeds the account's opening balance as a transaction under the `@Opening` system category (`system_key = 'opening_balance'`, auto-created on first use). The seed is an **ordinary transaction** — editable and deletable via the transactions API, balance applied atomically — whose only special property is its category: flow reports exclude it entirely (see Dashboard & Reporting below). An opening balance is where tracking starts, not money that moved.
+
+**Required:** `transaction_id` (client-supplied UUID), `amount_cents` (signed; positive = money you had, negative = starting debt), `date` (RFC 3339, must not be in the future)
+**Optional:** `title` (defaults to `"Opening balance"`), `exchange_rate` (same semantics as `POST /transactions`)
+**Forbidden:** any unknown field → `422 VALIDATION_ERROR`.
+
+**Validation:**
+- Account must be active and non-archived (`422`, same rule as transaction creation) and must be a real account — person accounts return `422` (`@Debt` is their domain).
+- `amount_cents` must not be zero; `date` must not be in the future (`422`).
+- **At most one active opening balance per account** — a second POST returns `409 CONFLICT`. To adjust an opening balance, edit or delete the existing seed transaction instead.
+- A `transaction_id` that already exists returns `409 CONFLICT`. Client-supplied ids make bulk-import re-runs deterministic: a replayed seed collides and is skipped, never double-applied.
+
+**Response:** `201` with the standard transaction row. Standard `X-Idempotency-Key` semantics apply.
+
 ### `GET /accounts/{id}`
 ### `PUT /accounts/{id}`
 
@@ -264,7 +279,8 @@ Categories carry no type restriction. The same category can be used on expenses,
 **Auto-creation (engine-side, not via this endpoint):**
 - `@Debt` — auto-created the first time a person account is involved in a transaction.
 - `@Transfer` — auto-created the first time a real-account transfer is created.
-Both are created with `is_system = true` and a stable `system_key` column (`"debt"` / `"transfer"`) — the engine looks them up by `system_key`, not by display name. This means users can freely rename the display text without breaking future transfer pipelines (which was a bug before the `system_key` column was added).
+- `@Opening` — auto-created the first time an account's opening balance is seeded via `POST /accounts/{id}/opening-balance`.
+All are created with `is_system = true` and a stable `system_key` column (`"debt"` / `"transfer"` / `"opening_balance"`) — the engine looks them up by `system_key`, not by display name. This means users can freely rename the display text without breaking the pipelines that depend on them (which was a bug before the `system_key` column was added).
 
 ### `PUT /categories/{id}`
 System categories (`is_system = true`) CAN be renamed — the engine identifies them by `system_key`, not by `name`. Any other field is also editable. Returns `404` if the category is missing. The same name normalization rules as `POST` apply: renames are trimmed, empty names return `422`, and case-insensitive conflicts return `409`.
@@ -756,9 +772,10 @@ Returns the current calendar month overview. Single endpoint, one call, everythi
 
 - `bank_accounts` includes only `is_person = false`, `is_archived = false`, `deleted_at IS NULL`. Sorted by `sort_order`.
 - `people` includes only `is_person = true`, `deleted_at IS NULL`. Same shape as `bank_accounts`, separated for client convenience.
-- `categories` includes every non-deleted category, even if `spent_cents = 0` (so the client can render the full category list without a second call). Sorted by `sort_order`.
+- `categories` includes every non-deleted category, even if `spent_cents = 0` (so the client can render the full category list without a second call), **except the `@Opening` system row** (`system_key = 'opening_balance'`) — see the opening-balance rule below. Sorted by `sort_order`.
 - **`hashtag_breakdown`** — array of `{ hashtag_ids, spent_cents, spent_home_cents }` rows. Aggregation is `GROUP BY (category_id, sorted_array_of_hashtag_ids)`. The hashtag set is sorted by `id` before grouping so `[#a, #b]` and `[#b, #a]` collapse to the same row. Transactions with no hashtags appear as a row with `hashtag_ids: []`. **The sum of all `hashtag_breakdown` rows under a category equals that category's `spent_cents` exactly** — no double-counting, no orphaned amounts.
 - `totals.inflow_cents` / `outflow_cents` are the sum of all positive and negative transactions in the current month, expressed in `main_currency`. Native-currency totals are not meaningful when accounts span currencies, so only `_home_cents` is authoritative; the non-home fields are provided for single-currency users.
+- **Opening balances are excluded from flow views entirely** (dashboard month panel and `/reports/monthly` alike): transactions under the `opening_balance` system category contribute nothing to `totals`, and the `@Opening` category row is omitted from `categories`. Rationale: an opening balance is where tracking starts, not money that moved — including it would report phantom income in the seed month, and hiding the row keeps the invariant that visible category rows sum exactly to `net_cents`. Exclusion keys off `system_key`, so renaming the category never breaks it. Account balances **do** include opening balances by construction, and the seed rows appear normally in transaction lists and `/sync`. Consequence: any transaction manually assigned to the `@Opening` category is likewise excluded from flow reports — the category carries the semantic.
 - All `*_home_cents` fields are pre-converted by the engine. Clients never compute currency conversions.
 - `bank_accounts[].current_balance_home_cents` and `people[].current_balance_home_cents` are `Optional[int]`. They are always populated for same-currency accounts (identity rate). For cross-currency accounts, they are `null` only when no exchange rate is available from the account's currency to `main_currency` for today's date — in that case, clients should display the native balance as a fallback.
 - "Current month" means `[first_day_of_month, last_day_of_month]` in the user's `display_timezone`.

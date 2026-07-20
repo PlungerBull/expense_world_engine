@@ -14,9 +14,10 @@ from uuid import UUID
 
 import asyncpg
 
-from app.constants import ActivityAction
+from app.constants import ActivityAction, SystemCategoryKey
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
+from app.helpers.categories import ensure_system_category
 from app.helpers.exchange_rate import get_rate
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.schemas.accounts import account_from_row
@@ -120,6 +121,80 @@ async def create_account(
         after_snapshot=response,
     )
     return response
+
+
+async def create_opening_balance(
+    conn: asyncpg.Connection,
+    user_id: str,
+    account_id: str,
+    body,
+) -> dict:
+    """Seed an account's opening balance as a transaction under @Opening.
+
+    The seed is an ordinary transaction (editable/deletable like any other);
+    what makes it special is the ``opening_balance`` system category, which
+    flow reports exclude — an opening balance is where tracking starts, not
+    money that moved. Delegates the insert to ``create_transaction`` so
+    validation, rate lookup, balance update, and activity logging stay in
+    one place.
+
+    Raises:
+        validation_error: account missing/archived (via
+            ``validate_active_account``), person account, or any
+            transaction-level failure (zero amount, future date).
+        conflict: the account already has an active opening balance, or a
+            transaction with ``body.transaction_id`` already exists.
+    """
+    from app.helpers.transactions import create_transaction  # avoid import cycle
+    from app.helpers.validation import validate_active_account
+    from app.schemas.transactions import TransactionCreateRequest
+
+    account = await validate_active_account(conn, account_id, user_id)
+    if account["is_person"]:
+        raise validation_error(
+            "Account validation failed.",
+            {"account_id": "Person accounts cannot carry an opening balance."},
+        )
+
+    # At most one active opening balance per account — "opening" is singular.
+    # To adjust one, edit or delete the existing seed transaction.
+    existing = await conn.fetchrow(
+        """
+        SELECT t.id
+        FROM expense_transactions t
+        JOIN expense_categories c ON c.id = t.category_id
+        WHERE t.user_id = $1 AND t.account_id = $2 AND t.deleted_at IS NULL
+          AND c.system_key = $3 AND c.deleted_at IS NULL
+        LIMIT 1
+        """,
+        user_id,
+        account_id,
+        SystemCategoryKey.OPENING_BALANCE.value,
+    )
+    if existing is not None:
+        raise conflict(
+            "This account already has an opening balance. "
+            "Edit or delete the existing opening-balance transaction instead."
+        )
+
+    category_id = await ensure_system_category(
+        conn, user_id, SystemCategoryKey.OPENING_BALANCE
+    )
+
+    title = (body.title or "").strip() or "Opening balance"
+    return await create_transaction(
+        conn,
+        user_id,
+        TransactionCreateRequest(
+            id=body.transaction_id,
+            title=title,
+            amount_cents=body.amount_cents,
+            date=body.date,
+            account_id=account_id,
+            category_id=category_id,
+            exchange_rate=body.exchange_rate,
+        ),
+    )
 
 
 async def update_account(

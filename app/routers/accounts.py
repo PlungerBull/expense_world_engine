@@ -14,7 +14,12 @@ from app.helpers.exchange_rate import batch_get_rates
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
 from app.helpers.validation import extract_update_fields
-from app.schemas.accounts import AccountCreateRequest, AccountUpdateRequest, account_from_row
+from app.schemas.accounts import (
+    AccountCreateRequest,
+    AccountUpdateRequest,
+    OpeningBalanceRequest,
+    account_from_row,
+)
 from app.schemas.reconciliations import ReconciliationReorderRequest
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -105,6 +110,23 @@ async def create_account(
         status_code=201,
         work=lambda conn: accounts_service.create_account(
             conn, auth_user.id, body.id, body.name, body.currency_code, body.color, body.sort_order,
+        ),
+    )
+
+
+@router.post("/{account_id}/opening-balance", status_code=201)
+async def create_opening_balance(
+    account_id: str,
+    body: OpeningBalanceRequest,
+    auth_user: CurrentUser,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+):
+    return await run_idempotent(
+        auth_user.id,
+        x_idempotency_key,
+        status_code=201,
+        work=lambda conn: accounts_service.create_opening_balance(
+            conn, auth_user.id, account_id, body,
         ),
     )
 
