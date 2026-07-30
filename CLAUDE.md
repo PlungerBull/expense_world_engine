@@ -2,7 +2,9 @@
 
 ## What this repo is
 
-The Brain. A Python (FastAPI) backend hosted on Render, backed by Supabase (Postgres). It is the single source of truth for all business logic, validation, and data. The iOS app, CLI, and web dashboard are all equal clients — none of them implement logic. If it isn't in the engine, it doesn't exist.
+The Brain. A Python (FastAPI) backend, backed by Postgres. It is the single source of truth for all business logic, validation, and data. The iOS app, CLI, and web dashboard are all equal clients — none of them implement logic. If it isn't in the engine, it doesn't exist.
+
+**Deployment (since 2026-07-30): local profile** — the engine runs on the owner's Mac (launchd, `127.0.0.1:8000`) against Homebrew Postgres; the Render/Supabase cloud profile is mothballed until a second client needs it. Profiles live in `deploy/` (local = active, cloud = reactivation checklist); rationale in `expense_world_CLI/docs/decisions.md` ("Local-first deployment, 2026-07-30"). This changes where the engine runs, not what it is — every convention below holds unchanged.
 
 ## Key documentation
 
@@ -17,9 +19,9 @@ The Brain. A Python (FastAPI) backend hosted on Render, backed by Supabase (Post
 
 - **Language:** Python
 - **Framework:** FastAPI
-- **Database:** Supabase (managed Postgres). RLS enabled on all tables: `auth.uid() = user_id`.
-- **Auth:** Supabase Auth. Engine validates JWT, extracts `user_id`, never stores passwords.
-- **Hosting:** Render (stateless — all state lives in Supabase).
+- **Database:** Postgres (local profile: Homebrew 17 on the owner's Mac; cloud profile: Supabase). RLS policies ship in the schema (`auth.uid() = user_id`); live protection in the cloud profile, inert under the local owner connection.
+- **Auth:** Bearer tokens — engine-issued PATs (local profile uses these exclusively) or Supabase Auth JWTs (cloud profile). Engine validates, extracts `user_id`, never stores passwords.
+- **Hosting:** per deployment profile (`deploy/`) — local launchd service now; Render on cloud reactivation. Stateless either way — all state lives in Postgres.
 
 ## Non-negotiable conventions
 
@@ -78,7 +80,8 @@ Before writing a new helper, utility, or service function, check if one already 
 | 9.4 | Opening balances (`@Opening` + report exclusion) | ✅ Done |
 | — | **Engine feature-complete. All endpoints shipped + tested.** | ✅ Done |
 | 9.5 | Web Dashboard (read-only) | Pending (separate repo) |
-| 10 | CLI | Pending (separate repo) |
+| 10 | CLI | Shipped (separate repo — flat CLI + TUI complete; see `expense_world_CLI/docs/roadmap.md`) |
+| 11 | Local deployment (engine + Postgres on the owner's Mac; cloud mothballed) | ✅ Done (2026-07-30) |
 
 ## Error format
 

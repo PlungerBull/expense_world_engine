@@ -8,7 +8,7 @@
 
 ## Base Conventions
 
-**Base URL:** `https://expense-world-engine.onrender.com/v1` (production) / `http://localhost:8000/v1` (local)
+**Base URL:** `http://localhost:8000/v1` (local profile — active since 2026-07-30) / `https://expense-world-engine.onrender.com/v1` (cloud profile, mothballed; see `deploy/cloud/README.md`)
 
 **Authentication:** Every request requires `Authorization: Bearer <token>`. The token is either a Supabase JWT (iOS app) or a Personal Access Token (CLI, web integrations) — both resolve to the same `user_id`. PATs are recognized by the `ewe_pat_` prefix; any other token is parsed as a JWT. Unauthenticated, invalid, expired, or revoked tokens return `401`.
 

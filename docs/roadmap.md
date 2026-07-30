@@ -184,7 +184,7 @@ At this point you have a fully working headless expense logger. Verify the entir
 2. Deploy the engine to Render. Set env variables in the hosting dashboard. ✅
 3. Verify `GET /health` returns 200 in production. ✅
 
-**Production URL:** `https://expense-world-engine.onrender.com`
+**Production URL (at this step's completion):** `https://expense-world-engine.onrender.com` — *mothballed 2026-07-30 by Step 11; the live engine is `http://127.0.0.1:8000` (deploy/local).*
 
 ---
 
@@ -203,7 +203,7 @@ Split into **Part A** (read-side endpoints + exchange rates) and **Part B** (syn
 ### Step 9 Part A — Activity, Exchange Rates, Dashboard, Reports ✅ Shipped
 
 1. **`GET /activity`** — paginated audit-log reads with `resource_type` and `resource_id` filters, sorted by `created_at DESC`. *(commit `d57b7f7`)*
-2. **Exchange rate daily fetch job + `GET /exchange-rates`** — stdlib-only Python script (`app/jobs/fetch_exchange_rates.py`) that calls Frankfurter (`https://api.frankfurter.app/latest?from=USD&to=<targets>`) and upserts canonical USD-based rows into `exchange_rates`. The read endpoint uses the shared `get_rate` helper which handles directional math (USD-involving conversions and inversion) at lookup time. Cross-rate (non-USD ↔ non-USD) lookups are intentionally unsupported under the Phase 1 PEN/USD-only policy (`sql/015`); `get_pair_rate` returns `None` for that case. Wiring the script to a daily Render Cron Job is operational and tracked in [TODO.md](../TODO.md). Historical backfill is also a user-owned task in [TODO.md](../TODO.md), scheduled for the very end of engine work. *(commit `d57b7f7`)*
+2. **Exchange rate daily fetch job + `GET /exchange-rates`** — stdlib-only Python script (`app/jobs/fetch_exchange_rates.py`) that fetches all USD rates and upserts canonical USD-based rows into `exchange_rates`. *(Provider was Frankfurter at ship time; swapped to fawazahmed0/currency-api 2026-07-30 — ECB data carries no PEN. See the job docstring + TODO.md.)* The read endpoint uses the shared `get_rate` helper which handles directional math (USD-involving conversions and inversion) at lookup time. Cross-rate (non-USD ↔ non-USD) lookups are intentionally unsupported under the Phase 1 PEN/USD-only policy (`sql/015`); `get_pair_rate` returns `None` for that case. Wiring the script to a daily Render Cron Job is operational and tracked in [TODO.md](../TODO.md). Historical backfill is also a user-owned task in [TODO.md](../TODO.md), scheduled for the very end of engine work. *(commit `d57b7f7`)*
 3. **`GET /dashboard`** — current calendar month summary. Single call, everything needed for the main view. Response includes:
    - **`bank_accounts`** — all real accounts (`is_person = false`, not archived) with `current_balance_cents` + `current_balance_home_cents` (home converted at today's rate via `get_rate`).
    - **`people`** — all person accounts (`is_person = true`) with balances in both currencies. Same shape as `bank_accounts`, separated for client convenience.
@@ -345,6 +345,28 @@ expense_world_ios      → later, maybe never needed
 **Engine is feature-complete.** All endpoints (Steps 0–9.1) are implemented, documented, and tested (26 sync + 6 recalc integration tests). Two operational tasks remain before full production readiness — see [TODO.md](../TODO.md): (1) wire up the Render Cron Job for daily exchange-rate fetching, (2) backfill historical exchange rates.
 
 Next: write the `expense_world_cli` spec (fill in `cli-spec.md`) and start building CLI commands against the live engine.
+
+---
+
+## Step 11 — Local Deployment (decided and executed 2026-07-30)
+
+*Deliverable: the entire system running on the owner's Mac — engine + Postgres local, daily FX fetch working, nightly backups proven — with the cloud mothballed until a second client exists.*
+
+**Why:** single-user phase; Render free-tier cold starts made daily use slow; the FX cron was never wired on Render (paid-only) which blocked cross-currency PEN/USD writes. Full rationale + rejected alternatives: `expense_world_CLI/docs/decisions.md` → "Local-first deployment (2026-07-30)". **This is a deployment change, not an architecture change** — no edits to `app/` or `sql/`; §3b and the one-engine invariant hold verbatim.
+
+**Ops home:** [deploy/local/README.md](../deploy/local/README.md) (procedures, launchd templates, backup/restore) · [deploy/cloud/README.md](../deploy/cloud/README.md) (mothball + iOS-day reactivation).
+
+1. **11.1 — Postgres:** Homebrew install, service running, engine database + role created.
+2. **11.2 — Auth stand-in:** minimal `auth` schema (`auth.users` with the owner's existing `user_id`, `auth.uid()` stub) so `sql/005`/`sql/006` apply cleanly; PAT auth unchanged. Final SQL committed to `deploy/local/`.
+3. **11.3 — Schema + data:** run `sql/001`→`017`; `pg_dump` Supabase (direct connection) → restore local; row counts verified against the cloud ledger.
+4. **11.4 — Engine as a service:** `.env` per `app/config.py` (direct-connection pool sizing), uvicorn under launchd, survives reboot.
+5. **11.5 — FX:** daily launchd fetch task verified (`GET /v1/exchange-rates?target=PEN&base=USD` returns today), then the historical backfill (TODO.md) + home-currency recalc so PEN/USD history is accurate.
+6. **11.6 — Backups:** nightly `pg_dump` → iCloud Drive, 30-copy rotation, one restore drill passed before the step closes.
+7. **11.7 — Cutover:** CLI verification gate against an isolated config (ping → full sync → contract suite at `http://127.0.0.1:8000`), then repoint the real `~/.expense-config`. Mothball the cloud per `deploy/cloud/README.md`.
+
+**Verify (step gate):** a full day of real use — capture, dashboard, monthly report — with every command instant, plus one nightly backup and one FX fetch confirmed in the logs.
+
+**Docs to flip when this ships (not before):** engine CLAUDE.md hosting lines · `docs/api-design-principles.md` Database/Engine/Auth paragraphs · `docs/engine-spec.md` base URL · CLI repo: `cli-runtime.md` "Working against the live engine", `cli-spec.md` `engine_url` example, CLAUDE.md "hits the production engine" wording, and the `roadmap.md` header line naming the onrender URL. (Historical mentions — dated status lines, `polish-backlog.md`'s cold-start rationale — stay per the absolute-dates rule.)
 
 ---
 

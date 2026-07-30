@@ -4,6 +4,8 @@ Operational / deployment tasks that are not part of normal code review. Each ent
 
 ## Wire up the Render Cron Job for daily exchange-rate fetching
 
+> **Status (2026-07-30): superseded by the local deployment** ([docs/roadmap.md](docs/roadmap.md) Step 11.5) — the same job runs as a daily launchd task on the owner's Mac ([deploy/local/README.md](deploy/local/README.md)), no billing required. The Render steps below are **retained deliberately**: they become live again on cloud reactivation ([deploy/cloud/README.md](deploy/cloud/README.md) step 5).
+
 **What:** Create a new Render Cron Job service that runs `python -m app.jobs.fetch_exchange_rates` daily.
 
 **Why:** Without it, no rows are ever written to the `exchange_rates` table. Any write that needs a cross-currency conversion (`POST /transactions`, `PUT /transactions/{id}` with a date change, `POST /transactions/batch`, `POST /inbox`, `PUT /inbox/{id}` with a date change) now fails with `422 RATE_UNAVAILABLE`. Same-currency writes still succeed (identity rate short-circuit in `get_rate`), so a single-currency user is unaffected.
@@ -43,9 +45,9 @@ Should return the rate just inserted, not 404.
 
 **Owner:** User (PlungerBull) will handle this directly against the database — not via engine code.
 
-**When:** at the very end of engine work, after all of Step 9 (Parts A + B) and Step 9.1 ship, and immediately before moving on to the CLI repo. This is the last cleanup task for the engine.
+**When:** ~~at the very end of engine work~~ **Updated 2026-07-30:** folded into local-deployment Step 11.5 ([docs/roadmap.md](docs/roadmap.md)) — runs right after the data migration and daily-fetch verification, followed by a home-currency recalc, so PEN/USD history converts at true point-in-time rates. Easier now: the target database is local Postgres, no pooler in the way.
 
-**Reference:** Frankfurter supports per-date queries — `https://api.frankfurter.app/YYYY-MM-DD?from=USD&to=PEN` returns the closing rate for that specific date. Any backfill script or manual run should use this and insert rows canonically as `(base_currency='USD', target_currency=<X>, rate_date=<date>, rate=<rate>)`, matching the daily cron's format.
+**Reference (provider corrected 2026-07-30):** Frankfurter **cannot** serve this — it carries ECB reference rates only, and the ECB list has no PEN (discovered when the daily job first ran for real; the 15 pre-existing `rate=3.75` rows turned out to be hand-inserted placeholders, ~10% off market, and were deleted). The provider is now **fawazahmed0/currency-api** (keyless, CDN-hosted), which the daily job uses via `app.jobs.fetch_exchange_rates`. It supports dated queries for backfill — `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@YYYY-MM-DD/v1/currencies/usd.min.json` returns all USD rates for that date (lowercase codes) — and `_fetch_currency_api(version="YYYY-MM-DD")` in the job module already wraps this. Insert rows canonically as `(base_currency='USD', target_currency=<X>, rate_date=<date>, rate=<rate>)`, matching the daily job's format. **Run the backfill before importing historical spreadsheet data** — cross-currency writes for dates without rates fail with `422 RATE_UNAVAILABLE` by design.
 
 ---
 

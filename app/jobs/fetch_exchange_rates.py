@@ -1,6 +1,11 @@
-"""Daily Frankfurter fetcher for the exchange_rates table.
+"""Daily exchange-rate fetcher for the exchange_rates table.
 
-Runs as a Render Cron Job (or manually via `python -m app.jobs.fetch_exchange_rates`).
+Runs as a scheduled job (or manually via `python -m app.jobs.fetch_exchange_rates`).
+
+Provider: fawazahmed0/currency-api (keyless, CDN-hosted, ~200 currencies incl. PEN,
+and date-versioned endpoints for historical backfill). Frankfurter, the original
+provider, was dropped 2026-07-30: it serves ECB reference rates only, and the ECB
+list does not include PEN — `to=PEN` can never resolve there.
 
 Storage is canonical USD-based: one row per non-USD currency per day, stored as
 `(base_currency='USD', target_currency=<X>, rate = units of X per 1 USD)`. Directional
@@ -8,16 +13,15 @@ math (invert) lives in `app.helpers.exchange_rate.get_rate`, so the fetcher only
 needs to insert USD→X rows here.
 
 The target list is derived from every non-USD currency currently referenced by an
-active bank account or any user's main_currency. A single Frankfurter call
-(`/latest?from=USD&to=<comma-separated>`) covers all of them. Upserts are idempotent
-on the `(base_currency, target_currency, rate_date)` unique constraint — safe to
-re-run the job at any time.
+active bank account or any user's main_currency. A single call (`@latest` returns all
+currencies against USD) covers all of them. Upserts are idempotent on the
+`(base_currency, target_currency, rate_date)` unique constraint — safe to re-run the
+job at any time.
 """
 import asyncio
 import json
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import date, datetime
 
@@ -25,7 +29,9 @@ import asyncpg
 
 from app.config import settings
 
-FRANKFURTER_URL = "https://api.frankfurter.app/latest"
+CURRENCY_API_URL = (
+    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{version}/v1/currencies/usd.min.json"
+)
 HTTP_TIMEOUT_SECONDS = 30
 
 
@@ -49,15 +55,21 @@ async def _fetch_target_currencies(conn: asyncpg.Connection) -> list[str]:
     return sorted({row["code"] for row in rows})
 
 
-def _fetch_frankfurter(targets: list[str]) -> dict:
-    """Call Frankfurter /latest?from=USD&to=<targets>.
+def _fetch_currency_api(version: str = "latest") -> dict:
+    """Call currency-api for all USD rates; `version` is 'latest' or 'YYYY-MM-DD'.
 
-    Response shape: {"amount": 1.0, "base": "USD", "date": "2026-04-10", "rates": {"PEN": 3.75, ...}}
+    Raw shape: {"date": "2026-07-30", "usd": {"pen": 3.39, "eur": 0.87, ...}} (codes
+    lowercase). Normalized here to the shape the caller consumes — {"date": ...,
+    "rates": {"PEN": 3.39, ...}} — so the provider swap stays inside this function.
     """
-    params = urllib.parse.urlencode({"from": "USD", "to": ",".join(targets)})
-    url = f"{FRANKFURTER_URL}?{params}"
-    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-        return json.loads(resp.read())
+    url = CURRENCY_API_URL.format(version=version)
+    req = urllib.request.Request(url, headers={"User-Agent": "expense-world-engine/1.0"})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+        raw = json.loads(resp.read())
+    return {
+        "date": raw["date"],
+        "rates": {code.upper(): rate for code, rate in raw.get("usd", {}).items()},
+    }
 
 
 async def _upsert_rate(
@@ -100,7 +112,7 @@ async def run() -> int:
             print(f"[fetch_exchange_rates] fetching USD -> {targets}")
 
             try:
-                resp = _fetch_frankfurter(targets)
+                resp = _fetch_currency_api()
             except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
                 print(f"[fetch_exchange_rates] HTTP error: {exc}", file=sys.stderr)
                 return 2

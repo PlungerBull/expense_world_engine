@@ -123,7 +123,7 @@ exchange_rates
   - UNIQUE (base_currency, target_currency, rate_date)
 ```
 
-**Rate source:** Frankfurter.app — free, no API key required, uses ECB rates. Endpoint: `https://api.frankfurter.app/latest?from=USD&to=PEN`. Sufficient for Phase 1.
+**Rate source:** fawazahmed0/currency-api — free, no API key, CDN-hosted, ~200 currencies, dated endpoints for backfill. Endpoint: `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.min.json`. *(Originally Frankfurter.app; replaced 2026-07-30 — Frankfurter serves ECB reference rates only and the ECB list has no PEN.)*
 
 **Fetch schedule:** A daily background job fetches the previous day's closing rate every morning and inserts one row per currency pair. Clients never write to this table.
 
@@ -619,7 +619,7 @@ Each rate was locked when the transaction was entered. The total reflects what y
 
 ### Exchange rate lifecycle
 
-1. Daily job fetches the closing rate from Frankfurter.app and inserts a row into `exchange_rates`.
+1. Daily job fetches the closing rate from currency-api (fawazahmed0) and inserts a row into `exchange_rates`.
 2. When a single-account transaction is created, the engine looks up the rate for that transaction's date. If no rate exists for that exact date, it falls back to the most recent available rate.
 3. The rate is written to `exchange_rate` on the transaction and `amount_home_cents` is computed and cached.
 4. The rate is now **locked**. It never changes unless the transaction date changes.
@@ -659,7 +659,7 @@ If the user changes `main_currency` (rare), the engine triggers a background job
 | Question | Decision |
 |---|---|
 | Store amounts | Native currency, always positive cents |
-| Rate source | Frankfurter.app, fetched daily |
+| Rate source | currency-api (fawazahmed0), fetched daily |
 | Missing rate | Most recent available rate |
 | Rate locked | At entry time, per transaction |
 | Rate overridable | Yes — user enters actual rate received |

@@ -139,7 +139,7 @@ The goal is a high-performance, minimalist expense tracker with a headless archi
 Four repositories, one managed database. Each has a single, clear role.
 
 **`expense_world_engine` — The Brain**
-Python (FastAPI) + Supabase. Single source of truth. Handles all database connections, all business logic (categorisation, balance updates, sync processing), and exposes the API that all clients consume. Hosted on Render. Never replaced — only evolved.
+Python (FastAPI) + Postgres. Single source of truth. Handles all database connections, all business logic (categorisation, balance updates, sync processing), and exposes the API that all clients consume. Hosted per deployment profile (`deploy/` — local since 2026-07-30, Render/Supabase on cloud reactivation). Never replaced — only evolved.
 
 **`expense_world_cli` — The Hands**
 Python (Typer). Developer-facing terminal interface. Talks to the engine via the API. Holds a local SQLite replica built from `GET /sync` (see §3b) so interactive reads are instant and work offline; writes go directly to the engine over HTTPS with idempotency keys. Supports an explicit stateless mode (`--no-cache` / `EXPENSE_STATELESS=1`) that bypasses the replica for scripting, CSV imports, and CI contexts. The primary tool for verifying backend behaviour during development. Built before the web dashboard.
@@ -156,13 +156,17 @@ Swift / SwiftUI. Minimalist mobile interface. Has no knowledge of the database o
 
 ## Infrastructure Stack
 
-**Database:** Supabase (managed Postgres). Single source of truth for all persistent data. Row-Level Security (RLS) enabled on all tables: `auth.uid() = user_id`. Even if someone bypasses the engine, they can only access their own rows.
+The stack is defined per **deployment profile** (`deploy/` in the engine repo). Since 2026-07-30 the active profile is **local** — single user, single machine; the cloud profile is mothballed until a second client (iOS/web) needs an always-reachable engine. The profile choice changes *where* things run, never *what* runs: same engine, same schema, same contracts. Decision record: `expense_world_CLI/docs/decisions.md` → "Local-first deployment (2026-07-30)".
 
-**Engine:** Python FastAPI on Render. Stateless — all state lives in Supabase. Deployment, restarts, and scaling are straightforward.
+**Database:** Postgres. Single source of truth for all persistent data. Row-Level Security (RLS) policies (`auth.uid() = user_id`) ship in the schema on all tables. Active profile: Homebrew Postgres 17 on the owner's Mac (RLS inert under the owner connection — defense-in-depth for direct-DB access paths that don't exist locally). Cloud profile: Supabase (managed Postgres), where RLS is live protection.
 
-**Configuration:** All credentials via environment variables. No hardcoded secrets. Same codebase points to local, staging, or production by swapping one variable.
+**Engine:** Python FastAPI. Stateless — all state lives in Postgres. Active profile: launchd service on `127.0.0.1:8000`. Cloud profile: Render (or any host).
 
-**Edge performance:** If latency from Lima is a concern, Fly.io allows deploying in Santiago or São Paulo for sub-50ms response times to Peruvian clients.
+**Configuration:** All credentials via environment variables. No hardcoded secrets. Same codebase points to local or cloud by swapping the `SUPABASE_DB_URL`/`SUPABASE_URL`/`SUPABASE_JWT_SECRET` variables — this is precisely what makes deployment a profile, not a fork.
+
+**Durability (local profile):** nightly `pg_dump` to iCloud Drive with rotation + periodic restore drills (`deploy/local/README.md`). With one machine, the backup replaces everything a managed cloud database provides for free — it is a correctness requirement, not an ops nicety.
+
+**Edge performance:** moot in the local profile (reads are replica-backed, writes are loopback). If cloud latency from Lima is ever a concern post-reactivation, Fly.io allows deploying in Santiago or São Paulo for sub-50ms response times to Peruvian clients.
 
 ---
 
@@ -180,15 +184,17 @@ FastAPI generates an OpenAPI spec automatically from the engine's route definiti
 
 ## Authentication Strategy
 
-Authentication is fully delegated to Supabase Auth. The engine never sees, stores, or manages passwords. It only verifies tokens.
+Password/OAuth authentication is delegated to Supabase Auth (cloud profile). The engine never sees, stores, or manages passwords. It only verifies tokens.
 
-**Token validation:** Every request must carry a JWT as `Authorization: Bearer <token>`. The engine verifies the signature using the Supabase JWT secret, rejects expired or tampered tokens (401), and extracts `user_id` from the verified payload. That `user_id` is passed into all downstream functions.
+**Token validation:** Every request must carry `Authorization: Bearer <token>` — either a Supabase JWT (verified by signature, `user_id` from the `sub` claim) or an engine-issued PAT (`ewe_pat_` prefix, SHA-256 lookup in `personal_access_tokens`). That `user_id` is passed into all downstream functions.
 
-**iOS:** Sign in with Apple and Sign in with Google, configured via Supabase Auth. Deep-link redirect URLs registered so the OAuth flow returns the user to the app with a valid session.
+**Local profile:** PAT-only in practice — PATs are engine-native (validated against the engine's own table), so the local deployment needs no auth provider at all; a minimal `auth` schema stand-in (`deploy/local/000_auth_standin.sql`) satisfies the schema's references. JWT bootstrap returns with Supabase on cloud reactivation.
 
-**CLI:** Personal Access Token (PAT) — a long-lived token generated once from the web dashboard, stored in `~/.expense-config`. From the engine's perspective, a PAT and an iOS JWT are identical — both validated the same way.
+**iOS (cloud profile):** Sign in with Apple and Sign in with Google, configured via Supabase Auth. Deep-link redirect URLs registered so the OAuth flow returns the user to the app with a valid session.
 
-**RLS as the final failsafe:** Supabase Row-Level Security (`auth.uid() = user_id`) is the last line of defence. No application-level bug can expose another user's financial data. Enforced at the database level automatically.
+**CLI:** Personal Access Token (PAT) — long-lived, stored in `~/.expense-config`. From the engine's perspective, a PAT and an iOS JWT are identical — both resolve to the same AuthUser.
+
+**RLS as the final failsafe (cloud profile):** Row-Level Security (`auth.uid() = user_id`) is the last line of defence against direct-DB access. No application-level bug can expose another user's financial data. In the local profile the engine connects as table owner and RLS is inert — the threat it guards against (other tenants, direct DB exposure) doesn't exist on a single-user machine.
 
 ---
 
