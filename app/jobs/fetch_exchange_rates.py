@@ -24,6 +24,7 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import date, datetime
+from typing import Optional
 
 import asyncpg
 
@@ -33,6 +34,45 @@ CURRENCY_API_URL = (
     "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{version}/v1/currencies/usd.min.json"
 )
 HTTP_TIMEOUT_SECONDS = 30
+
+# Wait-for-postgres budget, matched to deploy/local/backup.sh's `pg_isready`
+# loop: 30 tries, 2s apart. Far beyond a normal local start.
+DB_CONNECT_TRIES = 30
+DB_CONNECT_WAIT_SECONDS = 2
+
+
+async def _create_pool_waiting_for_db() -> Optional[asyncpg.Pool]:
+    """Create the pool, retrying while postgres is still coming up.
+
+    Under the local profile this job runs from launchd with `RunAtLoad`, which
+    starts it in parallel with Homebrew's postgres service — launchd has no
+    notion of one agent depending on another, so at login the first connect can
+    land before the socket exists. The engine survives that because `KeepAlive`
+    makes launchd relaunch it until postgres answers; this job has no such
+    safety net, so an unhandled ConnectionRefusedError meant exit 1 and no rate
+    until the next 6-hourly fire — and every cross-currency write 422s in the
+    meantime. Wait for postgres instead of racing it.
+
+    Only connect-time transients are retried: refused/unreachable socket
+    (OSError) and "the database system is starting up" (CannotConnectNowError,
+    the window where postgres listens but is still in recovery). A real fault —
+    missing database, bad credentials — still fails on the first try.
+    """
+    for attempt in range(1, DB_CONNECT_TRIES + 1):
+        try:
+            return await asyncpg.create_pool(settings.supabase_db_url)
+        except (OSError, asyncpg.exceptions.CannotConnectNowError) as exc:
+            if attempt == DB_CONNECT_TRIES:
+                print(
+                    f"[fetch_exchange_rates] postgres not up after "
+                    f"{DB_CONNECT_TRIES * DB_CONNECT_WAIT_SECONDS}s: {exc}",
+                    file=sys.stderr,
+                )
+                return None
+            if attempt == 1:
+                print("[fetch_exchange_rates] postgres not up yet — waiting for it")
+            await asyncio.sleep(DB_CONNECT_WAIT_SECONDS)
+    return None
 
 
 async def _fetch_target_currencies(conn: asyncpg.Connection) -> list[str]:
@@ -93,7 +133,7 @@ async def _upsert_rate(
 
 
 async def run() -> int:
-    pool = await asyncpg.create_pool(settings.supabase_db_url)
+    pool = await _create_pool_waiting_for_db()
     if pool is None:
         print("[fetch_exchange_rates] failed to create DB pool", file=sys.stderr)
         return 1
