@@ -1,7 +1,16 @@
 """Shared fixtures for integration tests.
 
-Tests run against the real Supabase dev database. Auth is bypassed via FastAPI
+Tests run against a DEDICATED database (`expense_world_test`), never the one
+holding the real ledger. Create it with `deploy/local/create-test-db.sh`, and
+re-run that with --force after any schema change. Auth is bypassed via FastAPI
 dependency override — no real JWT required.
+
+Until 2026-07-31 the suite ran against `expense_world` itself. The fixtures
+below insert and delete rows, and the exchange_rates seed in _ensure_test_data
+is global (no user_id column to scope cleanup by), so a test run could leave a
+synthetic USD->PEN rate in the ledger that the daily fetch job could never
+correct afterwards — ON CONFLICT DO NOTHING means the first writer wins for
+that date. Pointing the suite elsewhere removes that whole class of hazard.
 
 All tests and async fixtures share one session-scoped event loop (see
 pytest.ini), so the connection pool is created once per session instead of
@@ -10,15 +19,46 @@ per test.
 import os
 import uuid
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.config import settings
-from app.deps import AuthUser, get_current_user
-from app.main import app
-from app import db
+# Databases this suite is permitted to touch. An allowlist rather than a
+# denylist: a new database name is untrusted by default, which is the safe way
+# round when the cost of being wrong is a mangled ledger.
+_TEST_DB_ALLOWLIST = frozenset({"expense_world_test"})
+
+# Socket-style URL — no host, no username baked in, so it works on any machine
+# with the database present. app/config.py treats an empty hostname as local by
+# construction, so its non-local-host guard is satisfied too.
+_DEFAULT_TEST_DB_URL = "postgresql:///expense_world_test"
+
+# Set BEFORE app.config is imported: Settings() reads the environment at import
+# time, and an env var takes precedence over the .env file that points at the
+# real ledger. TEST_DATABASE_URL overrides, for CI or a second checkout.
+os.environ["SUPABASE_DB_URL"] = os.environ.get("TEST_DATABASE_URL", _DEFAULT_TEST_DB_URL)
+
+from app.config import settings  # noqa: E402  (must follow the env write above)
+from app.deps import AuthUser, get_current_user  # noqa: E402
+from app.main import app  # noqa: E402
+from app import db  # noqa: E402
+
+# Fail closed. The env write above is the mechanism; this is the guarantee. A
+# stray SUPABASE_DB_URL in the environment, a future refactor that moves the
+# import order, or a typo'd TEST_DATABASE_URL all land here and abort the run
+# instead of quietly deleting real rows. Mirrors the non-local-host guard in
+# app/config.py — same reasoning, one level narrower.
+_TARGET_DB = urlparse(settings.supabase_db_url).path.lstrip("/")
+if _TARGET_DB not in _TEST_DB_ALLOWLIST:
+    raise RuntimeError(
+        f"Refusing to run the test suite against database {_TARGET_DB!r}. "
+        f"These fixtures insert and delete rows, so they may only target "
+        f"{', '.join(sorted(_TEST_DB_ALLOWLIST))}. Create it with "
+        f"deploy/local/create-test-db.sh, and unset any SUPABASE_DB_URL / "
+        f"TEST_DATABASE_URL override pointing elsewhere."
+    )
 
 
 TEST_USER_ID = str(uuid.uuid4())
@@ -101,7 +141,7 @@ async def _ensure_test_data(conn, data: TestData):
         # Seed exchange rate so get_rate(PEN, USD, ...) works in recalc tests
         await conn.execute(
             """INSERT INTO exchange_rates (base_currency, target_currency, rate, rate_date, created_at)
-               VALUES ('USD', 'PEN', 3.75, CURRENT_DATE, now())
+               VALUES ('USD', 'PEN', 3.4, CURRENT_DATE, now())
                ON CONFLICT (base_currency, target_currency, rate_date) DO NOTHING""",
         )
 
@@ -145,11 +185,10 @@ async def db_pool(test_data):
     `async with db.pool.acquire()` — pool.close() at teardown waits on
     outstanding connections.
     """
-    # .env points at the Supavisor session-mode pooler (port 5432), where
-    # every pool slot pins a real backend connection. The prod sizing
-    # (5..50 per process) targets the transaction pooler; 4 xdist workers
-    # at that size exhaust the project's backend pool cap. Tests never run
-    # more than 2 requests concurrently per worker, so a tiny pool suffices.
+    # Every pool slot pins a real backend connection on a direct local
+    # connection, and 4 xdist workers at the configured size would eat most of
+    # Postgres's max_connections. Tests never run more than 2 requests
+    # concurrently per worker, so a tiny pool suffices.
     settings.db_pool_min_size = 1
     settings.db_pool_max_size = 3
     await db.connect()
