@@ -37,7 +37,26 @@ Should return the rate just inserted, not 404.
 
 ---
 
-## Backfill historical exchange rates (manual, user-owned)
+## Backfill historical exchange rates (manual, user-owned) — ✅ DONE 2026-07-31
+
+> **Shipped as a job, not a one-off:** `app/jobs/backfill_exchange_rates.py`.
+> `python -m app.jobs.backfill_exchange_rates --from 2024-03-02` inserted 881
+> daily USD→PEN rows spanning 2024-03-02 → 2026-07-31. Idempotent and resumable
+> — it skips dates already present before making any HTTP call, so re-run it
+> freely to widen the range. Spot-checked against the provider at full 8dp
+> precision; no day-over-day move above 5% in the whole series.
+>
+> **Two findings worth keeping:**
+> 1. **You need far less history than it looks.** `get_rate` resolves with
+>    `rate_date <= $1 ORDER BY rate_date DESC LIMIT 1` — it carries the last
+>    earlier rate forward. So the hard requirement is *one row on or before your
+>    earliest transaction date*; denser coverage buys accuracy, not availability.
+>    Weekends and holidays need no handling at all.
+> 2. **The provider floor is 2024-03-02.** Every earlier date 404s, including
+>    the legacy `@1/<date>/` path (verified 2026-07-31). The job refuses earlier
+>    `--from` values rather than leaving a silent hole. Pre-March-2024 history
+>    needs a different source. One genuine gap exists inside the range —
+>    2025-12-10, absent from the provider's dataset — which carry-back covers.
 
 **What:** Populate `exchange_rates` with per-date rows going back to the earliest transaction date in the system, so historical transactions can be re-converted with accurate point-in-time rates.
 

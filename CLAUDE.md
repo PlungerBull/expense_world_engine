@@ -20,6 +20,7 @@ The Brain. A Python (FastAPI) backend, backed by Postgres. It is the single sour
 - **Language:** Python
 - **Framework:** FastAPI
 - **Database:** Postgres (local profile: Homebrew 17 on the owner's Mac; cloud profile: Supabase). RLS policies ship in the schema (`auth.uid() = user_id`); live protection in the cloud profile, inert under the local owner connection.
+- **Tests:** `pytest` (no flags, no env) against a dedicated `expense_world_test` database — never the ledger. Create it with `deploy/local/create-test-db.sh`, re-run with `--force` after a schema change. `tests/conftest.py` fails closed if pointed anywhere else.
 - **Auth:** Bearer tokens — engine-issued PATs (local profile uses these exclusively) or Supabase Auth JWTs (cloud profile). Engine validates, extracts `user_id`, never stores passwords.
 - **Hosting:** per deployment profile (`deploy/`) — local launchd service now; Render on cloud reactivation. Stateless either way — all state lives in Postgres.
 
@@ -103,3 +104,6 @@ All errors use this exact shape — no deviations:
 | `audit-business-logic` | Scans the codebase and checks every endpoint/service against `engine-spec.md` |
 | `audit-coding-patterns` | Checks cross-cutting concerns (error format, null-over-omission, auth, idempotency, etc.) against `api-design-principles.md` |
 | `audit-bloat` | Finds dead code, unused imports, redundant logic, and unused dependencies |
+| `audit-doc-drift` | Compares `engine-spec.md` against the implementation in both directions — planned gaps, undocumented behavior, divergences |
+| `audit-schema-drift` | Compares `schema-reference.md` against the SQL migrations in `sql/` — undocumented tables/columns, type and constraint mismatches |
+| `tech-consultant` | Second opinion on a proposal or plan from another AI agent — skeptical by default, checks it against this project's design principles |

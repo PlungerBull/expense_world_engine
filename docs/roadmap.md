@@ -1,7 +1,7 @@
 # Expense Tracker — Build Roadmap
 
 > Build order: Engine → CLI → Web Dashboard → iOS. Nothing exists for any client until it is defined and working in the engine first.
-> Full specs: `engine-spec.md` · `cli-spec.md` · `ios-spec.md`
+> Full specs: `engine-spec.md` (this repo) · `cli-spec.md` (sibling repo, `expense_world_CLI/docs/`) · `ios-spec.md` (not yet written — the `expense_world_ios` repo does not exist as of 2026-07-30)
 
 ---
 
@@ -22,7 +22,7 @@ Everything you need before writing a single line of code.
 **Local setup:**
 - Clone `expense_world_engine` locally
 - Create a Python virtual environment inside it
-- Install FastAPI, Uvicorn, SQLAlchemy (or asyncpg), python-jose (JWT), Typer as starters
+- Install FastAPI, Uvicorn, python-jose (JWT), and a Postgres driver as starters. *(Resolved: **asyncpg**, used directly with hand-written SQL — no ORM. SQLAlchemy was listed as an option here and pinned in `requirements.txt` for a while but was never imported; it was dropped 2026-07-30. Test deps live in `requirements-dev.txt`.)*
 
 **Connect GitHub from day one.** Every step below ends with a commit and push. Small, frequent commits — one per logical unit of work.
 
@@ -224,7 +224,7 @@ Split into **Part A** (read-side endpoints + exchange rates) and **Part B** (syn
 - Call `GET /v1/reports/monthly?from_year=2025&from_month=11&to_year=2026&to_month=4` and confirm 6 months returned in order.
 - Create a cross-currency transfer (3750 PEN → 1000 USD with `main_currency = PEN`). Call `GET /v1/dashboard`. Confirm both legs have `amount_home_cents = 375000` (PEN cents) and that `totals.net_home_cents` is unchanged by the transfer.
 
-### Step 9 Part B — Sync 🔨 In Progress
+### Step 9 Part B — Sync ✅ Shipped
 
 Design validated against Todoist Sync API v9, YNAB delta requests, Contentful CDA, Lunch Money, TickTick, and Things Cloud. See `docs/api-design-principles.md §3` for the full sync model and `docs/engine-spec.md §Sync` for the wire contract.
 
@@ -241,7 +241,7 @@ Design validated against Todoist Sync API v9, YNAB delta requests, Contentful CD
 
 *Deliverable: changing `main_currency` in settings recalculates all home-currency amounts, idempotently and in batches, via a first-class job.*
 
-**Implementation:** `app/helpers/recalculate_home_currency.py`, wired into `PUT /auth/settings` in `app/routers/auth.py`. Three passes: (1) regular transactions — `get_rate` lookup + recompute, (2) transfer pairs — dominant-side rule reapplication for zero-sum, (3) pending inbox items — `exchange_rate` refresh. Synchronous inside the settings request (Phase 1). Every updated row bumps `version + updated_at` for sync. Single `activity_log` entry includes recalc summary. 6 integration tests in `tests/test_home_currency_recalc.py`. *(commit `003c204`)*
+**Implementation:** `app/helpers/recalculate_home_currency.py`, wired into `PUT /auth/settings` in `app/routers/auth.py`. Three passes: (1) regular transactions — `get_rate` lookup + recompute, (2) transfer pairs — dominant-side rule reapplication for zero-sum, (3) pending inbox items — `exchange_rate` refresh. Synchronous inside the settings request (Phase 1). Every updated row bumps `version + updated_at` for sync. Single `activity_log` entry includes recalc summary. 9 integration tests in `tests/test_home_currency_recalc.py`. *(commit `003c204`)*
 
 Depends on: Step 6 (transactions exist), Step 9 Part A (historical exchange rates available, background job infrastructure in place).
 
@@ -273,6 +273,32 @@ When `PUT /auth/settings` detects that `main_currency` has actually changed (old
 - Create a cross-currency transfer in PEN main. Switch to USD main. Confirm the transfer still nets to zero in the new home currency.
 
 **Commit:** `feat: home currency recalculation on main_currency change`
+
+---
+
+## Step 9.2 — Personal Access Tokens (CLI auth) ✅ Shipped
+
+*Deliverable: long-lived engine-issued tokens so clients that can't do interactive JWT refresh (CLI, scripts, cron) can authenticate.*
+
+**Implementation:** `sql/016_personal_access_tokens.sql` adds the `personal_access_tokens` table (SHA-256 hash, cleartext `token_prefix` for display, nullable `name`, `revoked_at` soft-delete). `app/helpers/auth_token.py` owns the `ewe_pat_` prefix and hashing; `app/helpers/pat.py` exposes `create` / `revoke`; routes in `app/routers/pat.py` (`POST /auth/pat`, `DELETE /auth/pat/{pat_id}`), schemas in `app/schemas/pat.py`. Token resolution is unified in `app/deps.py` — a bearer token starting with `ewe_pat_` is looked up by hash, anything else is parsed as a Supabase JWT, and both resolve to the same `AuthUser`, so no downstream code knows which was used. Plaintext is returned exactly once at mint time. 11 integration tests in `tests/test_pat.py`. *(commit `3f729b2`)*
+
+Depends on: Step 3 (auth middleware). Unblocks: the CLI, which authenticates exclusively via PAT — and under the local profile (Step 11) this becomes the *only* auth path, since no JWT provider runs locally.
+
+**Deliberately not shipped:** `GET /auth/pat` (list) — deferred until a web dashboard needs a management UI. `last_used_at` tracking — dropped to avoid a per-request DB write on every authenticated call. Both recorded in `engine-spec.md §Auth`.
+
+---
+
+## Step 9.3 — Profile Mutation ✅ Shipped
+
+*Deliverable: `PUT /auth/profile` — the single post-bootstrap path for changing identity fields on the `users` row.*
+
+**Implementation:** `ProfileUpdateRequest` in `app/schemas/auth.py`, route in `app/routers/auth.py`, `update_profile` in `app/helpers/auth.py`. No SQL migration — it writes existing `users` columns.
+
+**Why it exists:** `POST /auth/bootstrap` sets `display_name` only on the first call and never overwrites it on later logins, and `PUT /auth/settings` mutates `user_settings`, not `users` — so before this step there was no way to rename yourself after bootstrap. Mutable in v1: `display_name` only. `id`, `email`, and `last_login_at` are returned for context but read-only (`email` lives in Supabase Auth; `last_login_at` is owned by the bootstrap flow and is explicitly preserved so this endpoint can't masquerade as a login event).
+
+Unlike `PUT /auth/settings` (8 fields, empty-body-as-fetch), an empty body here is a client bug and fails fast with `422`; explicit `"display_name": null` is also `422` — clearing the name isn't in v1 scope. Forward-compatible: future identity fields (e.g. `avatar_url`) drop into the request schema without touching the route or helper. 7 integration tests in `tests/test_auth_profile.py`. *(commit `7017615`)*
+
+Depends on: Step 3 (bootstrap + `users` row).
 
 ---
 
@@ -342,7 +368,9 @@ expense_world_ios      → later, maybe never needed
 
 ## Step 10 — Engine Complete → Start CLI
 
-**Engine is feature-complete.** All endpoints (Steps 0–9.1) are implemented, documented, and tested (26 sync + 6 recalc integration tests). Two operational tasks remain before full production readiness — see [TODO.md](../TODO.md): (1) wire up the Render Cron Job for daily exchange-rate fetching, (2) backfill historical exchange rates.
+**Engine is feature-complete.** All endpoints (Steps 0–9.4) are implemented, documented, and tested — 171 integration tests across 20 files, run in parallel via pytest-xdist (`pip install -r requirements-dev.txt`). Full suite runs in ~1s against local Postgres; it took ~4 min against the Supabase pooler before Step 11.
+
+One operational task remains — see [TODO.md](../TODO.md): backfill historical exchange rates (user-owned, run against the local database). The daily exchange-rate fetch is **no longer outstanding**: it was never wired on Render (paid-only cron), and Step 11 ships it as a launchd task instead.
 
 Next: write the `expense_world_cli` spec (fill in `cli-spec.md`) and start building CLI commands against the live engine.
 
@@ -360,13 +388,21 @@ Next: write the `expense_world_cli` spec (fill in `cli-spec.md`) and start build
 2. **11.2 — Auth stand-in:** minimal `auth` schema (`auth.users` with the owner's existing `user_id`, `auth.uid()` stub) so `sql/005`/`sql/006` apply cleanly; PAT auth unchanged. Final SQL committed to `deploy/local/`.
 3. **11.3 — Schema + data:** run `sql/001`→`017`; `pg_dump` Supabase (direct connection) → restore local; row counts verified against the cloud ledger.
 4. **11.4 — Engine as a service:** `.env` per `app/config.py` (direct-connection pool sizing), uvicorn under launchd, survives reboot.
-5. **11.5 — FX:** daily launchd fetch task verified (`GET /v1/exchange-rates?target=PEN&base=USD` returns today), then the historical backfill (TODO.md) + home-currency recalc so PEN/USD history is accurate.
-6. **11.6 — Backups:** nightly `pg_dump` → iCloud Drive, 30-copy rotation, one restore drill passed before the step closes.
+5. **11.5 — FX:** daily launchd fetch task verified (`GET /v1/exchange-rates?target=PEN&base=USD` returns today), then the historical backfill + home-currency recalc so PEN/USD history is accurate. ✅ **Closed 2026-07-31:** backfill shipped as `app/jobs/backfill_exchange_rates.py` and run for 2024-03-02 → today (881 daily USD→PEN rows; provider has no data before 2024-03-02). No recalc needed — the ledger was wiped clean the same day, so there was nothing to convert.
+6. **11.6 — Backups:** nightly `pg_dump` → **Google Drive** (via Drive for Desktop's local mount), 30-copy rotation, one restore drill passed before the step closes. *(iCloud Drive was the original target and is what earlier drafts of this line said. It fails **silently** under a launchd agent — new files can be created, but directory listing returns empty and existing files can't be modified, so rotation silently kept everything and the log append failed. Google Drive's mount has no such restriction and needs no Full Disk Access grant.)*
 7. **11.7 — Cutover:** CLI verification gate against an isolated config (ping → full sync → contract suite at `http://127.0.0.1:8000`), then repoint the real `~/.expense-config`. Mothball the cloud per `deploy/cloud/README.md`.
 
-**Verify (step gate):** a full day of real use — capture, dashboard, monthly report — with every command instant, plus one nightly backup and one FX fetch confirmed in the logs.
+8. **11.8 — Operational hardening (2026-07-31).** Four items found after the step was first called done:
+   - **Login race, both periodic agents.** `RunAtLoad` starts them in parallel with Homebrew's postgres service, so either could reach a socket that did not exist yet. `backup.sh` aborted under `set -e` (no dump that day); `fetch_exchange_rates` raised an unhandled `ConnectionRefusedError` (exit 1, no rate until the next 6-hourly fire, every cross-currency write 422ing until then). Both now wait up to 60s. Details: [deploy/local/README.md](../deploy/local/README.md) "The login race".
+   - **Test database separated.** The suite ran against the ledger database; `exchange_rates` has no `user_id`, so its seed row could not be cleaned up and would win the day against the real fetch. Now `expense_world_test`, with a fail-closed allowlist guard in `tests/conftest.py`. Setup: [deploy/local/create-test-db.sh](../deploy/local/create-test-db.sh).
+   - **Ledger wiped clean** to start fresh, keeping identity, PATs and `global_currencies`. Everything prior was contract-test residue.
+   - **Health check** — [deploy/local/healthcheck.sh](../deploy/local/healthcheck.sh) covers engine, database, agent exit codes, backup freshness and today's FX rate.
 
-**Docs to flip when this ships (not before):** engine CLAUDE.md hosting lines · `docs/api-design-principles.md` Database/Engine/Auth paragraphs · `docs/engine-spec.md` base URL · CLI repo: `cli-runtime.md` "Working against the live engine", `cli-spec.md` `engine_url` example, CLAUDE.md "hits the production engine" wording, and the `roadmap.md` header line naming the onrender URL. (Historical mentions — dated status lines, `polish-backlog.md`'s cold-start rationale — stay per the absolute-dates rule.)
+**Verify (step gate):** a full day of real use — capture, dashboard, monthly report — with every command instant, plus one nightly backup and one FX fetch confirmed in the logs. **Not yet met** — the ledger holds no real data. This is what actually closes Step 11.
+
+**Docs to flip when this ships — ✅ done for the engine repo (2026-07-30):** engine CLAUDE.md hosting lines · `docs/api-design-principles.md` Database/Engine/Auth paragraphs · `docs/engine-spec.md` base URL. All three are flipped; do not re-action.
+
+*CLI repo — verify separately if not already done:* `cli-runtime.md` "Working against the live engine", `cli-spec.md` `engine_url` example, CLAUDE.md "hits the production engine" wording, and the `roadmap.md` header line naming the onrender URL. (Historical mentions — dated status lines, `polish-backlog.md`'s cold-start rationale — stay per the absolute-dates rule.)
 
 ---
 
@@ -383,14 +419,14 @@ Next: write the `expense_world_cli` spec (fill in `cli-spec.md`) and start build
 
 ## Web Dashboard — Expand Later
 
-Once the CLI is stable and you've used the system for a while, the web dashboard can be expanded incrementally — add entry, add editing, add more views. By that point you'll know exactly what you actually want. Spec in `ios-spec.md` (serves as design reference for both web and iOS).
+Once the CLI is stable and you've used the system for a while, the web dashboard can be expanded incrementally — add entry, add editing, add more views. By that point you'll know exactly what you actually want. Design reference will live in `ios-spec.md` (unwritten — it is intended to serve both web and iOS; `docs/design-philosophy.md` is the only UX reference that exists today).
 
 **Before any client UI ships:** Configure Supabase Auth providers (Apple sign-in, Google sign-in) in the Supabase dashboard. Not needed during engine development — only when real users log in via a UI.
 
 ## iOS (Maybe)
 
-Begins after the web dashboard proves insufficient for mobile use. If the Next.js PWA on Vercel is good enough pinned to your home screen, iOS may never be needed. Spec in `ios-spec.md`.
+Begins after the web dashboard proves insufficient for mobile use. If the Next.js PWA on Vercel is good enough pinned to your home screen, iOS may never be needed. Spec in `ios-spec.md` — to be written if and when this phase begins.
 
 ---
 
-*Last updated: April 2026*
+*Last updated: 2026-07-31 (Step 11.8 — operational hardening: login-race fixes, test database separated, FX backfill, ledger reset)*
