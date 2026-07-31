@@ -39,7 +39,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="expense_world_engine",
-    version="0.1.0",
+    # Feature-complete engine (Steps 0-9.4). This version string is the one
+    # clients see in /openapi.json, so it is the API contract's version, not
+    # the deployment's — bump it when the wire format changes.
+    version="1.0.0",
     lifespan=lifespan,
 )
 

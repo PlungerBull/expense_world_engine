@@ -96,8 +96,8 @@ async def test_inbox_response_includes_home_cents_computed_from_rate(
 ):
     """Inbox responses include amount_home_cents = round(amount_cents *
     exchange_rate). For test_data.account_id (PEN), the seeded USD->PEN
-    rate is 3.75, so a 1000-cent expense at rate=3.75 produces a stored
-    amount_cents=1000 and amount_home_cents=3750.
+    rate is 3.4, so a 1000-cent expense at rate=3.4 produces a stored
+    amount_cents=1000 and amount_home_cents=3400.
     """
     inbox_id = str(uuid.uuid4())
     create_r = await client.post(
@@ -109,7 +109,7 @@ async def test_inbox_response_includes_home_cents_computed_from_rate(
             "date": "2026-04-12T12:00:00Z",
             "account_id": test_data.account_id,
             "category_id": test_data.category_id,
-            "exchange_rate": 3.75,
+            "exchange_rate": 3.4,
         },
         headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
@@ -118,8 +118,8 @@ async def test_inbox_response_includes_home_cents_computed_from_rate(
     try:
         body = create_r.json()
         assert body["amount_cents"] == 1000  # stored positive
-        assert body["amount_home_cents"] == 3750, (
-            f"Expected 1000 * 3.75 = 3750, got {body['amount_home_cents']}"
+        assert body["amount_home_cents"] == 3400, (
+            f"Expected 1000 * 3.4 = 3400, got {body['amount_home_cents']}"
         )
         # transfer fields absent → home variant is null, not missing.
         assert "transfer_amount_home_cents" in body
@@ -129,7 +129,7 @@ async def test_inbox_response_includes_home_cents_computed_from_rate(
         get_r = await client.get(f"/v1/inbox/{inbox_id}")
         assert get_r.status_code == 200
         get_body = get_r.json()
-        assert get_body["amount_home_cents"] == 3750
+        assert get_body["amount_home_cents"] == 3400
 
     finally:
         await _cleanup_inbox(inbox_id, test_data.user_id)

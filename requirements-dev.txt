@@ -1,0 +1,17 @@
+# Test/development dependencies. Runtime deps live in requirements.txt.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# Required to run the suite at all — pytest.ini sets `asyncio_mode = auto`
+# (pytest-asyncio) and `addopts = -n 4 --dist loadfile` (pytest-xdist), so a
+# runtime-only install cannot collect a single test. tests/conftest.py drives
+# the app through httpx's ASGITransport rather than a live server.
+#
+# Before running: tests execute against the database named by SUPABASE_DB_URL
+# and delete rows by user_id — see the shared test/ledger database hazard in
+# deploy/local/README.md.
+
+pytest==8.4.2
+pytest-asyncio==1.2.0
+pytest-xdist==3.8.0
+httpx==0.28.1

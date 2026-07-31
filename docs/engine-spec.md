@@ -8,7 +8,7 @@
 
 ## Base Conventions
 
-**Base URL:** `http://localhost:8000/v1` (local profile — active since 2026-07-30) / `https://expense-world-engine.onrender.com/v1` (cloud profile, mothballed; see `deploy/cloud/README.md`)
+**Base URL:** `http://127.0.0.1:8000/v1` (local profile — active since 2026-07-30) / `https://expense-world-engine.onrender.com/v1` (cloud profile, mothballed; see `deploy/cloud/README.md`)
 
 **Authentication:** Every request requires `Authorization: Bearer <token>`. The token is either a Supabase JWT (iOS app) or a Personal Access Token (CLI, web integrations) — both resolve to the same `user_id`. PATs are recognized by the `ewe_pat_` prefix; any other token is parsed as a JWT. Unauthenticated, invalid, expired, or revoked tokens return `401`.
 
@@ -59,7 +59,9 @@
 | 2 | Sync endpoints, Activity log reads, Dashboard + reporting | Sync-ready, reportable |
 | 3 | Reconciliations | Bank statement matching |
 | 4 | Transfers + People (`/` syntax, person accounts) | Debt tracking |
-| 5 | Batch import, Recurrence | Power features |
+| 5 | CSV import, split transactions, Recurrence | Power features |
+
+Shipped ahead of plan: `POST /transactions/batch` landed with Step 6 rather than Phase 5 — the CLI needed bulk historical entry before CSV import existed. Phase 5 retains the CSV layer on top of it. Transfers (Phase 4) also shipped early with Step 7; only the People API half of Phase 4 remains.
 
 Each phase is verified via Swagger UI before any CLI or iOS code is written.
 
@@ -407,14 +409,19 @@ Returns the newly created `expense_transactions` object (primary leg for transfe
 
 **Hashtag wire format:** every transaction returned by any read endpoint includes a `hashtag_ids: [uuid, ...]` array (sorted ascending) listing every hashtag attached to it. This applies uniformly to `/sync`, `GET /transactions`, `GET /transactions/{id}`, the response body of `POST /transactions`, `PUT /transactions/{id}`, `DELETE /transactions/{id}`, `POST /transactions/{id}/restore`, `POST /transactions/batch`, `POST /inbox/{id}/promote`, and each embedded transaction inside `GET /reconciliations/{id}`. Transactions with no attached hashtags return `"hashtag_ids": []` (never `null`, never omitted). The junction table `expense_transaction_hashtags` is internal storage only — clients never see junction rows. Mutations to a transaction's hashtag set bump the parent transaction's `version` and `updated_at` in the same DB transaction so delta sync always surfaces the change.
 
+**`parent_transaction_id` — reserved, always `null` in v1.** Every transaction payload carries a `parent_transaction_id` field, present per the null-over-omission rule. It backs the split-transaction model (parent row holds the full amount, child rows hold the portions and are the only ones that move the balance — see `schema-reference.md §Split Transactions`), which is **not implemented**: no endpoint accepts or writes it, no request schema exposes it, and no read path can return a non-null value. Clients should render the field as absent-of-meaning today and must not build logic on it until splits ship (Phase 5). It is documented here only because it is on the wire and would otherwise be an undocumented key.
+
 ### `GET /transactions`
 Returns all active ledger transactions. Supports filtering:
 - `?account_id=` — filter by account
 - `?category_id=` — filter by category
 - `?hashtag_id=` — filter by hashtag
+- `?reconciliation_id=` — filter to transactions assigned to one reconciliation batch. This is the standalone escape hatch referenced under `GET /reconciliations/{id}`, and unlike that endpoint's embedded window it supports the full filter surface below.
 - `?date_from=` / `?date_to=` — date range (ISO 8601)
 - `?cleared=true/false`
 - `?search=` — full-text search across `title` and `description`
+
+Standard `?include_deleted=true`, `?debit_as_negative=true`, and `?limit` / `?offset` also apply (see Base Conventions).
 
 ### `POST /transactions`
 Creates a transaction directly in the ledger, bypassing the inbox. Used by the CLI for fast entry when all required fields are known.
@@ -447,6 +454,10 @@ Auto-populates `exchange_rate` and computes `amount_home_cents` same as inbox. R
 ### `GET /transactions/{id}`
 ### `PUT /transactions/{id}`
 Partial update.
+
+**Updatable fields:** `title`, `amount_cents`, `date`, `account_id`, `category_id`, `description`, `exchange_rate`, `cleared`, `hashtag_ids`, `reconciliation_id`. Every field is optional; omitted fields are left untouched. An empty body is a no-op that returns current state.
+
+**Reconciliation assignment:** `reconciliation_id` on this endpoint is the **only** way a transaction is assigned to or removed from a reconciliation batch — see *Assigning transactions* under Reconciliations below for the full rules.
 
 **Field locking:** If the transaction belongs to a completed reconciliation (`reconciliation_id` is set and reconciliation `status = 2`), these fields are read-only: `amount_cents`, `account_id`, `title`, `date`. Attempting to update them returns `422`.
 
@@ -533,6 +544,29 @@ Include a `transfer` object on any transaction create request:
 ---
 
 ## Reconciliations
+
+### Assigning transactions
+
+There is no `POST /reconciliations/{id}/transactions` endpoint. A transaction joins or leaves a batch through its **own** update endpoint:
+
+```
+PUT /transactions/{transaction_id}   { "reconciliation_id": "<recon_uuid>" }   ← assign
+PUT /transactions/{transaction_id}   { "reconciliation_id": null }             ← unassign
+```
+
+The engine distinguishes *omitted* from *explicitly null*: leaving `reconciliation_id` out of the body preserves the current assignment, while sending it as `null` unassigns. This is why unassign has no dedicated route — `null` is a real value here, not a missing one.
+
+**Validation (all `422 VALIDATION_ERROR`, field-scoped on `reconciliation_id`):**
+
+| Condition | Message |
+|---|---|
+| Target reconciliation is missing, soft-deleted, or another user's | `"Must reference an active reconciliation."` |
+| Reconciliation's `account_id` ≠ the transaction's account | `"Reconciliation account does not match transaction account."` |
+| Target reconciliation is `status = 2` (completed) | `"Cannot assign transactions to a completed reconciliation."` |
+
+The account check uses the transaction's *effective* account — if the same `PUT` also changes `account_id`, the new value is what must match. A batch and its transactions therefore always share one account.
+
+Unassignment also happens implicitly in two places: `DELETE /reconciliations/{id}` cascade-unassigns every linked transaction, and `POST /transactions/{id}/restore` conditionally clears the link (see its table under Transactions).
 
 ### Ordering
 

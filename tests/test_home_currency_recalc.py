@@ -34,7 +34,7 @@ async def test_regular_transaction_recalculates(client, test_data):
         assert float(before["exchange_rate"]) == 1.0
         assert before["amount_home_cents"] == 5000
 
-        # Change to USD — PEN→USD rate is 1/3.75 ≈ 0.2667
+        # Change to USD — home becomes 1/(USD→PEN) of the PEN amount.
         r = await _set_currency(client, "USD")
         assert r.status_code == 200
 
@@ -43,10 +43,18 @@ async def test_regular_transaction_recalculates(client, test_data):
                 "SELECT exchange_rate, amount_home_cents FROM expense_transactions WHERE id = $1",
                 test_data.transaction_id,
             )
-        # Rate should now be ~0.2667 (1/3.75), not 1.0
+            # Read the rate actually in force rather than assuming the conftest
+            # seed won: exchange_rates is global and the seed is ON CONFLICT DO
+            # NOTHING, so on any day the real fetch job has already run, the
+            # live rate is what the recalc used.
+            usd_pen = await conn.fetchval(
+                """SELECT rate FROM exchange_rates
+                   WHERE base_currency = 'USD' AND target_currency = 'PEN'
+                     AND rate_date = CURRENT_DATE"""
+            )
+        assert usd_pen is not None, "No USD→PEN rate for today — conftest seed should guarantee one"
         assert float(after["exchange_rate"]) != 1.0
-        # 5000 PEN cents * 0.2667 ≈ 1333 USD cents
-        assert after["amount_home_cents"] == round(5000 * (1.0 / 3.75))
+        assert after["amount_home_cents"] == round(5000 * (1.0 / float(usd_pen)))
 
     finally:
         await _set_currency(client, "PEN")
@@ -98,7 +106,7 @@ async def test_transfer_pair_nets_to_zero(client, test_data):
                 (id, user_id, title, amount_cents, amount_home_cents, transaction_type,
                  transfer_direction, date, account_id, category_id, exchange_rate, cleared,
                  created_at, updated_at)
-               VALUES ($1, $2, 'Transfer Out', 3750, 3750, 3,
+               VALUES ($1, $2, 'Transfer Out', 3400, 3400, 3,
                  1, now(), $3, $4, 1.0, false, now(), now())""",
             tx_a_id, test_data.user_id, test_data.account_id, test_data.category_id,
         )
@@ -107,8 +115,8 @@ async def test_transfer_pair_nets_to_zero(client, test_data):
                 (id, user_id, title, amount_cents, amount_home_cents, transaction_type,
                  transfer_direction, date, account_id, category_id, exchange_rate, cleared,
                  created_at, updated_at)
-               VALUES ($1, $2, 'Transfer In', 1000, 3750, 3,
-                 2, now(), $3, $4, 3.75, false, now(), now())""",
+               VALUES ($1, $2, 'Transfer In', 1000, 3400, 3,
+                 2, now(), $3, $4, 3.4, false, now(), now())""",
             tx_b_id, test_data.user_id, usd_account_id, test_data.category_id,
         )
         # Now link them
