@@ -203,7 +203,7 @@ Split into **Part A** (read-side endpoints + exchange rates) and **Part B** (syn
 ### Step 9 Part A — Activity, Exchange Rates, Dashboard, Reports ✅ Shipped
 
 1. **`GET /activity`** — paginated audit-log reads with `resource_type` and `resource_id` filters, sorted by `created_at DESC`. *(commit `d57b7f7`)*
-2. **Exchange rate daily fetch job + `GET /exchange-rates`** — stdlib-only Python script (`app/jobs/fetch_exchange_rates.py`) that fetches all USD rates and upserts canonical USD-based rows into `exchange_rates`. *(Provider was Frankfurter at ship time; swapped to fawazahmed0/currency-api 2026-07-30 — ECB data carries no PEN. See the job docstring + TODO.md.)* The read endpoint uses the shared `get_rate` helper which handles directional math (USD-involving conversions and inversion) at lookup time. Cross-rate (non-USD ↔ non-USD) lookups are intentionally unsupported under the Phase 1 PEN/USD-only policy (`sql/015`); `get_pair_rate` returns `None` for that case. Wiring the script to a daily Render Cron Job is operational and tracked in [TODO.md](../TODO.md). Historical backfill is also a user-owned task in [TODO.md](../TODO.md), scheduled for the very end of engine work. *(commit `d57b7f7`)*
+2. **Exchange rate daily fetch job + `GET /exchange-rates`** — stdlib-only Python script (`app/jobs/fetch_exchange_rates.py`) that fetches all USD rates and upserts canonical USD-based rows into `exchange_rates`. *(Provider was Frankfurter at ship time; swapped to fawazahmed0/currency-api 2026-07-30 — ECB data carries no PEN. See the job docstring + TODO.md.)* The read endpoint uses the shared `get_rate` helper which handles directional math (USD-involving conversions and inversion) at lookup time. Cross-rate (non-USD ↔ non-USD) lookups are intentionally unsupported under the Phase 1 PEN/USD-only policy (`sql/015`); `get_pair_rate` returns `None` for that case. Scheduling is operational, not code: the job runs as a daily launchd agent under the local profile ([deploy/local/README.md](../deploy/local/README.md)); the Render cron recipe for cloud reactivation lives in [deploy/cloud/README.md](../deploy/cloud/README.md) step 5. Historical backfill shipped 2026-07-31 as `app/jobs/backfill_exchange_rates.py` (see [TODO.md](../TODO.md)). *(commit `d57b7f7`)*
 3. **`GET /dashboard`** — current calendar month summary. Single call, everything needed for the main view. Response includes:
    - **`bank_accounts`** — all real accounts (`is_person = false`, not archived) with `current_balance_cents` + `current_balance_home_cents` (home converted at today's rate via `get_rate`).
    - **`people`** — all person accounts (`is_person = true`) with balances in both currencies. Same shape as `bank_accounts`, separated for client convenience.
@@ -329,48 +329,13 @@ Depends on: Step 4 (accounts, categories, `ensure_system_category`), Step 6 (tra
 
 ---
 
-## Step 9.5 — Web Dashboard (Read-Only)
-
-*Deliverable: a lightweight Next.js dashboard on Vercel that reads from the engine and shows you if you're on track.*
-
-**Repo:** `expense_world_web` → deployed to Vercel free tier.
-
-**Built after:** Step 6 (transactions endpoint) is working. You don't need reconciliations or transfers to visualise basic spending.
-
-**Stack:**
-```
-expense_world_engine   → Render (Python FastAPI, always-on)
-expense_world_db       → Supabase (Postgres)
-expense_world_web      → Vercel (Next.js, read-only client)
-expense_world_cli      → local machine (Python Typer)
-expense_world_ios      → later, maybe never needed
-```
-
-**Engine calls:**
-- `GET /dashboard` → bank accounts, people, categories (with hashtag breakdown), current month totals
-- `GET /reports/monthly?from_year=...&to_year=...` → last 6 months for the trend table
-- `GET /transactions` with filters (`account_id`, `category_id`, `hashtag_id`, date range, search) → the transactions browser
-
-**Must-have views:**
-1. **Bank accounts panel** — every real account with its current outstanding balance (native + home currency).
-2. **People panel** — every person account with its outstanding balance. Same shape as bank accounts; visually separated.
-3. **Categories — current month** — flat list of categories with this month's total spend.
-4. **Categories → hashtag breakdown — current month** — each category expandable to show its `hashtag_breakdown` rows. Hashtag-combination rows sum cleanly to the parent category total.
-5. **6-month trend table — categories** — rows are categories, columns are the last 6 months, cells are `spent_home_cents`. Powered by a single multi-month `/reports/monthly` call.
-6. **6-month trend table — categories + hashtag combinations** — same shape as #5 but rows include the hashtag-combination breakdown beneath each category.
-7. **Transaction browser** — paginated list of all transactions with filters for hashtag, category, and bank account (and date range / search as bonus).
-
-**What it does not do:** no entry, no editing, no forms. Read-only. Anything beyond the seven views above waits for a later iteration.
-
-**Commit:** `feat: read-only dashboard — balances, category totals, recent transactions`
-
----
+> **Step 9.5 — Web Dashboard (Read-Only): removed as a numbered engine step, 2026-08-01.** It was never engine work — the dashboard is a separate repo (`expense_world_web`) consuming endpoints that already shipped in Step 9 Part A (`/dashboard`, `/reports/monthly`, `/transactions`). The seven must-have views it specified are in git history; the web dashboard as a *product* phase survives under "Web Dashboard — Expand Later" below.
 
 ## Step 10 — Engine Complete → Start CLI
 
 **Engine is feature-complete.** All endpoints (Steps 0–9.4) are implemented, documented, and tested — 171 integration tests across 20 files, run in parallel via pytest-xdist (`pip install -r requirements-dev.txt`). Full suite runs in ~1s against local Postgres; it took ~4 min against the Supabase pooler before Step 11.
 
-One operational task remains — see [TODO.md](../TODO.md): backfill historical exchange rates (user-owned, run against the local database). The daily exchange-rate fetch is **no longer outstanding**: it was never wired on Render (paid-only cron), and Step 11 ships it as a launchd task instead.
+No operational tasks remain outstanding: the daily exchange-rate fetch ships as a launchd task under Step 11, and the historical backfill closed 2026-07-31 (Step 11.5). What is left in [TODO.md](../TODO.md) is a trigger-gated performance item, not a gap.
 
 Next: write the `expense_world_cli` spec (fill in `cli-spec.md`) and start building CLI commands against the live engine.
 
@@ -429,4 +394,4 @@ Begins after the web dashboard proves insufficient for mobile use. If the Next.j
 
 ---
 
-*Last updated: 2026-07-31 (Step 11.8 — operational hardening: login-race fixes, test database separated, FX backfill, ledger reset)*
+*Last updated: 2026-08-01 (removed Step 9.5 Web Dashboard as a numbered engine step; Render FX cron recipe moved to `deploy/cloud/README.md`)*

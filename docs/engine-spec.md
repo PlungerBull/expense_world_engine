@@ -124,7 +124,7 @@ Updates `user_settings`. Partial update — only supplied fields are changed. If
 
 **Settings preconditions:** Endpoints that read `user_settings` (dashboard, reports, recalc) return `422 SETTINGS_MISSING` with `fields: {"user_settings": "Must be provisioned via POST /v1/auth/bootstrap."}` if the user has not completed bootstrap. This is a precondition-unmet state, not a conflict.
 
-**Exchange-rate preconditions:** Any write that needs to compute `amount_home_cents` for a cross-currency account (`POST /transactions`, `PUT /transactions/{id}` with a `date` change, `POST /transactions/batch`, `POST /inbox`, `PUT /inbox/{id}` with a `date` change) returns `422 RATE_UNAVAILABLE` with `fields: {"exchange_rate": "No rate on or before <date> for <from>-><to>. Wait for the daily fetch or supply an explicit exchange_rate."}` when no `exchange_rates` row exists on or before the transaction's `date`. No silent `1.0` fallback — a missing rate fails loudly so `amount_home_cents` cannot be corrupted. Clients can either retry after the daily FX cron runs (see [TODO.md](../TODO.md)) or bypass the lookup by supplying an explicit `exchange_rate` on the request. Same-currency accounts short-circuit to the identity rate and never hit this path.
+**Exchange-rate preconditions:** Any write that needs to compute `amount_home_cents` for a cross-currency account (`POST /transactions`, `PUT /transactions/{id}` with a `date` change, `POST /transactions/batch`, `POST /inbox`, `PUT /inbox/{id}` with a `date` change) returns `422 RATE_UNAVAILABLE` with `fields: {"exchange_rate": "No rate on or before <date> for <from>-><to>. Wait for the daily fetch or supply an explicit exchange_rate."}` when no `exchange_rates` row exists on or before the transaction's `date`. No silent `1.0` fallback — a missing rate fails loudly so `amount_home_cents` cannot be corrupted. Clients can either retry after the daily FX fetch runs (scheduling per deployment profile — see [deploy/local/README.md](../deploy/local/README.md)) or bypass the lookup by supplying an explicit `exchange_rate` on the request. Same-currency accounts short-circuit to the identity rate and never hit this path.
 
 ### `PUT /auth/profile`
 Partial update of identity fields on the `users` row. This is the single post-bootstrap path for changing `display_name` — `POST /auth/bootstrap` sets `display_name` only on the first call and never overwrites it on subsequent logins, and `PUT /auth/settings` mutates `user_settings`, not `users`.
@@ -193,7 +193,9 @@ A PAT may revoke itself — that's fine; the row lookup succeeds, the `UPDATE` r
 ## Bank Accounts
 
 ### `GET /accounts`
-Returns all active bank accounts. Includes `is_person = false` accounts only. Use `?include_people=true` to include person virtual accounts. Use `?include_archived=true` to include archived accounts. Use `?include_deleted=true` to include soft-deleted accounts.
+Returns active bank accounts. Includes `is_person = false` accounts only. Use `?include_people=true` to include person virtual accounts. Use `?include_archived=true` to include archived accounts. Use `?include_deleted=true` to include soft-deleted accounts.
+
+**Supports standard pagination** (`?limit=50&offset=0`, response `{items, total, limit, offset}` — see Base Conventions). This endpoint is paginated like every other list: a client that ignores `limit` receives the first 50 accounts and a `total`, not the whole set. Read `total` and page rather than assuming one call returns everything — person accounts are the side that realistically grows past the default.
 
 Each account response includes `current_balance_cents` and `current_balance_home_cents` (balance converted to `main_currency`).
 
@@ -528,6 +530,11 @@ Include a `transfer` object on any transaction create request:
   }
 }
 ```
+
+**Validation (all `422 VALIDATION_ERROR`, field-scoped, accumulated into one response):**
+- **The two sides must be different accounts.** A `transfer.account_id` equal to the request's own `account_id` returns `fields: {"transfer.account_id": "Must be a different account."}` — a transfer to itself moves no money and would write two rows that cancel on one balance. Checked before either account is loaded, so it fires even for an account that doesn't exist; if the same id is also missing or archived, the existence message wins the field (the checks share one key).
+- `transfer.amount_cents` must not be zero, and must carry the opposite sign to the primary `amount_cents` (see zero-sum validation below).
+- Both `account_id` values must reference the caller's own active, non-archived accounts.
 
 **Business logic (atomic):**
 1. Creates the primary transaction (the one in the request body).

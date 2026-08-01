@@ -2,40 +2,7 @@
 
 Operational / deployment tasks that are not part of normal code review. Each entry describes what needs to happen, why, and when it becomes blocking.
 
-## Wire up the Render Cron Job for daily exchange-rate fetching
-
-> **Status (2026-07-30): superseded by the local deployment** ([docs/roadmap.md](docs/roadmap.md) Step 11.5) — the same job runs as a daily launchd task on the owner's Mac ([deploy/local/README.md](deploy/local/README.md)), no billing required. The Render steps below are **retained deliberately**: they become live again on cloud reactivation ([deploy/cloud/README.md](deploy/cloud/README.md) step 5).
-
-**What:** Create a new Render Cron Job service that runs `python -m app.jobs.fetch_exchange_rates` daily.
-
-**Why:** Without it, no rows are ever written to the `exchange_rates` table. Any write that needs a cross-currency conversion (`POST /transactions`, `PUT /transactions/{id}` with a date change, `POST /transactions/batch`, `POST /inbox`, `PUT /inbox/{id}` with a date change) now fails with `422 RATE_UNAVAILABLE`. Same-currency writes still succeed (identity rate short-circuit in `get_rate`), so a single-currency user is unaffected.
-
-**When it becomes blocking:** the moment any user holds an account in a currency other than their `main_currency`. Until then, same-currency writes succeed and nothing is corrupted — but the first cross-currency write 422s until the cron populates a rate row.
-
-**Status (2026-04-28):** Registration deferred. Render Cron Jobs are a paid-only resource type — both `render services create --type cron_job ...` and the dashboard "New + → Cron Job" path return `402 Payment information is required` until a card is on file at https://dashboard.render.com/billing. Cheapest cron tier ≈ $1/month. **Decision:** the user (PlungerBull) will add billing and register the cron at the end of operational hardening, once the rest of the pre-mobile-launch checklist is verified working in production. Until then, the platform stays on Render's free tier and this remains the only piece of operational config not yet wired. Everything else is ready: job code is shipped, `SUPABASE_DB_URL` already points at the Supabase pgBouncer transaction-mode pooler, asyncpg is configured `statement_cache_size=0` for pgBouncer safety, and the test suite has been validated against the pooler config.
-
-**Steps (one-time, via Render dashboard, AFTER billing is added):**
-
-1. Render dashboard → **New +** → **Cron Job**
-2. Connect the same GitHub repo as the web service
-3. **Name:** `fetch-exchange-rates`
-4. **Runtime:** Python
-5. **Build Command:** `pip install -r requirements.txt`
-6. **Command:** `python -m app.jobs.fetch_exchange_rates`
-7. **Schedule:** `0 16 * * *` (daily 16:00 UTC — after ECB's ~16:00 CET publish in both DST variants)
-8. **Environment:** link the same env group as the web service so it picks up `SUPABASE_DB_URL` and friends
-9. Save, then click **Trigger Run** once to smoke-test. Check the logs for `inserted USD->PEN <date> = <rate>`.
-
-**Verification after first run:**
-```
-GET /v1/exchange-rates?target=PEN&base=USD
-```
-Should return the rate just inserted, not 404.
-
-**Not in scope here:**
-- Adopting the whole service into `render.yaml` / Blueprint. The web service is currently dashboard-managed; adding a Blueprint would conflict. Keep everything dashboard-managed for now.
-
----
+> **Removed 2026-08-01: "Wire up the Render Cron Job for daily exchange-rate fetching."** Never an open task on the local profile — the job runs as a daily launchd agent ([deploy/local/README.md](deploy/local/README.md), roadmap Step 11.5). The Render recipe it carried now lives where it is actually needed, in [deploy/cloud/README.md](deploy/cloud/README.md) step 5 (cloud reactivation). Full original entry in git history.
 
 ## Backfill historical exchange rates (manual, user-owned) — ✅ DONE 2026-07-31
 

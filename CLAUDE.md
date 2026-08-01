@@ -80,7 +80,6 @@ Before writing a new helper, utility, or service function, check if one already 
 | 9.3 | Profile mutation (`PUT /auth/profile`) | ✅ Done |
 | 9.4 | Opening balances (`@Opening` + report exclusion) | ✅ Done |
 | — | **Engine feature-complete. All endpoints shipped + tested.** | ✅ Done |
-| 9.5 | Web Dashboard (read-only) | Pending (separate repo) |
 | 10 | CLI | Shipped (separate repo — flat CLI + TUI complete; see `expense_world_CLI/docs/roadmap.md`) |
 | 11 | Local deployment (engine + Postgres on the owner's Mac; cloud mothballed) | ✅ Done (2026-07-30) |
 
