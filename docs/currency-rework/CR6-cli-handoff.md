@@ -103,6 +103,20 @@ Note `category_id` explicitly: it used to be silently accepted and is now reject
 
 Beyond `exchange_rate`:
 
+0. **`amount_home_cents` is absent from transaction and inbox responses**, and from
+   `/sync` payloads for those two resources. Absent, not null.
+
+   ✅ **Verified 2026-08-02: the CLI does not use this field anywhere** —
+   `grep -rn "amount_home_cents" expense/` returns nothing. No work expected. It is
+   listed only so the absence is a confirmed fact rather than an assumption.
+
+   ⚠️ **`current_balance_home_cents` on accounts is UNCHANGED** and the CLI does use
+   it (`tui/screens/home.py:105`, `outstanding.py:54`). So are
+   `spent_home_cents` / `net_home_cents` / `outflow_home_cents` on reports and the
+   dashboard (`reports_cmd.py:42,112,126`, `home.py:110`). **Do not remove home-currency
+   handling wholesale** — only the per-transaction field went away, and the CLI never
+   read it.
+
 1. **`exchange_rate` is absent from responses** — absent, not null. Any
    `.get("exchange_rate")` is dead code; any direct `[...]` access will `KeyError`.
 2. **`warnings` may appear on create/update responses** — surface them. Previously
@@ -110,6 +124,16 @@ Beyond `exchange_rate`:
 3. **`spent_home_cents` may be `null`**, with `unconverted_count` alongside, when a
    month contains a row whose date has no rate. Render "—" or similar; **do not
    render 0** — that is a different fact.
+
+   `unconverted_count` arrives at **two levels**: on each category / hashtag row,
+   and once per report (per month in the multi-month range form). Surface both — the
+   report-level one as a visible warning line, since a blank cell is easy to skim
+   past. `lifetime_spent_home_cents` on the archived panels follows the same rule.
+
+   ⚠️ `format_cents` (`reports_cmd.py:42,53`) is already fed `.get(...)`, so it
+   receives `None` today when a key is missing — confirm it renders a dash rather
+   than `0` or crashing, because `None` stops being an edge case and becomes a
+   documented state.
 4. **`@Transfer` may show a non-zero total.** Two legitimate causes: an FX spread
    on a cross-currency transfer, or a loan/repayment with a person. Any TUI logic
    assuming it cancels to zero is now wrong.

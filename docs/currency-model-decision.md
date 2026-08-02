@@ -86,11 +86,49 @@ Migration `sql/019`.
 | `expense_bank_accounts.currency_code` | the only place currency lives |
 | **the `exchange_rates` table** | the rate history reads convert from — now load-bearing |
 | `app/jobs/fetch_exchange_rates.py`, `app/jobs/backfill_exchange_rates.py` | same reason |
-| `amount_home_cents` **in API responses** | computed instead of stored |
+| `amount_home_cents` on **reports and account balances** | computed instead of stored |
 
-**The response contract does not change.** The "every response with an amount
-includes a home-currency version" convention holds exactly as written. Reads keep
-their shape; only writes change, because they stop accepting a rate.
+### Where PEN appears — amended 2026-08-02
+
+> The first version of this document said *"the response contract does not change —
+> every response with an amount includes a home-currency version."* **That was
+> wrong**, and the owner corrected it while CR2 was being planned.
+
+The rule is not "every amount." It is **figures the user compares or sums across
+currencies**:
+
+| Surface | PEN? |
+|---|---|
+| Monthly report — per category / per hashtag, single month **and** multi-month range | ✅ |
+| Month totals — inflow / outflow / net | ✅ |
+| Dashboard — archived lifetime panels | ✅ |
+| Account balances (`current_balance_home_cents`) | ✅ — the only place you see all your money at once |
+| **Individual transactions** | ❌ removed |
+| **Inbox items** | ❌ removed |
+
+A PEN account shows soles; a USD account shows dollars; their transactions show the
+account's currency and nothing else. A second number on every ledger row is noise —
+the rows in any one account are all the same currency anyway.
+
+**Evidence this is right, not merely cheaper:** the CLI has **zero** references to
+transaction-level `amount_home_cents`. It reads `current_balance_home_cents` and
+`spent_home_cents` / `net_home_cents` only. The per-transaction value was computed
+on every write, stored, serialised and shipped — and rendered by nobody. The CLI's
+own docstring (`reports_cmd.py:80-81`) already calls home currency *"the only column
+comparable across a multi-currency ledger."*
+
+The field is **absent, not `null`** — a documented exception to null-over-omission,
+same as `exchange_rate` and the retired `recalculation` field. A permanently-`null`
+key on every transaction forever is dead weight.
+
+`CLAUDE.md`'s home-currency convention was amended to match: the engine remains the
+only thing that converts — that part never changes — but the obligation applies to
+cross-currency figures, not to every amount.
+
+**Known inconsistency, deliberately left:** reconciliations still expose
+`beginning_balance_home_cents` / `ending_balance_home_cents` even though a
+reconciliation belongs to one account and is therefore single-currency. The
+chaining retirement reworks them wholesale; it settles this.
 
 ---
 

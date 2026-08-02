@@ -39,6 +39,18 @@ package's job is to make the docs true, not to restate the plan.
 
 - **The currency model**, or a pointer to `currency-model-decision.md` — native
   storage, read-time conversion, rate on the transaction's date.
+- **Where PEN appears, and where it does not** (decision D-e). Reports, month
+  totals, archived lifetime panels and account balances carry a home-currency
+  figure; individual transactions and inbox items do **not**. State the rule —
+  *figures the user compares or sums across currencies* — rather than listing
+  endpoints, so it stays true as endpoints are added.
+- **`amount_home_cents` removed from transaction/inbox responses** as a second
+  documented exception to null-over-omission, alongside `exchange_rate`. Absent,
+  not `null`.
+- **`unconverted_count` appears at two levels** (decision D-f): per category /
+  hashtag row, and once per report — per month in the multi-month range form. Note
+  that the report-level figure counts **distinct transactions**, so it is not the
+  sum of the per-row counts.
 - **`@Transfer` semantics.** Nets to zero only when both legs land in it. Non-zero
   means exactly one of: an FX spread (both legs, different home values) or a
   loan/repayment with a person (one leg, nothing to cancel). Include the four-row
@@ -104,6 +116,14 @@ Must cover:
 1. **`exchange_rate` no longer accepted on any write.** `POST`/`PUT` transactions,
    batch, inbox, opening-balance.
 2. **`exchange_rate` absent from every response.** Absent, not null.
+2b. **`amount_home_cents` absent from transaction and inbox responses**, and from
+   their `/sync` payloads. Absent, not null. State plainly what is **kept**, since
+   the risk is a client stripping home-currency handling wholesale:
+   `current_balance_home_cents` on accounts, and
+   `spent_home_cents` / `net_home_cents` / `inflow_home_cents` /
+   `outflow_home_cents` / `lifetime_spent_home_cents` on reports and the dashboard
+   are all unchanged. Verified 2026-08-02 that the CLI never read the
+   per-transaction field, so this item is expected to be zero work for it.
 3. **New `warnings` on create/update** when a rate is unavailable.
 4. **New `unconverted_count`** on dashboard and monthly-report responses;
    `spent_home_cents` may now be `null`.
@@ -201,11 +221,12 @@ code before deleting any definition.
   lesson — the observation about Lunch Money may still be accurate; the conclusion
   we drew from it is what changed. Check the other `lessons-*.md` files for the same
   pattern while here.
-- **`CLAUDE.md`** — already indexes `currency-model-decision.md`; verify no
-  convention text contradicts the new model. In particular the **Home currency**
-  convention ("Every response that contains an amount must include a
-  home-currency version") still holds — the value is now computed, not stored, and
-  may be `null` when unconvertible. Say so.
+- **`CLAUDE.md`** — ✅ **already amended 2026-08-02**, no action expected. The
+  **Home currency** convention was rewritten from *"every response that contains an
+  amount must include a home-currency version"* (written for the stored-column
+  model) to a per-surface table implementing D-e, plus the read-time and
+  `null` + `unconverted_count` rules. **Verify it matches what actually shipped**
+  and correct any drift; do not rewrite it from scratch.
 - **`docs/currency-rework/`** — this directory is transient. Once this package
   lands, either delete it or add a "superseded, see `currency-model-decision.md`"
   banner to `README.md` — **and remove its row from the `CLAUDE.md` Key

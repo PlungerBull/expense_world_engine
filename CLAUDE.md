@@ -65,7 +65,21 @@ These apply everywhere, no exceptions:
 - Responses: `amount_cents` is always positive. `transaction_type` tells direction. The `?debit_as_negative=true` flag is a caller-side preference, not a schema property.
 
 **Home currency**
-Every response that contains an amount must include a home-currency version alongside it (`amount_home_cents`, `spent_home_cents`, `current_balance_home_cents`, etc.). The engine is the only thing that does currency conversion. Clients never compute it.
+**The engine is the only thing that does currency conversion. Clients never compute it.** That part is absolute.
+
+Home-currency values appear on **figures the user compares or sums across currencies** — never on individual ledger records:
+
+| Surface | Home-currency field |
+|---|---|
+| Monthly report (single month and multi-month range) | `spent_home_cents` per category and per hashtag |
+| Month totals | `inflow_home_cents`, `outflow_home_cents`, `net_home_cents` |
+| Dashboard archived panels | `lifetime_spent_home_cents` |
+| Account balances | `current_balance_home_cents` — the only view showing all your money at once |
+| Individual transactions and inbox items | **none** — native currency only |
+
+Values are **computed at read time**, never stored (see `docs/currency-model-decision.md`). Where no rate exists for a row's date, the affected figure is `null` plus an `unconverted_count` — never a native amount substituted for a home amount.
+
+*Amended 2026-08-02. This convention previously read "every response that contains an amount must include a home-currency version", which was written for the stored-column model and made every transaction carry a PEN value no client rendered.*
 
 **Null over omission**
 Optional fields with no value are always returned as `null`, never omitted. Response shape never changes based on data presence.

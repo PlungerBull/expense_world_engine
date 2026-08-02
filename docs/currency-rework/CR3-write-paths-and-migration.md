@@ -86,6 +86,15 @@ remove it too.
 - `app/schemas/transactions.py` — `TransactionResponse` and `transaction_from_row`
 - `app/schemas/inbox.py` — request and response models
 
+ℹ️ **`amount_home_cents` is already gone from these responses — CR2 removed it**
+(owner decision, 2026-08-02: individual transactions and inbox items carry no PEN
+value). This package only has `exchange_rate` left to remove. If you still find
+`amount_home_cents` in a transaction or inbox schema, CR2 is incomplete — stop and
+finish it rather than absorbing the work here.
+
+**Account balances keep `current_balance_home_cents`.** Do not remove it for
+consistency; it is a compare-across-currencies figure and is out of scope.
+
 **Both directions.** A rate belongs to a (currency, date) pair, not a transaction;
 `GET /exchange-rates` already serves it. Keeping it as a read-only computed field
 would preserve the mental model that caused these three findings.

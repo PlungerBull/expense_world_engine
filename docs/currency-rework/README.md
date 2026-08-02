@@ -90,6 +90,8 @@ CR3's deletions. If a package leaves the suite red, it is not done.
 | **D-b** | A write whose date has no resolvable rate **succeeds and warns** | Recording reality must not depend on a rate lookup. The warning names the missing pair and date so the operator knows to run the backfill. |
 | **D-c** | Currency rework precedes the reconciliation-chaining retirement | Three open 🔴s vs one 🟠 whose findings are already superseded on paper. |
 | **D-d** | **`@FX` category is deferred**, not rejected | Specified in the decision doc §"Deferred: `@FX`". Report-layer only to add later — no migration, no data change. **Do not build it in this rework.** |
+| **D-e** | **Individual transactions and inbox items carry no PEN value.** `amount_home_cents` is removed from their responses, not recomputed. Reports, month totals, archived lifetime panels and account balances keep theirs. *(2026-08-02, mid-CR2)* | A PEN account shows soles, a USD account shows dollars; rows within one account are all the same currency, so a second number per row is noise. Consolidation belongs where figures are combined — the report. Verified: the CLI has **zero** references to transaction-level `amount_home_cents`; it was computed, stored, shipped and rendered by nobody. **This deleted CR2's largest step** (re-reading every row after every write, ~12 call sites) and the dual-implementation risk with it. |
+| **D-f** | **`unconverted_count` is reported at both levels** — per category / hashtag row, and once per report | The per-row count is already computed to decide whether to null the row, so it is free; the report-level one is what makes a user notice, since a blank cell is easy to skim past. ⚠️ The roll-up must be `COUNT(DISTINCT t.id)` — a transaction appears in both its category row and its hashtag row. |
 
 ---
 
@@ -104,11 +106,15 @@ Check these before declaring any package done:
 - **`@Transfer ≠ 0` means exactly two things:** an FX spread (both legs in, valued
   at different home amounts) or a loan/repayment with a person (one leg in,
   nothing to cancel against). Any third cause is a bug. See the decision doc.
-- **Null over omission.** Optional fields return `null`, never absent. The one
-  deliberate exception is `exchange_rate`, which is *removed* from the schema
-  entirely, not nulled.
-- **`amount_home_cents` stays in every response** — computed, not stored. The
-  response contract does not change; only writes do.
+- **Null over omission.** Optional fields return `null`, never absent. Two
+  deliberate exceptions, both *removed* from the schema rather than nulled:
+  `exchange_rate` (CR3) and `amount_home_cents` on transactions / inbox items (CR2).
+- **PEN appears only on cross-currency figures** — reports, month totals, archived
+  lifetime panels, and account balances. **Not** on individual transactions or
+  inbox items. Computed at read time, never stored. See D-e below.
+- **`current_balance_home_cents` on accounts is untouched** by this rework, in
+  either direction. It is already read-time, the CLI renders it, and it is the only
+  view showing all your money at once.
 - **Balance atomicity, idempotency, activity log, soft delete** — untouched.
 
 ---
