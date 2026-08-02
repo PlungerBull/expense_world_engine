@@ -1,5 +1,8 @@
 # CR1 — Conversion helper
 
+**✅ Complete (2026-08-02, commit `cffc092`).** `app/helpers/home_currency.py` + 13 tests in
+`tests/test_home_currency_parity.py`; suite 165 → 178, green. Nothing wired — CR2 is next.
+
 **Prerequisites:** Phase 0 in [README.md](README.md). Read
 [`../currency-model-decision.md`](../currency-model-decision.md) first.
 **Blocks:** CR2, CR3, CR4, CR5. **Blocked by:** nothing.
@@ -471,22 +474,22 @@ docstring note pointing at WP1.7 so the gap is recorded rather than rediscovered
 
 ## Done when
 
-- [ ] `app/helpers/home_currency.py` exists exporting `HOME_RATE_JOIN`,
+- [x] `app/helpers/home_currency.py` exists exporting `HOME_RATE_JOIN`,
       `HOME_CENTS_EXPR`, `SIGNED_HOME_CENTS_EXPR`, `SIGNED_CENTS_EXPR`,
       `UNCONVERTIBLE_FLAG_EXPR`, and the required table aliases
-- [ ] `HOME_RATE_JOIN` is a **builder** taking the caller's `display_timezone`
+- [x] `HOME_RATE_JOIN` is a **builder** taking the caller's `display_timezone`
       placeholder, carries the `a.currency_code = 'USD'` fail-closed guard, and
       casts as `(t.date AT TIME ZONE <tz_param>)::date`
-- [ ] The timezone is bound, never interpolated; `<home>` is interpolated from the
+- [x] The timezone is bound, never interpolated; `<home>` is interpolated from the
       single `HOME_CURRENCY` constant
-- [ ] `HOME_CENTS_EXPR` casts the converted arm `::bigint`, so the expression has
+- [x] `HOME_CENTS_EXPR` casts the converted arm `::bigint`, so the expression has
       one type regardless of which arm fires
-- [ ] `SIGNED_HOME_CENTS_EXPR` wraps `HOME_CENTS_EXPR` by reference rather than
+- [x] `SIGNED_HOME_CENTS_EXPR` wraps `HOME_CENTS_EXPR` by reference rather than
       re-deriving the multiplication
-- [ ] `UNCONVERTIBLE_FLAG_EXPR` carries the `t.id IS NOT NULL` guard, and is
+- [x] `UNCONVERTIBLE_FLAG_EXPR` carries the `t.id IS NOT NULL` guard, and is
       documented as CTE-projected rather than outer-SELECT interpolated
-- [ ] Every expression uses `app.constants` enum members, no bare integers
-- [ ] Module docstring states: `NULL` means unconvertible and must never be
+- [x] Every expression uses `app.constants` enum members, no bare integers
+- [x] Module docstring states: `NULL` means unconvertible and must never be
       coalesced; the aggregation contract (every `SUM` paired with the
       unconvertible count, non-zero count ⇒ `null` not a partial total); the
       caller's query must **`LEFT JOIN`** `expense_bank_accounts a ON a.id =
@@ -495,23 +498,23 @@ docstring note pointing at WP1.7 so the gap is recorded rather than rediscovered
       `HOME_CURRENCY`-vs-`main_currency` divergence from `sql/018` and CR2's
       obligation to assert they agree; and the `get_rate` duplication + why the
       parity test exists
-- [ ] Parity test covers all six matrix rows above. Rows 2–6 assert SQL/`get_rate`
+- [x] Parity test covers all six matrix rows above. Rows 2–6 assert SQL/`get_rate`
       **agreement** rather than absolute values; row 1 (PEN→PEN) instead asserts
       the home value equals the native amount
-- [ ] Fixture transactions are seeded at **midday** so timezone handling cannot
+- [x] Fixture transactions are seeded at **midday** so timezone handling cannot
       decide a parity row
-- [ ] The near-midnight test uses a **non-UTC** `display_timezone` and an instant
+- [x] The near-midnight test uses a **non-UTC** `display_timezone` and an instant
       after UTC midnight — verify it *fails* against a hardcoded-UTC cast before
       accepting it, since the UTC-user version is vacuous
-- [ ] A separate test pins the `NULL` (unconvertible) path at a date below the
+- [x] A separate test pins the `NULL` (unconvertible) path at a date below the
       suite-wide seed floor
-- [ ] A separate test reproduces the `dashboard` `LEFT JOIN` shape and asserts an
+- [x] A separate test reproduces the `dashboard` `LEFT JOIN` shape and asserts an
       empty archived category flags **0**, not 1
-- [ ] Parity test clears the `get_rate` cache and cleans up only its own seeded
+- [x] Parity test clears the `get_rate` cache and cleans up only its own seeded
       rate dates
-- [ ] **Nothing else imports the new module yet** — this package wires nothing
-- [ ] `pytest` green, and the test *count* is higher than before (only additions)
-- [ ] `git diff` touches only the new module and the new test file
+- [x] **Nothing else imports the new module yet** — this package wires nothing
+- [x] `pytest` green, and the test *count* is higher than before (only additions)
+- [x] `git diff` touches only the new module and the new test file
 
 ---
 
