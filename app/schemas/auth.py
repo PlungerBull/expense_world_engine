@@ -18,14 +18,6 @@ class UserResponse(BaseModel):
     updated_at: datetime
 
 
-class RecalculationSummary(BaseModel):
-    regular_transactions: int
-    transfer_transactions: int
-    orphan_transfer_legs: int
-    inbox_items: int
-    total: int
-
-
 class UserSettingsResponse(BaseModel):
     user_id: str
     theme: int
@@ -40,7 +32,6 @@ class UserSettingsResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     deleted_at: Optional[datetime]
-    recalculation: Optional[RecalculationSummary] = None
 
 
 class BootstrapResponse(BaseModel):
@@ -51,6 +42,10 @@ class BootstrapResponse(BaseModel):
 class SettingsUpdateRequest(BaseModel):
     theme: Optional[int] = None
     start_of_week: Optional[int] = None
+    # Not updatable — the home currency is locked to PEN (sql/018). Declared
+    # here only so update_settings can reject it with a 422; dropping the
+    # field would make Pydantic silently discard it under extra="ignore",
+    # and the caller would believe the switch succeeded.
     main_currency: Optional[str] = None
     transaction_sort_preference: Optional[int] = None
     display_timezone: Optional[str] = None

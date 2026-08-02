@@ -15,7 +15,6 @@ import asyncpg
 from app.constants import ActivityAction
 from app.errors import not_found, validation_error
 from app.helpers.activity_log import write_activity_log
-from app.helpers.recalculate_home_currency import recalculate_home_currency
 from app.schemas.auth import settings_from_row, user_from_row
 
 
@@ -110,21 +109,18 @@ async def update_settings(
     user_id: str,
     fields: dict,
 ) -> dict:
-    """Apply field updates to ``user_settings``, recalculating home currency when needed.
+    """Apply field updates to ``user_settings``.
 
     Returns the unchanged settings if ``fields`` is empty (matches the prior
     router behaviour of treating empty-update as a fetch).
 
-    If ``main_currency`` actually changes, triggers a full home-currency
-    recalculation. The summary is returned on the response under the
-    ``recalculation`` key (or ``null`` when no recalc ran — see
-    ``UserSettingsResponse`` for the always-present-with-null contract)
-    and is also embedded into the activity log's after snapshot, which
-    remains the canonical audit record per engine-spec.md.
+    ``main_currency`` is not updatable: the home currency is locked to PEN
+    (``sql/018``). It stays in ``SettingsUpdateRequest`` purely so a caller
+    asking for a switch gets a loud 422 instead of a silently-ignored field.
 
     Raises:
         not_found: the user_settings row does not exist.
-        validation_error: ``main_currency`` is not a known global currency code.
+        validation_error: the request tried to change ``main_currency``.
     """
     # Empty update — return current settings
     if not fields:
@@ -135,17 +131,14 @@ async def update_settings(
             raise not_found("user_settings")
         return settings_from_row(row)
 
-    # Validate main_currency if provided
+    # Home currency is immutable. Reject rather than ignore: a caller that
+    # silently "succeeds" here would cache a currency the engine never
+    # adopted, and every amount it renders afterwards would be mislabelled.
     if "main_currency" in fields:
-        currency = await conn.fetchrow(
-            "SELECT code FROM global_currencies WHERE code = $1",
-            fields["main_currency"],
+        raise validation_error(
+            "Home currency cannot be changed.",
+            {"main_currency": "The home currency is locked to PEN and is not updatable."},
         )
-        if currency is None:
-            raise validation_error(
-                "Invalid currency code.",
-                {"main_currency": f"'{fields['main_currency']}' is not a valid currency code."},
-            )
 
     # Before snapshot
     before_row = await conn.fetchrow(
@@ -170,23 +163,13 @@ async def update_settings(
     after_row = await conn.fetchrow(query, *params)
     after = settings_from_row(after_row)
 
-    # Home-currency recalculation when main_currency actually changes
-    old_currency = before_row["main_currency"]
-    new_currency = after_row["main_currency"]
-    recalc_summary = None
-
-    if old_currency != new_currency:
-        recalc_summary = await recalculate_home_currency(
-            conn, user_id, new_currency,
-        )
-
     await write_activity_log(
         conn, user_id, "user_settings", user_id, ActivityAction.UPDATED,
         before_snapshot=before,
-        after_snapshot={**after, "recalculation": recalc_summary} if recalc_summary else after,
+        after_snapshot=after,
     )
 
-    return {**after, "recalculation": recalc_summary}
+    return after
 
 
 async def update_profile(

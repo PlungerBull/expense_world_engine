@@ -138,7 +138,7 @@ async def _ensure_test_data(conn, data: TestData):
                VALUES ($1, $2, 'Test Inbox', 1.0, 1, now(), now())""",
             data.inbox_id, data.user_id,
         )
-        # Seed exchange rate so get_rate(PEN, USD, ...) works in recalc tests
+        # Seed USD→PEN so get_rate works for USD-account conversions.
         await conn.execute(
             """INSERT INTO exchange_rates (base_currency, target_currency, rate, rate_date, created_at)
                VALUES ('USD', 'PEN', 3.4, CURRENT_DATE, now())

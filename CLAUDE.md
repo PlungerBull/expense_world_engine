@@ -14,6 +14,11 @@ The Brain. A Python (FastAPI) backend, backed by Postgres. It is the single sour
 | `docs/api-design-principles.md` | Architectural decisions and the reasoning behind them. |
 | `docs/schema-reference.md` | Full database schema. |
 | `docs/design-philosophy.md` | UX philosophy and product vision. |
+| `docs/scaling-boundaries.md` | What is business logic (scale-invariant) vs. a scaling constraint (single-user-shaped). Read before arguing that something should be built or deferred "for scale". |
+
+## Who this is for
+
+**One user — the owner (since 2026-08-01).** The earlier 1000+ public-users target is retired; if scaling happens it gets a dedicated, professionally-staffed plan. Build what makes daily use work well, not what a hypothetical user base would need. The one obligation this leaves: when a decision is single-user-shaped, record it in `docs/scaling-boundaries.md` instead of leaving it implicit. Ledger correctness is never a scale trade-off — the conventions below hold at any size.
 
 ## Tech stack
 

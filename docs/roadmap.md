@@ -237,9 +237,11 @@ Design validated against Todoist Sync API v9, YNAB delta requests, Contentful CD
 
 ---
 
-## Step 9.1 — Home Currency Recalculation ✅ Shipped
+## Step 9.1 — Home Currency Recalculation ✅ Shipped → ⛔ RETIRED 2026-08-01
 
-*Deliverable: changing `main_currency` in settings recalculates all home-currency amounts, idempotently and in batches, via a first-class job.*
+> **Retired 2026-08-01.** The home currency is now locked to PEN (`sql/018`) and `PUT /auth/settings` rejects `main_currency` with `422`. `app/helpers/recalculate_home_currency.py` and `tests/test_home_currency_recalc.py` were **deleted** — the helper contained a silent `1.0` rate fallback (audit finding WP1.1) that wrote wrong `amount_home_cents` for any transaction dated before the FX backfill floor. Everything below is kept as the dated record of what shipped and why; it no longer describes the engine. See [audit-2026-08-01-remediation-plan.md](audit-2026-08-01-remediation-plan.md) WP1.1 and the `sql/018` header for the restoration path.
+
+*Deliverable (historical): changing `main_currency` in settings recalculates all home-currency amounts, idempotently and in batches, via a first-class job.*
 
 **Implementation:** `app/helpers/recalculate_home_currency.py`, wired into `PUT /auth/settings` in `app/routers/auth.py`. Three passes: (1) regular transactions — `get_rate` lookup + recompute, (2) transfer pairs — dominant-side rule reapplication for zero-sum, (3) pending inbox items — `exchange_rate` refresh. Synchronous inside the settings request (Phase 1). Every updated row bumps `version + updated_at` for sync. Single `activity_log` entry includes recalc summary. 9 integration tests in `tests/test_home_currency_recalc.py`. *(commit `003c204`)*
 

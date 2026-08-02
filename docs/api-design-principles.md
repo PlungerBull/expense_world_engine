@@ -76,10 +76,10 @@ All mutable tables carry `deleted_at` (nullable timestamptz). Hard deletion is n
 
 Every mutation to any mutable table produces an immutable row in `activity_log` capturing: resource type, resource ID, action (1=CREATED, 2=UPDATED, 3=DELETED, 4=RESTORED), full before/after JSON snapshots, timestamp, and actor. For a financial application this is not optional — it is the mechanism for answering "why does my balance look wrong?" Designed from day one; retrofitting loses historical record. See `lessons-todoist.md §6`.
 
-**Deliberate aggregate exceptions.** Three mutation paths skip per-row entries in favor of a single aggregate entry. Each is a conscious trade, not an oversight:
+**Deliberate aggregate exceptions.** Two mutation paths skip per-row entries in favor of a single aggregate entry. Each is a conscious trade, not an oversight:
 
 1. **Junction-row mutations on `expense_transaction_hashtags`** — the parent transaction's `UPDATED` entry carries the full new `hashtag_ids` list, so the change is captured at parent granularity. Per-link entries would multiply audit row count by the average hashtags per transaction without enabling new audit questions.
-2. **`recalculate_home_currency` bulk UPDATEs** — a single `UPDATED` entry on `user_settings` carries a `recalculation` summary block (rows touched per pass). A full recalc on a busy user can rewrite tens of thousands of rows in one request; per-row entries would inflate `activity_log` by orders of magnitude.
+2. *(Retired 2026-08-01)* The `recalculate_home_currency` exception was removed with the helper — the home currency is locked to PEN (`sql/018`), so nothing rewrites `amount_home_cents` in bulk. Numbering preserved.
 3. **`users.last_login_at` bumps on repeat bootstrap** — not logged at all. Login bumps are operational metadata, not user actions. If session-level audit becomes a requirement, a dedicated `auth_sessions` table is the right home, not inflated `activity_log`.
 
 ### 7. Command Batching for Multi-Record Workflows
