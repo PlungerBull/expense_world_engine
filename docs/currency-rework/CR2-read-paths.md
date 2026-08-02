@@ -30,7 +30,7 @@ the drop in CR3 is a no-op for readers rather than a breakage.
 | File | What changes |
 |---|---|
 | `app/helpers/monthly_report.py` | 8 `COALESCE(t.amount_home_cents, …)` arms at `:119-122` and `:198-201` → `SIGNED_HOME_CENTS_EXPR` + join. Add unconverted-row counting. |
-| `app/routers/dashboard.py` | `_SIGNED_HOME_CENTS_SQL` at `:112-120` → import from `home_currency`. Both archived-lifetime aggregators (`:133-208`) use it. |
+| `app/routers/dashboard.py` | `_SIGNED_HOME_CENTS_SQL` at `:112-120` → import from `home_currency`. Both archived-lifetime aggregators (`:133-208`) use it, each needing a **`LEFT JOIN`** to accounts and a new `display_timezone` parameter — see step 1. |
 | `app/schemas/transactions.py` | `transaction_from_row:105` reads `row["amount_home_cents"]` — must come from the query, not the column |
 | `app/schemas/inbox.py` | `:70,79` multiply by the stored rate — same treatment |
 | `app/helpers/sync.py`, `app/routers/sync.py` | transaction + inbox payloads carry computed home values |
@@ -42,9 +42,28 @@ the drop in CR3 is a no-op for readers rather than a breakage.
 
 ### 1. Aggregates (`monthly_report.py`, `dashboard.py`)
 
-Both currently `SELECT ... FROM expense_transactions t` **without joining
-accounts**. `HOME_RATE_JOIN` needs `expense_bank_accounts a` — add
-`JOIN expense_bank_accounts a ON a.id = t.account_id AND a.user_id = t.user_id`.
+Neither file joins accounts today, so `HOME_RATE_JOIN` has no `a` to reference.
+**The join you add is not the same in both files — read this before copying it.**
+
+- **`monthly_report.py`** starts `FROM expense_transactions t`, so an inner join is
+  correct:
+  `JOIN expense_bank_accounts a ON a.id = t.account_id AND a.user_id = t.user_id`
+- ⚠️ **`dashboard.py` must use `LEFT JOIN`.** Both archived aggregators start from
+  the category/hashtag table and `LEFT JOIN expense_transactions`
+  (`:141-144`, `:176-197`) precisely so empty rows survive — the invariant is
+  documented at `:129-131`: *"Categories with no transactions ever appear with zero
+  totals — the LEFT JOIN preserves them."* An **inner** join to
+  `expense_bank_accounts` on `t.account_id` re-filters those rows away and every
+  archived category or hashtag with no transactions silently vanishes from the
+  `include_archived` panels. Use
+  `LEFT JOIN expense_bank_accounts a ON a.id = t.account_id AND a.user_id = t.user_id`.
+
+**Both aggregators also need the user's `display_timezone` threaded in.**
+`_load_archived_categories(conn, user_id)` (`:123`) and
+`_load_archived_hashtags(conn, user_id)` (`:164`) take no settings today; add the
+parameter and bind it for `HOME_RATE_JOIN`. `get_dashboard` already loads settings
+at `:235` before calling them at `:254-255`, so pass what is already there — do not
+add a second settings query.
 
 Then replace the CASE matrices with the imported expressions. Delete the local
 `_SIGNED_CENTS_SQL` / `_SIGNED_HOME_CENTS_SQL` constants in `dashboard.py` and the
@@ -59,9 +78,40 @@ shapes by construction). Do not fork it.
 Per the decision doc: a row whose date has no resolvable rate contributes nothing,
 and **the category must not report a partial sum.**
 
-- Add `COUNT(*) FILTER (WHERE <home expr> IS NULL)` to the aggregates.
+- Use CR1's `UNCONVERTIBLE_FLAG_EXPR` — do **not** hand-roll the
+  `COUNT(*) FILTER (WHERE <home expr> IS NULL)` predicate at each of the four call
+  sites (both `monthly_report` queries, both `dashboard` aggregators). One
+  definition, imported, same as the CASE matrices.
 - If a category has any unconverted row, its `spent_home_cents` is `null` — not a
-  sum of the convertible subset.
+  sum of the convertible subset. **The same applies to the dashboard's
+  `lifetime_spent_home_cents`** (`dashboard.py:139`, `:181`), which is the same
+  quantity under a different name and is easy to miss because the archived panels
+  are the least-touched surface here.
+- ⚠️ **The unconvertible count is the only authority. Never infer convertibility
+  from the sum.** Both dashboard aggregators wrap their totals in
+  `COALESCE(SUM(...), 0)`, so a group where *every* row is unconvertible arrives as
+  a confident `0`, not a `NULL`. Keep that wrapper — it is what makes an empty
+  archived category report `0` deterministically — but drive the null-out from
+  `SUM(UNCONVERTIBLE_FLAG_EXPR) > 0` in Python, never from the aggregate being
+  `NULL`. A `0` total sitting next to `unconverted_count > 0` is a false total, and
+  it is the exact failure this package exists to remove.
+- **The inflow/outflow totals need this too**, not just the category breakdown.
+  `monthly_report.py:217` and `:219` wrap the home value in
+  `SUM(CASE WHEN signed_home_cents > 0 THEN … ELSE 0 END)` — `NULL > 0` is `NULL`,
+  so an unconvertible row silently scores as **zero** rather than propagating, and
+  an all-unconvertible month returns `0` rather than failing loudly. Pair those two
+  home SUMs with the flag. Leave `:216` and `:218` alone — they are the native
+  figures, which per the rule below are unaffected.
+- ⚠️ **Project the flag inside the CTE.** Both queries aggregate in an outer
+  `SELECT … FROM signed_txns` (`:107-151`, `:188-220`) where the `a` and `r`
+  aliases are out of scope. Select `UNCONVERTIBLE_FLAG_EXPR` as a column within the
+  CTE and sum it by name outside; interpolating it into the outer `SUM` is a hard
+  SQL error.
+- ⚠️ **Fix the Python consumers in the same step.** `monthly_report.py:166`
+  (`int(row["spent_home_cents"])`) and `:175`
+  (`sum(r["spent_home_cents"] for r in rows)`) both `TypeError` on `None` — which
+  is exactly the state this policy now produces. They must handle the null category
+  total, or CR2's own missing-rate test goes red.
 - Surface an `unconverted_count` on dashboard and monthly-report responses.
 - Native-currency figures (`spent_cents`) are unaffected — they never needed a rate.
 
@@ -126,6 +176,15 @@ was wrong (rate-1.0 rows from finding 1.4, forced transfer legs from 1.3). The
 computed value is the correct one. Both tables hold 0 rows as of 2026-08-01, so in
 practice only test fixtures are affected.
 
+**5. Near-midnight transactions may price on a different day than before.** Reads
+now resolve the rate date in the user's `display_timezone` (decision doc, "Which
+calendar day a transaction is priced on"), while the stored value was written from
+the *client's* offset date. For a transaction within a few hours of midnight the
+two can differ by one calendar day, and therefore by one rate row. This is the
+intended convention — it keeps a transaction's rate date and its report month in
+agreement — not a bug to patch back. The divergence disappears in CR3, when writes
+stop resolving rates at all.
+
 ---
 
 ## Tests
@@ -153,10 +212,18 @@ Add:
 
 ## Done when
 
-- [ ] No `COALESCE(t.amount_home_cents, …)` remains anywhere — `grep` returns nothing
+- [ ] No `COALESCE(t.amount_home_cents, …)` remains anywhere — `grep` returns nothing.
+      ⚠️ This grep does **not** cover the aggregate-level `COALESCE(SUM(…), 0)` at
+      `dashboard.py:139,181`; check those by hand and confirm the null-out is driven
+      by the unconvertible count, not by the sum
+- [ ] `lifetime_spent_home_cents` nulls out on `unconverted_count > 0`, same as
+      `spent_home_cents` — a `0` total beside a non-zero count is a bug
 - [ ] No read path reads `amount_home_cents` or `exchange_rate` from a row
 - [ ] `dashboard.py`'s local CASE constants deleted; both files import from
       `home_currency`
+- [ ] `dashboard.py`'s account join is a **`LEFT JOIN`** — archived categories and
+      hashtags with zero transactions still appear with zero totals
+      (`dashboard.py:129-131`); an inner join silently drops them
 - [ ] `unconverted_count` on dashboard + monthly-report responses; categories with
       an unconvertible row report `spent_home_cents: null`
 - [ ] `hashtag_breakdown` still sums to its parent category total

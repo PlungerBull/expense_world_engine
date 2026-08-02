@@ -228,8 +228,17 @@ COALESCE(t.amount_home_cents, t.amount_cents)
 ```
 
 which falls back to **treating USD cents as PEN cents** — a 3.58× understatement
-rendered without complaint. That fallback is removed. It appears 8 times across
-`helpers/monthly_report.py:119-122, 198-201`.
+rendered without complaint. That fallback is removed. It appears **12 times across
+three sites**: `helpers/monthly_report.py:119-122` and `:198-201`, plus
+`routers/dashboard.py:114-117` (`_SIGNED_HOME_CENTS_SQL`, used by both
+archived-lifetime aggregators).
+
+**A per-row `null` is not sufficient on its own.** `SUM` silently skips `NULL`s,
+and `SUM(CASE WHEN x > 0 THEN x ELSE 0 END)` silently scores a `NULL` row as zero,
+so an unflagged aggregate understates exactly like the fallback it replaced. Every
+home-value `SUM` must be paired with a count of unconvertible rows, and a non-zero
+count makes the aggregate `null` rather than a partial total. CR1 exports
+`UNCONVERTIBLE_FLAG_EXPR` for this; CR2 §2 wires it.
 
 **Why the write should no longer fail.** Recording what happened must never be
 blocked by a rate lookup. Two consequences worth having:
@@ -240,6 +249,33 @@ blocked by a rate lookup. Two consequences worth having:
 Scope is narrow in practice — the backfill covers 2024-03-02 → today and the
 daily job runs — but the case is newly reachable, and silence is the wrong
 default.
+
+---
+
+## Which calendar day a transaction is priced on
+
+`expense_transactions.date` is `timestamptz`, so "the transaction's date" is not
+self-evident — a bare `::date` cast resolves in whatever timezone the database
+session happens to carry, which is machine-dependent and must never ship.
+
+**Decision: the rate date is the transaction's date in the user's
+`display_timezone`** — the same zone `compute_month_bounds` uses to bucket months.
+This keeps pricing and reporting coherent: a transaction at
+`2026-03-31T23:00-05:00` is counted in March *and* priced at the March 31 rate.
+Under UTC it would be counted in March but priced at April 1.
+
+Two consequences to know:
+
+- **This diverges from the write path**, which resolves rates from the *client's*
+  offset date (`body.date` is an `AwareDatetime`; Pydantic preserves the offset).
+  That offset is not recoverable from a stored `timestamptz`, so read-time SQL
+  cannot reproduce it. The divergence is deliberate, and it disappears once CR3
+  removes rate resolution from writes entirely.
+- **`display_timezone` is unvalidated user input** (`sql/002:22`, settable via
+  `PUT /auth/settings`). It must reach SQL as a bind parameter, never interpolated.
+  `compute_month_bounds` silently falls back to UTC on an invalid zone name while
+  `AT TIME ZONE` would raise — validating it on write is the root fix and belongs
+  in the fail-closed sweep.
 
 ---
 
