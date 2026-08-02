@@ -8,6 +8,15 @@ still providing readable ``repr()`` output in logs and debuggers.
 from enum import Enum, IntEnum
 
 
+# The one home currency the engine converts to. Locked at the schema level by
+# sql/018 (CHECK main_currency = 'PEN'), so this is a constant rather than a
+# per-user value. It exists because SQL fragments in helpers/home_currency.py
+# interpolate the home currency as a literal — see that module's docstring for
+# why binding it is not an option, and for what has to change if sql/018 is
+# ever reverted.
+HOME_CURRENCY = "PEN"
+
+
 class SystemCategoryKey(str, Enum):
     """Stable discriminator for engine-managed categories.
 
