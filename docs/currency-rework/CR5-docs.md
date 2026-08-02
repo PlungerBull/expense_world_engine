@@ -20,7 +20,42 @@ package's job is to make the docs true, not to restate the plan.
 
 ## `docs/engine-spec.md` — the rulebook
 
-### Remove
+> ⚠️ **Do not work from this list alone.** Two alignment audits (2026-08-01,
+> 2026-08-02) each found sites an earlier enumeration had missed — enumeration is
+> the wrong tool for a sweep. **Start by grepping**, then use the list below as a
+> checklist of known-hard cases, not as the scope:
+>
+> ```
+> grep -n "amount_home_cents\|exchange_rate\|dominant\|RATE_UNAVAILABLE" docs/engine-spec.md
+> ```
+>
+> Every hit is guilty until proven innocent.
+
+### Remove — `amount_home_cents` from individual-record contracts (D-e)
+
+These document a field that no longer exists on transactions or inbox items.
+Line numbers as of 2026-08-02:
+
+| Line | What it says | Action |
+|---|---|---|
+| `:352-353` | inbox response carries `amount_home_cents` and `transfer_amount_home_cents`, *"computed as `amount_cents × exchange_rate` at read time"* | **Delete both bullets.** Neither field nor rate survives. |
+| `:355` | `?debit_as_negative=true` negates `amount_home_cents` | **Correct** — it negates `amount_cents` only; CR2 deleted the home-value branch in `formatting.py` |
+| `:395` | promote *"Computes `amount_home_cents` from `amount_cents × exchange_rate`"* | **Delete the sentence** — promote copies the native amount and nothing else |
+| `:447` | `POST /transactions` *"Auto-populates `exchange_rate` and computes `amount_home_cents` same as inbox"* | **Delete** |
+| `:466` | date change *"re-fetches the historical exchange rate and recalculates `amount_home_cents`"* | **Delete the rule.** Nothing is recalculated because nothing is stored. This is the §468 note below, at its real line. |
+| `:730` | `/sync` row shapes — *"`inbox` rows include `amount_home_cents` / `transfer_amount_home_cents` computed from the stored `exchange_rate`"* | **Correct.** ⚠️ The same paragraph correctly says `accounts` rows return `current_balance_home_cents: null` in sync and that `/dashboard` is canonical for derived values — **keep that**, it is still true. |
+
+⚠️ **`:125` — the exchange-rate precondition block** is the highest-risk single
+paragraph in the file. It states that five named write endpoints return
+`422 RATE_UNAVAILABLE` when no rate exists, and tells clients to *"bypass the lookup
+by supplying an explicit `exchange_rate` on the request."* After CR3 **both halves
+are false**: writes succeed and warn (D-b), and no endpoint accepts an
+`exchange_rate`. Rewrite, don't patch.
+
+Keep the *"No silent `1.0` fallback"* principle in whatever replaces it — that
+invariant survives and is the reason any of this happened.
+
+### Remove — the rest
 
 - **`exchange_rate` from every request and response contract** — transactions,
   batch create, inbox, promote. Gone from the wire in both directions (decision
@@ -33,7 +68,14 @@ package's job is to make the docs true, not to restate the plan.
   (Note: it could never fire anyway, because the schema dropped the key before the
   guard ran — a symptom of the fail-open design CR4 fixed.)
 - **§468** — do **not** add the `account_id` re-rate rule the audit asked for
-  under WP1.5. That finding closed by deletion; there is nothing to re-rate.
+  under WP1.5. That finding closed by deletion; there is nothing to re-rate. The
+  *existing* date-change re-rate rule at `:466` must also go — see the table above.
+- **§545/§547 point 7** (`:545`) — the dominant-side rule, *"the other side's
+  `amount_home_cents` is forced to equal the dominant side's"*, ending with *"No
+  separate FX gain/loss is recognized at transaction time."* Both are reversed: legs
+  store native amounts only, and the FX difference now surfaces as a non-zero
+  `@Transfer`. This is the same claim as `api-design-principles.md:113` — fix both,
+  and make them say the same thing.
 
 ### Add
 
@@ -236,7 +278,17 @@ code before deleting any definition.
 
 ## Done when
 
+- [ ] **Ran the greps first**, not just the checklists — `amount_home_cents`,
+      `exchange_rate`, `dominant`, `RATE_UNAVAILABLE` across `docs/`, `CLAUDE.md`,
+      `TODO.md`. Two prior audits each caught sites an enumeration had missed.
 - [ ] No doc claims transactions store a rate or a home amount
+- [ ] No doc shows `amount_home_cents` on a **transaction or inbox** response
+      shape. Known sites: `engine-spec.md:352,353,355,395,447,466,730`
+- [ ] `engine-spec.md:125` no longer says writes 422 on a missing rate, nor that a
+      client may supply `exchange_rate` to bypass the lookup
+- [ ] Docs still show home values on **reports, month totals, archived lifetime
+      panels and account balances** — the sweep must not over-delete. If
+      `current_balance_home_cents` vanished from the spec, you went too far.
 - [ ] `grep -rn "dominant" docs/ CLAUDE.md TODO.md` returns only dated historical
       entries — **no doc still describes the rule as live**. Known sites:
       `api-design-principles.md:113`, `scaling-boundaries.md:24,35`, `TODO.md:9`
