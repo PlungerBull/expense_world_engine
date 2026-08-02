@@ -15,10 +15,36 @@ The Brain. A Python (FastAPI) backend, backed by Postgres. It is the single sour
 | `docs/schema-reference.md` | Full database schema. |
 | `docs/design-philosophy.md` | UX philosophy and product vision. |
 | `docs/scaling-boundaries.md` | What is business logic (scale-invariant) vs. a scaling constraint (single-user-shaped). Read before arguing that something should be built or deferred "for scale". |
+| `docs/client-breaking-changes.md` | Engine changes that require work in a client repo. Append here whenever a change breaks the CLI/iOS/web contract. |
+| `docs/currency-model-decision.md` | How multi-currency works: native storage, conversion at read time, what `@Transfer ≠ 0` means. Read before touching exchange rates, `amount_home_cents`, or transfer home values. |
+| `docs/currency-rework/` | **Transient (2026-08-01).** Work packages CR1–CR6 executing the above decision, one per agent. Start at its `README.md`. Delete the directory and this row when CR5 lands. |
 
 ## Who this is for
 
 **One user — the owner (since 2026-08-01).** The earlier 1000+ public-users target is retired; if scaling happens it gets a dedicated, professionally-staffed plan. Build what makes daily use work well, not what a hypothetical user base would need. The one obligation this leaves: when a decision is single-user-shaped, record it in `docs/scaling-boundaries.md` instead of leaving it implicit. Ledger correctness is never a scale trade-off — the conventions below hold at any size.
+
+## The engine comes first (2026-08-01)
+
+**The engine's job is to be correct and coherent, not convenient for its clients.**
+We are not live. Prefer breaking a client and fixing the root cause over patching
+around a design flaw — client repos absorb their own churn, that is their job.
+Never let CLI/iOS/web convenience justify keeping a bad shape in the engine.
+
+Corollaries:
+
+- **Fix at the root, not at the call site.** A guard added to stop one symptom is a
+  smell — ask what design let the symptom exist. (Example: the transfer-leg field
+  guard was a deny-list that forgot `category_id`; the fix was inverting it to an
+  allow-list, not adding one more field.)
+- **Fail closed.** Enumerate what is *permitted*, never what is forbidden. New
+  fields must default to blocked, unknown input must 422 rather than be silently
+  dropped, and missing data must surface as `null` + a flag rather than a
+  convenient substitute value.
+- **Breaking a client is a documented cost, not a blocker.** Record it in
+  `docs/client-breaking-changes.md` and proceed.
+
+Do not weigh "this would be less work for the CLI" against engine correctness. It
+is not a factor.
 
 ## Tech stack
 
@@ -80,7 +106,7 @@ Before writing a new helper, utility, or service function, check if one already 
 | — | **Phase 1 complete. Deployed to Render.** | ✅ Done |
 | 8 | Reconciliations | ✅ Done |
 | 9 | Sync, Dashboard, Reports, Activity reads, Exchange rates | ✅ Done |
-| 9.1 | Home Currency Recalculation | ✅ Done |
+| 9.1 | ~~Home Currency Recalculation~~ | ⛔ Retired 2026-08-01 — home currency locked to PEN (`sql/018`); helper deleted |
 | 9.2 | Personal Access Tokens (CLI auth) | ✅ Done |
 | 9.3 | Profile mutation (`PUT /auth/profile`) | ✅ Done |
 | 9.4 | Opening balances (`@Opening` + report exclusion) | ✅ Done |
