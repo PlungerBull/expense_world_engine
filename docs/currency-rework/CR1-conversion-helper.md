@@ -107,6 +107,21 @@ a constant, not user input, and never reaches these strings from a request. Note
 the docstring that if that CHECK is lifted, these become builder functions taking
 `home_currency`, and the `'USD'` guard below must be revisited at the same time.
 
+⚠️ **This is in tension with `sql/018`, deliberately.** That migration's comment
+argues the home-currency policy should live at the `user_settings.main_currency`
+chokepoint "rather than as a `'PEN'` literal scattered through the codebase", and
+these fragments bypass `main_currency` entirely. The tension is resolved in favour
+of the constant because the alternative — binding `<home>` — forces *all five*
+exports to become builders for a value that cannot vary. Two obligations follow:
+
+- Record the divergence in the module docstring, alongside the "if the CHECK is
+  lifted" note, so a future author finds both facts in one place.
+- **CR2 must assert the two agree.** Its call sites already hold
+  `settings["main_currency"]` from `get_user_report_settings`; comparing it to
+  `HOME_CURRENCY` costs nothing and makes a lifted CHECK fail loudly instead of
+  silently pricing a non-PEN user's whole ledger in PEN. The assertion belongs to
+  CR2 (nothing here has a caller); this package only records the requirement.
+
 **The timezone is the opposite case** — user-settable and therefore a bind
 parameter, which is why `HOME_RATE_JOIN` is a builder. See the timezone note under
 "Background you need" before writing it.
@@ -153,15 +168,35 @@ export them as module constants and name them in the docstring, so CR2 and the
 parity test embed the same scaffold rather than two. Several current queries do not
 join the accounts table — note in the docstring that CR2 must add that join.
 
+⚠️ **Spell out that the join is a `LEFT JOIN`**, not just "a join":
+
+```sql
+LEFT JOIN expense_bank_accounts a ON a.id = t.account_id
+```
+
+`dashboard.py`'s archived aggregators reach transactions through a `LEFT JOIN`
+(`:141-144`, `:188-191`) precisely so empty categories and hashtags survive. An
+inner join to the accounts table would re-drop every one of them — destroying the
+same invariant the `t.id IS NOT NULL` guard below exists to protect, one join
+later. On a category with no transactions `a.*` is then `NULL`, the lateral's `ON`
+is `NULL`, `r.rate` is `NULL`, and the guard does its job.
+
 **2. `HOME_CENTS_EXPR`** — the unsigned home value:
 
 ```sql
 CASE
     WHEN a.currency_code = <home> THEN t.amount_cents
-    WHEN r.rate IS NOT NULL       THEN round(t.amount_cents * r.rate)
+    WHEN r.rate IS NOT NULL       THEN round(t.amount_cents * r.rate)::bigint
     ELSE NULL
 END
 ```
+
+⚠️ **The `::bigint` is not decoration.** `t.amount_cents` is `bigint` but
+`round(bigint * numeric)` is `numeric`, so without the cast the whole `CASE`
+resolves to `numeric` and asyncpg hands CR2 a `Decimal` on any per-row projection.
+Nothing breaks today — every current call site wraps the expression in
+`SUM(...)::bigint` — but the export should have one predictable type rather than
+one that depends on which arm fired. The cast changes no value.
 
 ⚠️ **`NULL` is the missing-rate signal.** Never `COALESCE` it to
 `t.amount_cents` — that is the existing bug being removed (it treats USD cents as
@@ -198,7 +233,8 @@ CASE WHEN t.id IS NOT NULL AND (<HOME_CENTS_EXPR>) IS NULL THEN 1 ELSE 0 END
 
 ⚠️ **The `t.id IS NOT NULL` guard is required, not defensive.** `dashboard.py`'s
 archived aggregators `LEFT JOIN` transactions so that categories and hashtags with
-no transactions survive with zero totals (`:129-131`). On those rows `t.*` and `a.*`
+no transactions survive with zero totals (`:141-144`, `:188-191`). On those rows
+`t.*` and `a.*`
 are all `NULL`, so `HOME_CENTS_EXPR` falls to its `ELSE NULL` arm — indistinguishable
 from a genuinely unconvertible row. Verified:
 
@@ -443,6 +479,8 @@ docstring note pointing at WP1.7 so the gap is recorded rather than rediscovered
       casts as `(t.date AT TIME ZONE <tz_param>)::date`
 - [ ] The timezone is bound, never interpolated; `<home>` is interpolated from the
       single `HOME_CURRENCY` constant
+- [ ] `HOME_CENTS_EXPR` casts the converted arm `::bigint`, so the expression has
+      one type regardless of which arm fires
 - [ ] `SIGNED_HOME_CENTS_EXPR` wraps `HOME_CENTS_EXPR` by reference rather than
       re-deriving the multiplication
 - [ ] `UNCONVERTIBLE_FLAG_EXPR` carries the `t.id IS NOT NULL` guard, and is
@@ -451,10 +489,12 @@ docstring note pointing at WP1.7 so the gap is recorded rather than rediscovered
 - [ ] Module docstring states: `NULL` means unconvertible and must never be
       coalesced; the aggregation contract (every `SUM` paired with the
       unconvertible count, non-zero count ⇒ `null` not a partial total); the
-      caller's query must join `expense_bank_accounts a` using the contracted
-      aliases; rate dates resolve in the user's `display_timezone` and why that
-      diverges from the write path; and the `get_rate` duplication + why the parity
-      test exists
+      caller's query must **`LEFT JOIN`** `expense_bank_accounts a ON a.id =
+      t.account_id` using the contracted aliases; rate dates resolve in the user's
+      `display_timezone` and why that diverges from the write path; the
+      `HOME_CURRENCY`-vs-`main_currency` divergence from `sql/018` and CR2's
+      obligation to assert they agree; and the `get_rate` duplication + why the
+      parity test exists
 - [ ] Parity test covers all six matrix rows above. Rows 2–6 assert SQL/`get_rate`
       **agreement** rather than absolute values; row 1 (PEN→PEN) instead asserts
       the home value equals the native amount
@@ -465,6 +505,8 @@ docstring note pointing at WP1.7 so the gap is recorded rather than rediscovered
       accepting it, since the UTC-user version is vacuous
 - [ ] A separate test pins the `NULL` (unconvertible) path at a date below the
       suite-wide seed floor
+- [ ] A separate test reproduces the `dashboard` `LEFT JOIN` shape and asserts an
+      empty archived category flags **0**, not 1
 - [ ] Parity test clears the `get_rate` cache and cleans up only its own seeded
       rate dates
 - [ ] **Nothing else imports the new module yet** — this package wires nothing
