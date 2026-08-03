@@ -30,6 +30,18 @@ package's job is to make the docs true, not to restate the plan.
 > ```
 >
 > Every hit is guilty until proven innocent.
+>
+> ⚠️ **Widen the grep for D-g / D-h / D-i** (2026-08-02). Three further decisions
+> landed mid-CR2 and each deletes a family of fields:
+>
+> ```
+> grep -rn "lifetime_spent\|spent_cents\|inflow_cents\|outflow_cents\|net_cents" docs/
+> grep -rn "current_balance_home_cents\|balance_home_cents" docs/
+> ```
+>
+> ⚠️ **And grep `app/`, not just `docs/`.** This package has only ever swept
+> documentation, so wrong *code comments* survive every pass — including a
+> **user-facing** one. See "Stale comments in `app/`" below.
 
 ### Remove — `amount_home_cents` from individual-record contracts (D-e)
 
@@ -43,7 +55,7 @@ Line numbers as of 2026-08-02:
 | `:395` | promote *"Computes `amount_home_cents` from `amount_cents × exchange_rate`"* | **Delete the sentence** — promote copies the native amount and nothing else |
 | `:447` | `POST /transactions` *"Auto-populates `exchange_rate` and computes `amount_home_cents` same as inbox"* | **Delete** |
 | `:466` | date change *"re-fetches the historical exchange rate and recalculates `amount_home_cents`"* | **Delete the rule.** Nothing is recalculated because nothing is stored. This is the §468 note below, at its real line. |
-| `:730` | `/sync` row shapes — *"`inbox` rows include `amount_home_cents` / `transfer_amount_home_cents` computed from the stored `exchange_rate`"* | **Correct.** ⚠️ The same paragraph correctly says `accounts` rows return `current_balance_home_cents: null` in sync and that `/dashboard` is canonical for derived values — **keep that**, it is still true. |
+| `:730` | `/sync` row shapes — *"`inbox` rows include `amount_home_cents` / `transfer_amount_home_cents` computed from the stored `exchange_rate`"* | **Delete.** ⚠️ The same paragraph says `accounts` rows return `current_balance_home_cents: null` in sync — **that is now false too** (D-i removed the field; there is nothing left to null). The surviving true claim is that `/dashboard` is canonical for derived values and clients must not recompute — keep only that sentence. |
 
 ⚠️ **`:125` — the exchange-rate precondition block** is the highest-risk single
 paragraph in the file. It states that five named write endpoints return
@@ -81,14 +93,21 @@ invariant survives and is the reason any of this happened.
 
 - **The currency model**, or a pointer to `currency-model-decision.md` — native
   storage, read-time conversion, rate on the transaction's date.
-- **Where PEN appears, and where it does not** (decision D-e). Reports, month
-  totals, archived lifetime panels and account balances carry a home-currency
-  figure; individual transactions and inbox items do **not**. State the rule —
-  *figures the user compares or sums across currencies* — rather than listing
-  endpoints, so it stays true as endpoints are added.
-- **`amount_home_cents` removed from transaction/inbox responses** as a second
-  documented exception to null-over-omission, alongside `exchange_rate`. Absent,
-  not `null`.
+- **Where currency appears** (decisions D-e, D-h, D-i). State it as the three-level
+  rule, not as an endpoint list, so it stays true as endpoints are added:
+
+  | Level | Native | PEN |
+  |---|---|---|
+  | Individual records — transactions, inbox | **only** | none |
+  | Per-account figures — balances, reconciliations | **only** | none |
+  | Cross-account aggregates — category, hashtag, month totals | none | **only** |
+
+  In practice that means the monthly report and its month totals carry a PEN figure
+  and **nothing else does**. Say so plainly, and say that **no net-worth total
+  exists**, so its absence reads as a decision rather than a gap.
+- **`amount_home_cents`, `current_balance_home_cents`, the reconciliation balances
+  and the native aggregates are removed, not nulled** — documented exceptions to
+  null-over-omission alongside `exchange_rate`. Absent, not `null`.
 - **`unconverted_count` appears at two levels** (decision D-f): per category /
   hashtag row, and once per report — per month in the multi-month range form. Note
   that the report-level figure counts **distinct transactions**, so it is not the
@@ -158,21 +177,37 @@ Must cover:
 1. **`exchange_rate` no longer accepted on any write.** `POST`/`PUT` transactions,
    batch, inbox, opening-balance.
 2. **`exchange_rate` absent from every response.** Absent, not null.
-2b. **`amount_home_cents` absent from transaction and inbox responses**, and from
-   their `/sync` payloads. Absent, not null. State plainly what is **kept**, since
-   the risk is a client stripping home-currency handling wholesale:
-   `current_balance_home_cents` on accounts, and
-   `spent_home_cents` / `net_home_cents` / `inflow_home_cents` /
-   `outflow_home_cents` / `lifetime_spent_home_cents` on reports and the dashboard
-   are all unchanged. Verified 2026-08-02 that the CLI never read the
-   per-transaction field, so this item is expected to be zero work for it.
+2b. **`amount_home_cents` absent from transaction and inbox responses** (D-e), and
+   from their `/sync` payloads. Absent, not null.
+2c. **`current_balance_home_cents` absent from every account response and `/sync`;
+   `beginning_/ending_balance_home_cents` absent from every reconciliation
+   response** (D-i). ⚠️ **State that no cross-account total replaces them** — the
+   engine reports no net worth, deliberately, and a client must not synthesise one
+   by converting (clients never convert).
+2d. **`spent_cents`, `inflow_cents`, `outflow_cents`, `net_cents` absent from the
+   dashboard and monthly report** (D-h), because a category spanning two accounts
+   summed dollars into soles.
+2e. **`archived_categories` and `archived_hashtags` absent from `/dashboard`**
+   (D-g). `archived_accounts` survives.
+
+   ⚠️ **State plainly what is kept**, since the risk is a client stripping
+   home-currency handling wholesale — after D-e/D-g/D-h/D-i the surviving list is
+   short: `spent_home_cents` per category and per hashtag row, and
+   `inflow_/outflow_/net_home_cents` on month totals. **That is the entire set.**
 3. **New `warnings` on create/update** when a rate is unavailable.
-4. **New `unconverted_count`** on dashboard and monthly-report responses;
-   `spent_home_cents` may now be `null`.
+4. **New `unconverted_count`** at two levels (D-f) on dashboard and monthly-report
+   responses; `spent_home_cents` may now be `null`.
 5. **`@Transfer` may be non-zero** — clients must not assume it cancels. Explain
    both causes.
 6. **System `category_id` → 422.**
 7. **Transfer-leg `category_id` → 422.**
+8. **`?debit_as_negative=true` no longer negates any home value** — there is none
+   left on a record to negate.
+
+⚠️ **Correct the existing entry too.** `client-breaking-changes.md:79` claims *"No
+amounts, balances, or transaction shapes changed. Nothing needs re-syncing."* That
+was true on 2026-08-01 and is false after this rework. Amend it in place with a
+dated pointer to the new entry rather than deleting it.
 
 Include the per-call-site CLI table from [CR6](CR6-cli-handoff.md) so the CLI
 maintainer has one place to work from.
@@ -201,13 +236,82 @@ are computed at read time; and a cross-currency transfer therefore shows its spr
 rather than being forced to zero. Keep the industry framing but correct the
 conclusion — production systems recognise the difference, they do not hide it.
 
-Check the other four hits in this file for the same assumption.
+Check the other four hits in this file for the same assumption. **Two are already
+known stale** — name them rather than leaving them to the grep:
+
+- **`:91`** — *"Every API response containing an amount — at any level of
+  aggregation — includes a home-currency version alongside the native amount. This
+  applies to individual transactions (`amount_home_cents`), category totals, account
+  balances, monthly summaries…"* Reversed by D-e, D-h and D-i in three separate
+  places. Replace with the three-level rule from [README.md](README.md). The
+  sentence *"The engine is exclusively responsible for currency conversion. The
+  frontend never performs it"* is **still true and more load-bearing than before** —
+  keep it verbatim.
+- **`:59`** — *"The `amount_home_cents` and related fields returned by `/sync`
+  reflect FX rates at sync time and drift as rates move."* No such field is returned
+  by `/sync` any more. The paragraph's conclusion — that `/dashboard` is canonical
+  for derived values and clients must not recompute — survives; its premise does not.
 
 ---
 
-## `docs/scaling-boundaries.md` — three stale rows
+## D-g / D-h / D-i — three further families of removals (2026-08-02)
+
+Landed mid-CR2, after this package was last revised. Each deletes fields the spec
+documents at length.
+
+**D-g — archived lifetime panels deleted.** `engine-spec.md:823-845` — the whole
+`?include_archived=true` block. Rewrite it: the response gains **`archived_accounts`
+only**. Delete the `archived_categories` / `archived_hashtags` JSON examples and the
+`lifetime_spent_cents` / `lifetime_spent_home_cents` semantics paragraph at `:845`.
+
+**D-h — native aggregates deleted.** Every `spent_cents` / `inflow_cents` /
+`outflow_cents` / `net_cents` occurrence in the dashboard and monthly-report
+contracts, including the JSON examples at `:779-794` and `:861-865`. ⚠️ **Two
+invariants are worded against deleted fields and must be restated, not dropped:**
+
+| Where | Now reads | Must read |
+|---|---|---|
+| `engine-spec.md:815` | breakdown rows sum to the category's **`spent_cents`** | …to its **`spent_home_cents`**; a `null` parent has `null` rows |
+| `scaling-boundaries.md:28` | *"visible rows sum exactly to **`net_cents`**"* | …to **`net_home_cents`** |
+
+`scaling-boundaries.md:28` sits under **business logic — scale-invariant**. The
+invariant is unchanged and must stay there; only the field name moves. It is also
+the reason archived categories remain in the monthly report — see CR2's
+"Archived categories stay" section, and say so in the spec so the missing
+`is_archived` filter is documented as deliberate.
+
+**D-i — per-account PEN deleted.** Every `current_balance_home_cents` occurrence
+(accounts, dashboard panels, `/sync` — including the `:730` paragraph that says sync
+rows null it, which now has no field to null) and the reconciliation
+`beginning_/ending_balance_home_cents`. State plainly that **the engine reports no
+net-worth total**, so its absence reads as a decision rather than a gap.
+
+---
+
+## Stale comments in `app/` — not just docs
+
+Grep the code, not only `docs/`. Known wrong after CR2/CR3:
+
+| Site | Problem |
+|---|---|
+| **`app/errors.py:102-106`** | **User-facing.** The `RATE_UNAVAILABLE` message tells the caller to *"supply an explicit `exchange_rate`"* — a request field CR3 deletes. Fix or delete with the error |
+| `app/jobs/backfill_exchange_rates.py:28` | *"which is the whole reason `amount_home_cents` is cached per transaction"* — no longer true |
+| `app/helpers/exchange_rate.py:180` | describes `lookup_exchange_rate`'s write-blocking role, retired by D-b |
+| `app/helpers/transfers.py:120-141` | the dominant-side rationale block, deleted with the rule |
+| `app/helpers/transactions.py:388` | references the stored home value |
+
+---
+
+## `docs/scaling-boundaries.md` — four stale rows
 
 ⚠️ **Also omitted from an earlier draft.**
+
+- **`:16`** — table row *"Home-currency amount alongside every amount; the engine is
+  the only converter"*, filed under **business logic — scale-invariant**. The first
+  clause is exactly what D-e/D-h/D-i reverse. The second clause (*"the engine is the
+  only converter"*) is still true and load-bearing — keep it, and replace the first
+  with the three-level rule from [README.md](README.md).
+- **`:28`** — the `net_cents` → `net_home_cents` restatement above.
 
 - **`:24`** — table row *"Transfer pairing + cross-currency zero-sum via the
   dominant-side rule"*. The rule is gone; transfer pairing remains. Rewrite the row

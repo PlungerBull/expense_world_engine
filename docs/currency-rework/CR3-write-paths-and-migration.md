@@ -129,6 +129,18 @@ values back. Reference `docs/currency-model-decision.md`.
 
 **Both tables hold 0 rows (verified 2026-08-01)** — no data migration.
 
+### Idempotency-key cutover
+
+`helpers/idempotency.py:70-80` replays a stored `response_snapshot` **verbatim** for
+24 hours. So a write issued before this rework and retried after it returns the
+**old response shape** — carrying `amount_home_cents`, `exchange_rate`, and any
+other field CR2/CR3 removed — from a code path that no longer produces those fields.
+
+Not a correctness bug (the replay is doing its job), but it is a 24-hour window in
+which the contract is not what the docs say. Either purge `idempotency_keys` when
+`sql/019` is applied, or state the window explicitly in the release note. Purging is
+simpler and the table is disposable by design (24h TTL).
+
 `exchange_rates`, `app/jobs/fetch_exchange_rates.py` and
 `app/jobs/backfill_exchange_rates.py` are **kept and become load-bearing** —
 every report now reads them at query time.

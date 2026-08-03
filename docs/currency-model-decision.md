@@ -16,6 +16,55 @@ Nothing converted is ever stored.
 
 ---
 
+## Where currency appears
+
+**Amended 2026-08-02** (decisions D-e, D-g, D-h, D-i in
+[`currency-rework/README.md`](currency-rework/README.md)). The original version of
+this document assumed every response carrying an amount would carry a PEN version
+too — the convention inherited from the stored-column model. It doesn't.
+
+| Level | Native | PEN |
+|---|---|---|
+| Individual records — transactions, inbox items | **only** | none |
+| Per-account figures — balances, reconciliations | **only** | none |
+| Cross-account aggregates — category, hashtag, month totals | none | **only** |
+
+**The reasoning is one sentence: conversion belongs wherever currencies are
+combined, and nowhere else.** A transaction belongs to one account, so it is in one
+currency — a second number on the row is noise. A balance and a reconciliation are
+scoped to one account, so the same holds. Only an aggregate spans accounts, and
+categories and hashtags are **assumed** to span currencies rather than checked.
+
+Two consequences worth stating outright, because both look like omissions:
+
+- **There is no net-worth total.** Nothing sums balances across accounts. You read
+  S/8,500 and $1,200 side by side.
+- **A category whose date has no rate reports nothing at all** —
+  `spent_home_cents: null` with no native figure beside it, because the native
+  aggregate was removed as meaningless. Fail-closed, by design.
+
+### What re-adding a per-record or per-account PEN value would cost
+
+Recorded so a future reader inherits the price instead of rediscovering it:
+
+- `INSERT ... RETURNING *` cannot join to `expense_bank_accounts` or
+  `exchange_rates`, so **every write path would need a follow-up read** inside its
+  transaction — ~14 sites across `helpers/transactions.py`, `helpers/transfers.py`
+  and `helpers/inbox.py`.
+- Those write paths would each need the user's `display_timezone`, which they do not
+  load today.
+- The inbox needs the join **twice** — `account_id` and `transfer_account_id` are
+  different accounts — and `helpers/home_currency.py` hardcodes its table aliases, so
+  it would need alias-parameterised builders.
+- Account and reconciliation values would need `get_home_balance` and
+  `resolve_home_rates` rebuilt, along with the rate-date and duplicate-settings
+  problems that deleting them solved.
+
+If a future view genuinely needs a comparable column across currencies, the cheap
+answer is a new aggregate endpoint, not a field on every row.
+
+---
+
 ## Why this document exists
 
 The engine had four surfaces that show a PEN value for non-PEN money, and each
@@ -32,6 +81,13 @@ used a different mechanism:
 four surfaces already worked the way this decision mandates. **This is not a new
 architecture — it is finishing a conversion that was already half done and never
 completed.**
+
+⚠️ **Amended 2026-08-02.** The four-surface framing above is the *diagnosis*, and it
+holds. The *remedy* went further than "make all four convert at read time": under
+D-g/D-h/D-i, three of the four stop converting altogether. Inbox and transactions
+lose their PEN value, account balances and reconciliations lose theirs, and only the
+report converts. So the count that matters afterwards is **one surface, one
+mechanism** (`helpers/home_currency.py`) — not four surfaces agreeing.
 
 Every 🔴 finding in WP1 is the same failure: *a derived value was stored, then
 not kept in sync with what derives it.*
@@ -86,36 +142,25 @@ Migration `sql/019`.
 | `expense_bank_accounts.currency_code` | the only place currency lives |
 | **the `exchange_rates` table** | the rate history reads convert from — now load-bearing |
 | `app/jobs/fetch_exchange_rates.py`, `app/jobs/backfill_exchange_rates.py` | same reason |
-| `amount_home_cents` on **reports and account balances** | computed instead of stored |
+| `spent_home_cents` and the month totals on **the monthly report** | computed instead of stored — and the only surviving PEN figures |
 
-### Where PEN appears — amended 2026-08-02
+### Where PEN appears
 
-> The first version of this document said *"the response contract does not change —
-> every response with an amount includes a home-currency version."* **That was
-> wrong**, and the owner corrected it while CR2 was being planned.
+> **Revised twice on 2026-08-02.** The first version of this document said *"the
+> response contract does not change — every response with an amount includes a
+> home-currency version."* That was wrong (D-e). A narrower version then kept PEN on
+> archived lifetime panels and account balances; that was also wrong (D-g, D-h, D-i).
+> The settled rule is in **"Where currency appears"** near the top of this document.
 
-The rule is not "every amount." It is **figures the user compares or sums across
-currencies**:
+The short form: **the monthly report and its month totals. Nothing else.** Individual
+records, account balances and reconciliations report native currency only, and the
+native aggregates that used to sit beside the PEN ones were removed because
+`GROUP BY category_id` has no currency partition — `$15 + S/25 = 4000` is a number in
+no currency, which the "Research basis" section below records as a hard constraint.
 
-| Surface | PEN? |
-|---|---|
-| Monthly report — per category / per hashtag, single month **and** multi-month range | ✅ |
-| Month totals — inflow / outflow / net | ✅ |
-| Dashboard — archived lifetime panels | ✅ |
-| Account balances (`current_balance_home_cents`) | ✅ — the only place you see all your money at once |
-| **Individual transactions** | ❌ removed |
-| **Inbox items** | ❌ removed |
-
-A PEN account shows soles; a USD account shows dollars; their transactions show the
-account's currency and nothing else. A second number on every ledger row is noise —
-the rows in any one account are all the same currency anyway.
-
-**Evidence this is right, not merely cheaper:** the CLI has **zero** references to
-transaction-level `amount_home_cents`. It reads `current_balance_home_cents` and
-`spent_home_cents` / `net_home_cents` only. The per-transaction value was computed
-on every write, stored, serialised and shipped — and rendered by nobody. The CLI's
-own docstring (`reports_cmd.py:80-81`) already calls home currency *"the only column
-comparable across a multi-currency ledger."*
+A PEN account shows soles; a USD account shows dollars; their transactions and
+balances show the account's currency and nothing else. Consolidation happens where
+figures are combined, which is the report.
 
 The field is **absent, not `null`** — a documented exception to null-over-omission,
 same as `exchange_rate` and the retired `recalculation` field. A permanently-`null`

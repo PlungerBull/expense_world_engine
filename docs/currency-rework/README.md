@@ -35,6 +35,13 @@ using the rate on the transaction's date. Two of the engine's four home-value
 surfaces (account balances, reconciliations) already work this way — this finishes
 a conversion that was half done.
 
+**Revised 2026-08-02 (D-e, D-g, D-h, D-i).** The rework got narrower than that
+paragraph implies. PEN now appears on **one** surface — the monthly report's
+category and hashtag rows plus its month totals. Individual records, account
+balances and reconciliations report native currency only, so the two surfaces named
+above stop converting rather than being finished. Seven conversion mechanisms
+collapse to one: `helpers/home_currency.py`.
+
 ---
 
 ## Packages
@@ -42,7 +49,7 @@ a conversion that was half done.
 | # | Package | Scope | Ends green? |
 |---|---|---|---|
 | **CR1** | [Conversion helper](CR1-conversion-helper.md) | new `app/helpers/home_currency.py` + parity test. Nothing wired. | 🟢 zero behaviour change |
-| **CR2** | [Read paths](CR2-read-paths.md) | reads compute instead of reading the column. **Behaviour changes here.** | 🟢 |
+| **CR2** | [Read paths](CR2-read-paths.md) | four deletion steps (D-g, D-e, D-i, D-h) then one construction step — the monthly report computes instead of reading the column. **Behaviour changes here.** | 🟢 |
 | **CR3** | [Write paths + migration](CR3-write-paths-and-migration.md) | writes stop resolving rates; `sql/019` drops the columns | 🟢 |
 | **CR4** | [Fail-closed sweep](CR4-fail-closed.md) | allow-lists, `extra="forbid"`, system-category lock | 🟢 |
 | **CR5** | [Docs](CR5-docs.md) | spec, schema-reference, audit plan, client-breaking-changes | 🟢 |
@@ -63,20 +70,18 @@ CR4 §5c (system-category lock) touches only helpers/validation.py
 output. Do not parallelise CR1–CR5.
 
 **Every package must end with `pytest` green** (no flags, against
-`expense_world_test`). 165 tests pass as of 2026-08-01; expect a lower count after
-CR3's deletions. If a package leaves the suite red, it is not done.
+`expense_world_test`). **178 tests** pass as of 2026-08-02 (CR1 added 13); expect a
+lower count after CR2's and CR3's deletions. If a package leaves the suite red, it
+is not done.
 
 ---
 
 ## Phase 0 — prerequisites (do once, before CR1)
 
 1. ✅ **Principle recorded** in `CLAUDE.md` → "The engine comes first".
-2. ⬜ **Commit the staged WP1.1 work.** The tree currently holds uncommitted
-   changes: `sql/018`, `helpers/auth.py`, `schemas/auth.py`, the deleted
-   `recalculate_home_currency.py` + its tests, doc updates, and the new
-   `currency-model-decision.md` / `scaling-boundaries.md` /
-   `client-breaking-changes.md`. Commit before starting CR1 so each package is a
-   clean diff.
+2. ✅ **WP1.1 work committed** (`edf0d3a`) — `sql/018`, the deleted
+   `recalculate_home_currency.py`, and the new `currency-model-decision.md` /
+   `scaling-boundaries.md` / `client-breaking-changes.md`.
 3. ⬜ **Test database exists.** `deploy/local/create-test-db.sh`. Re-run with
    `--force` after CR3's migration.
 
@@ -90,8 +95,11 @@ CR3's deletions. If a package leaves the suite red, it is not done.
 | **D-b** | A write whose date has no resolvable rate **succeeds and warns** | Recording reality must not depend on a rate lookup. The warning names the missing pair and date so the operator knows to run the backfill. |
 | **D-c** | Currency rework precedes the reconciliation-chaining retirement | Three open 🔴s vs one 🟠 whose findings are already superseded on paper. |
 | **D-d** | **`@FX` category is deferred**, not rejected | Specified in the decision doc §"Deferred: `@FX`". Report-layer only to add later — no migration, no data change. **Do not build it in this rework.** |
-| **D-e** | **Individual transactions and inbox items carry no PEN value.** `amount_home_cents` is removed from their responses, not recomputed. Reports, month totals, archived lifetime panels and account balances keep theirs. *(2026-08-02, mid-CR2)* | A PEN account shows soles, a USD account shows dollars; rows within one account are all the same currency, so a second number per row is noise. Consolidation belongs where figures are combined — the report. Verified: the CLI has **zero** references to transaction-level `amount_home_cents`; it was computed, stored, shipped and rendered by nobody. **This deleted CR2's largest step** (re-reading every row after every write, ~12 call sites) and the dual-implementation risk with it. |
+| **D-e** | **Individual transactions and inbox items carry no PEN value.** `amount_home_cents` is removed from their responses, not recomputed. *(2026-08-02, mid-CR2)* | A PEN account shows soles, a USD account shows dollars; rows within one account are all the same currency, so a second number per row is noise. Consolidation belongs where figures are combined — the report. The field was computed, stored, shipped and rendered by nobody. **This deleted CR2's largest step** (re-reading every row after every write, ~12 call sites) and the dual-implementation risk with it. |
 | **D-f** | **`unconverted_count` is reported at both levels** — per category / hashtag row, and once per report | The per-row count is already computed to decide whether to null the row, so it is free; the report-level one is what makes a user notice, since a blank cell is easy to skim past. ⚠️ The roll-up must be `COUNT(DISTINCT t.id)` — a transaction appears in both its category row and its hashtag row. |
+| **D-g** | **`archived_categories` and `archived_hashtags` are deleted from `/dashboard`.** `archived_accounts` stays. *(2026-08-02, mid-CR2)* | No rationale was ever recorded for them (commit `296083a` is titled only "archive categories/hashtags"). `compute_month_flow`'s category query has no `is_archived` filter, so archived categories already appear in every monthly report, and `/reports/monthly` accepts a 24-month range — the lifetime figure is a roll-up of something already obtainable. Both aggregators also omitted the `@Opening` exclusion the monthly report has, so every lifetime total was inflated and nobody noticed. An archived *account* still holds real money; an archived *category* holds only history. |
+| **D-h** | **Cross-account aggregates report PEN only.** `spent_cents` (category and hashtag rows) and `inflow_cents` / `outflow_cents` / `net_cents` (month totals) are removed. *(2026-08-02, mid-CR2)* | `monthly_report.py:148,174,216,218` groups by category with no currency partition, so a category spanning both accounts sums `$15 + S/25 = 4000` — a number in no currency. This violates the hard constraint at `../currency-model-decision.md:488`: *"never emit a total that sums across currencies without converting."* **Categories and hashtags are assumed to span currencies rather than checked**, so there is no native aggregate worth preserving — not as a nullable field, not as a per-currency map. |
+| **D-i** | **Per-account figures are native only.** `current_balance_home_cents` is removed from accounts and `/sync`; `beginning_/ending_balance_home_cents` from reconciliations. **No cross-account total replaces them** — the engine reports no net worth. *(2026-08-02, mid-CR2)* | A balance and a reconciliation are scoped to one account, therefore one currency, so the native figure is already complete. The absence of a total is deliberate: accounts are read in their own currency. **This deletes three of the seven conversion mechanisms** — `resolve_home_rates`, `get_home_balance`, `batch_get_rates` all lose every caller — and closes five review findings by deletion: the UTC `date_end` rate (F10), the UTC `today` rate (F11), three of four duplicate `main_currency` queries (F12), the double `get_home_balance` per mutation that made the activity log non-reproducible (F13), and an account query missing its `user_id` filter (F17). |
 
 ---
 
@@ -109,12 +117,24 @@ Check these before declaring any package done:
 - **Null over omission.** Optional fields return `null`, never absent. Two
   deliberate exceptions, both *removed* from the schema rather than nulled:
   `exchange_rate` (CR3) and `amount_home_cents` on transactions / inbox items (CR2).
-- **PEN appears only on cross-currency figures** — reports, month totals, archived
-  lifetime panels, and account balances. **Not** on individual transactions or
-  inbox items. Computed at read time, never stored. See D-e below.
-- **`current_balance_home_cents` on accounts is untouched** by this rework, in
-  either direction. It is already read-time, the CLI renders it, and it is the only
-  view showing all your money at once.
+- **Currency appears by level, not by endpoint.** The rule, from D-e / D-h / D-i:
+
+  | Level | Native | PEN |
+  |---|---|---|
+  | Individual records — transactions, inbox | **only** | none (D-e) |
+  | Per-account figures — balances, reconciliations | **only** | none (D-i) |
+  | Cross-account aggregates — category, hashtag, month totals | none (D-h) | **only** |
+
+  A record is in one currency. An account is in one currency. Only an aggregate
+  spans currencies. So conversion belongs at exactly one level and nowhere else,
+  and it is computed at read time, never stored.
+- **Visible rows sum exactly to the month total.** `scaling-boundaries.md:28`,
+  filed as never-trade-away business logic. ⚠️ It is worded against `net_cents`,
+  which D-h deletes — CR5 restates it as `net_home_cents`; the invariant itself is
+  unchanged. It is also what forces archived categories to **stay** in the monthly
+  report: the category list and the totals come from two independent queries, so
+  filtering archived out of the list would strand their transactions inside the
+  total with no row explaining them.
 - **Balance atomicity, idempotency, activity log, soft delete** — untouched.
 
 ---
