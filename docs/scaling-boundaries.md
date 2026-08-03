@@ -10,10 +10,31 @@
 
 These are the ledger's truth. They hold identically for 1 user and 1,000,000, and a scaling project must preserve every one of them unchanged. None of these is a performance trade-off; they are correctness.
 
+> ### ⚠️ Three rows are superseded by the currency rework — read before treating them as binding
+>
+> **Added 2026-08-02.** The three rows marked ⏳ below — and the closing paragraph
+> of this section — still describe the code *as it stands today*, so they are not
+> yet false. But decisions **D-b** and **D-e** through **D-i**
+> ([`currency-rework/README.md`](currency-rework/README.md)) replace them, and
+> CR2/CR3 are the packages that do it.
+>
+> A fourth row, `@Opening`, is **not** superseded: the invariant holds exactly as
+> written and only the field it names changes (`net_cents` → `net_home_cents`).
+>
+> **If you are implementing CR2 or CR3, these rows are not an objection to your
+> work.** They are pending rewrites, owned by CR5, which documents what shipped
+> rather than what was planned. Do not stop on them; do not "fix" the code to
+> satisfy them.
+>
+> The rows that are **not** marked are untouched and fully binding — in particular
+> *"the engine is the only converter"*, *"`@Opening` excluded from flow reports;
+> visible rows sum exactly to the month total"*, and *"never a silent `1.0`"* are
+> all **more** load-bearing after the rework, not less.
+
 | Invariant | Where |
 |---|---|
 | Sign convention — signed request → typed storage (`transaction_type`, `transfer_direction`) → positive response | [engine-spec.md](engine-spec.md), CLAUDE.md |
-| Home-currency amount alongside every amount; the engine is the only converter | [api-design-principles.md](api-design-principles.md) |
+| ⏳ Home-currency amount alongside every amount; the engine is the only converter | [api-design-principles.md](api-design-principles.md) — **first clause superseded by D-e/D-h/D-i:** PEN appears only on cross-account aggregates (monthly report + month totals), never on records or per-account figures. **Second clause stands, unchanged and absolute.** |
 | Null over omission — response shape never varies with data presence | [api-design-principles.md](api-design-principles.md) |
 | Soft delete everywhere; financial records are never hard-deleted | all mutable tables |
 | Activity log on every mutation, with before/after snapshots | [app/helpers/activity_log.py](../app/helpers/activity_log.py) |
@@ -21,18 +42,34 @@ These are the ledger's truth. They hold identically for 1 user and 1,000,000, an
 | UUID-first — client generates the ID before the write | all `POST` endpoints |
 | Balance updates atomic with the transaction that causes them | [app/helpers/balance.py](../app/helpers/balance.py) |
 | Batch = all or nothing, one DB transaction | `POST /transactions/batch` |
-| Transfer pairing + cross-currency zero-sum via the dominant-side rule | [app/helpers/transfers.py](../app/helpers/transfers.py), [api-design-principles.md §12](api-design-principles.md) |
+| ⏳ Transfer pairing + cross-currency zero-sum via the dominant-side rule | [app/helpers/transfers.py](../app/helpers/transfers.py), [api-design-principles.md §12](api-design-principles.md) — **transfer pairing stands. The zero-sum forcing does not:** CR3 deletes the dominant-side rule, and a cross-currency transfer then shows its FX spread instead of being forced to zero. Same-currency transfers still net to exactly 0. |
 | Reconciliation state machine + transaction field locking when completed | [app/helpers/reconciliations.py](../app/helpers/reconciliations.py) |
 | Inbox promotion — atomic inbox→ledger with both activity entries | [app/helpers/inbox.py](../app/helpers/inbox.py) |
 | System categories resolved by `system_key`, never by display name | [app/constants.py](../app/constants.py), `sql/010` |
-| `@Opening` excluded from flow reports; visible rows sum exactly to `net_cents` | [app/helpers/monthly_report.py](../app/helpers/monthly_report.py) |
-| FX resolution carries the last rate forward (`rate_date <= $1 DESC LIMIT 1`); a genuine miss is `422 RATE_UNAVAILABLE`, never a silent `1.0` | [app/helpers/exchange_rate.py](../app/helpers/exchange_rate.py) |
+| `@Opening` excluded from flow reports; visible rows sum exactly to `net_cents` | [app/helpers/monthly_report.py](../app/helpers/monthly_report.py) — **the invariant is untouched; only the field name moves** to `net_home_cents` (D-h removes the native aggregate). ⚠️ See the note below — this row has been violated once already. |
+| ⏳ FX resolution carries the last rate forward (`rate_date <= $1 DESC LIMIT 1`); a genuine miss is `422 RATE_UNAVAILABLE`, never a silent `1.0` | [app/helpers/exchange_rate.py](../app/helpers/exchange_rate.py) — **carry-forward and "never a silent `1.0`" stand.** The `422` does not: per D-b, CR3 makes a write with no resolvable rate **succeed and warn**, and the miss surfaces at read time as `null` + `unconverted_count`. |
+
+> ### ⚠️ The `@Opening` row has been violated once — do not let it happen again
+>
+> `compute_month_flow` excludes opening balances (`monthly_report.py:139-143`), but
+> the dashboard's archived category and hashtag aggregators **did not** — so every
+> `lifetime_spent_cents` was inflated by any opening balance in that category, and
+> nobody noticed for as long as the panels existed. Decision **D-g** deletes those
+> panels, which closes it by removal rather than repair.
+>
+> **The lesson, for whoever builds the next lifetime or cross-period aggregate:**
+> a second query over `expense_transactions` does not inherit the report's
+> exclusions. `@Opening` filtering, soft-delete filtering and the currency rule all
+> have to be restated deliberately. The invariant above is the *requirement*; it is
+> not enforced by anything structural.
 
 **Home currency is fixed at PEN and is not a scaling boundary — it is a retired capability.** `sql/018` locks `user_settings.main_currency` to `'PEN'`; `PUT /auth/settings` rejects the field with `422`. The recalculation helper that rewrote `amount_home_cents` across the ledger on a switch was **deleted** on 2026-08-01, not deferred, because it carried a silent `1.0` rate fallback (audit WP1.1) that wrote wrong home amounts whenever the FX table had no row for a transaction's date.
 
 This is *not* a "revisit at scale" row. A second user does not want a different home currency — they want their own engine, or a real multi-tenancy design in which home currency is per-user and the conversion happens at read time. Reviving the deleted helper would be the wrong move either way; the correct restoration path is documented in the `sql/018` header.
 
-The part that *was* genuine business logic — the dominant-side rule keeping cross-currency transfer pairs zero-sum — survives in [transfers.py](../app/helpers/transfers.py) and is unaffected.
+~~The part that *was* genuine business logic — the dominant-side rule keeping cross-currency transfer pairs zero-sum — survives in [transfers.py](../app/helpers/transfers.py) and is unaffected.~~
+
+⏳ **Superseded 2026-08-02.** The dominant-side rule is deleted by CR3. It was not business logic — it *forced* `sibling_home = primary_home`, which hid the FX spread the bank actually charged, and its `else: raise RuntimeError` made every USD→USD transfer 500 for a PEN-home user (audit finding 1.3). The distinction this paragraph draws — retired capability vs. genuine business logic — is still useful; the example just moved. The genuine invariant is the one above it: **same-currency transfers still net to exactly 0**, and transfers are never excluded from totals.
 
 ---
 

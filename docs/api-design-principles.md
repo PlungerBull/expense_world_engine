@@ -58,6 +58,10 @@ All interactive clients — iOS, web, CLI, and any future client — hold a disp
 
 **Home-currency amounts in the replica are point-in-time.** The `amount_home_cents` and related fields returned by `/sync` reflect FX rates at sync time and drift as rates move. Clients must treat any balance-sensitive display (dashboard totals, report summaries, net-worth views) as requiring a fresh engine call, not a local recomputation. `/dashboard` is the canonical place for derived home-currency values, and clients should prefer it over computing aggregates from cached transaction rows.
 
+> ⏳ **Premise superseded 2026-08-02 — pending CR5.** `/sync` returns **no** home-currency fields after CR2: `amount_home_cents` is gone from transactions and inbox items (D-e) and `current_balance_home_cents` from accounts (D-i). So there is nothing in the replica left to drift.
+>
+> **The conclusion survives and hardens.** Derived home-currency values live only on `/dashboard` and `/reports/monthly`, must be fetched fresh, and must never be recomputed client-side from cached rows — which is now impossible rather than merely discouraged, since the inputs are not shipped. Note also that **no net-worth view exists to support** (D-i); the engine sums nothing across accounts.
+
 **Stateless escape hatch (CLI).** The CLI additionally supports an explicit stateless mode via a `--no-cache` flag or `EXPENSE_STATELESS=1` environment variable that bypasses the replica entirely for a given invocation. In this mode, reads go straight to the engine, no cache file is opened, and no sync is performed. This mode exists for CSV imports, CI pipelines, cron-triggered scripts, and ad-hoc automation piped into tools like `jq` — contexts where per-invocation freshness matters more than speed, where ephemeral environments (CI containers) gain nothing from a cache, and where concurrent invocations would otherwise contend on the local SQLite file. Other clients may expose an equivalent mode if their product calls for it, but it is not required.
 
 ### 4. Idempotency Keys
@@ -89,6 +93,18 @@ Batch endpoints exist for operations that are inherently multi-record: CSV impor
 ### 8. to_base Consistency Across All API Layers
 
 Every API response containing an amount — at any level of aggregation — includes a home-currency version alongside the native amount. This applies to individual transactions (`amount_home_cents`), category totals, account balances, monthly summaries, and any future budget or P&L views. The engine is exclusively responsible for currency conversion. The frontend never performs it. See `lessons-lunchmoney.md §2`.
+
+> ⏳ **Superseded 2026-08-02 — pending CR5.** The first three sentences no longer hold. Decisions **D-e**, **D-h** and **D-i** ([`currency-rework/README.md`](currency-rework/README.md)) replace "every amount at any level" with a rule stated by level:
+>
+> | Level | Native | PEN |
+> |---|---|---|
+> | Individual records — transactions, inbox | **only** | none |
+> | Per-account figures — balances, reconciliations | **only** | none |
+> | Cross-account aggregates — category, hashtag, month totals | none | **only** |
+>
+> In practice: the monthly report and its month totals, and nothing else. There is deliberately **no net-worth total**. A record is in one currency and an account is in one currency, so a second number there is noise; only an aggregate spans currencies.
+>
+> ⚠️ **The last two sentences are untouched and now carry more weight, not less:** the engine is exclusively responsible for conversion, and the frontend never performs it. With fewer converted figures on the wire, a client cannot fill a gap by converting — it must ask for an aggregate the engine computes.
 
 ### 9. debit_as_negative as a Caller-Side Flag
 

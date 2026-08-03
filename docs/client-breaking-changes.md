@@ -78,6 +78,18 @@ response forever.
   before; USD amounts are still converted to PEN for reporting.
 - No amounts, balances, or transaction shapes changed. Nothing needs re-syncing.
 
+> ⏳ **The last bullet is scoped to this 2026-08-01 entry and does not survive the
+> next one.** The currency rework (decisions D-e, D-g, D-h, D-i in
+> [`currency-rework/README.md`](currency-rework/README.md)) removes
+> `amount_home_cents` from transactions and inbox items,
+> `current_balance_home_cents` from accounts, the reconciliation home balances, the
+> native report aggregates, and the dashboard's archived category/hashtag panels.
+> **Response shapes change substantially.** No *values* change and nothing needs
+> re-syncing — the removed figures were derived, never stored facts — but a client
+> that reads those keys will find them absent. CR5 writes the full entry when the
+> code lands; this pointer exists so nobody plans against the sentence above in the
+> meantime.
+
 ### Engine references
 
 - `sql/018_lock_home_currency_to_pen.sql` — the constraint and the restoration path
