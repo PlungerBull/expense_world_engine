@@ -335,7 +335,7 @@ async def test_rate_date_resolves_in_the_users_timezone(fx, test_data):
 
     The zone is supplied as the bind parameter rather than by mutating
     ``user_settings``: nothing imports this module yet, so the test builds the
-    query itself and passes exactly what CR2's callers will pass — the value from
+    query itself and passes exactly what the read-path callers will pass — the value from
     ``get_user_report_settings``.
     """
     just_after_utc_midnight = datetime(2010, 6, 16, 2, 0, tzinfo=timezone.utc)

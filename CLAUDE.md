@@ -11,17 +11,32 @@ The Brain. A Python (FastAPI) backend, backed by Postgres. It is the single sour
 | Doc | What it contains |
 |---|---|
 | `docs/engine-spec.md` | Every endpoint, every business logic rule, every validation. The rulebook. |
-| `docs/api-design-principles.md` | Architectural decisions and the reasoning behind them. |
 | `docs/schema-reference.md` | Full database schema. |
+| `docs/open-bugs.md` | **Known defects, by severity.** A work queue, not a document — delete a row when it is fixed rather than annotating it done. Read before assuming something is broken by accident. |
 | `docs/design-philosophy.md` | UX philosophy and product vision. |
-| `docs/scaling-boundaries.md` | What is business logic (scale-invariant) vs. a scaling constraint (single-user-shaped). Read before arguing that something should be built or deferred "for scale". |
 | `docs/client-breaking-changes.md` | Engine changes that require work in a client repo. Append here whenever a change breaks the CLI/iOS/web contract. |
 | `docs/currency-model-decision.md` | How multi-currency works: native storage, conversion at read time, what `@Transfer ≠ 0` means. Read before touching exchange rates, `amount_home_cents`, or transfer home values. |
-| `docs/currency-rework/` | **Transient (2026-08-01).** Work packages CR1–CR6 executing the above decision, one per agent. Start at its `README.md`. Delete the directory and this row when CR5 lands. |
+| `docs/rework/` | **Transient (2026-08-04).** The deletion program: work packages WP1–WP7, one per agent, executing the audit of 2026-08-04. Start at its `README.md`. **Read it before changing transfers, balances, currency, `/sync`, or reconciliations** — several conventions below are scheduled to change and WP7 rewrites them. Delete the directory and this row when WP7 lands. |
 
 ## Who this is for
 
-**One user — the owner (since 2026-08-01).** The earlier 1000+ public-users target is retired; if scaling happens it gets a dedicated, professionally-staffed plan. Build what makes daily use work well, not what a hypothetical user base would need. The one obligation this leaves: when a decision is single-user-shaped, record it in `docs/scaling-boundaries.md` instead of leaving it implicit. Ledger correctness is never a scale trade-off — the conventions below hold at any size.
+**One user — the owner (since 2026-08-01).** The earlier 1000+ public-users target is retired; if scaling happens it gets a dedicated, professionally-staffed plan. Build what makes daily use work well, not what a hypothetical user base would need. Ledger correctness is never a scale trade-off — the conventions below hold at any size.
+
+**What is single-user-shaped** (safe today, revisit only if a second user appears — none of these is a known defect):
+
+| Constraint | At scale |
+|---|---|
+| One Mac, launchd, one Homebrew Postgres, no pooler | `deploy/cloud/` is the reactivation checklist |
+| Pool `min=5 / max=20`, sized for direct connections | ~50 behind a transaction-mode pooler; `statement_cache_size=0` already set |
+| **RLS inert — engine-side `user_id` scoping is the only guard** | Non-owner role, or `FORCE ROW LEVEL SECURITY`. Do it *before* user two |
+| `sql/015` locks currencies to USD/PEN; no non-USD↔non-USD cross-rate | Lift the CHECK, implement cross-rate math, widen the FX job |
+| `GET /sync` returns the whole delta, no cursor | Cursoring or `has_more` |
+| No rate limiting at all | Required before any public exposure |
+| No worker or queue — everything is request-synchronous | Needed by any import/report job |
+| Nightly `pg_dump` to Drive, manual restore drill | Managed PITR |
+| No PAT list endpoint, no `last_used_at` (deliberate — avoids a write per request) | Ship with a management UI |
+
+A decision belongs in that table if **a bug report from a second user would be about it**. If one user could hit it and get a wrong number, it is business logic and belongs in `engine-spec.md`.
 
 ## The engine comes first (2026-08-01)
 
@@ -63,6 +78,14 @@ These apply everywhere, no exceptions:
 - Requests: `amount_cents` is signed. Negative = expense/outflow. Positive = income/inflow. The engine infers `transaction_type` from the sign — callers never set it manually. Transfers are identified by the presence of a `transfer` field, not by sign.
 - Storage: `amount_cents` is always stored as a positive integer. `transaction_type` (1=expense, 2=income, 3=transfer) and `transfer_direction` (1=debit, 2=credit) encode direction.
 - Responses: `amount_cents` is always positive. `transaction_type` tells direction. The `?debit_as_negative=true` flag is a caller-side preference, not a schema property.
+- **No column's sign means anything, anywhere.** Direction is always a separate typed column. `infer_transaction_type` / `infer_transfer_direction` (`app/schemas/transactions.py`) are the only places a sign is read — adding a second is the bug, not the fix.
+
+> ⏳ **`transaction_type = 3` and `transfer_direction` are scheduled for deletion by
+> `docs/rework/WP1`.** Direction collapses into `transaction_type` (1 = outflow, 2 = inflow,
+> on every row, never null) and a transfer becomes two ordinary rows paired by
+> `transfer_transaction_id`. After WP1 there is exactly *one* place a sign is read, which is
+> what this rule was aiming at. Until WP1 lands the three-value encoding above is live.
+- **This holds on the inbox identically.** The inbox is a draft ledger row: looser about *which fields are null*, never about *how a field encodes its meaning*. `transfer_amount_cents` was the one exception — signed until `sql/019` (2026-08-03), which is what let a same-sign transfer draft promote with a leg silently flipped (audit WP7.2). The lesson: a table that mirrors another copies the whole encoding or none of it — a half-copied convention makes the missing half load-bearing without anyone deciding it should be.
 
 **Home currency**
 **The engine is the only thing that does currency conversion. Clients never compute it.** That part is absolute.
@@ -93,14 +116,31 @@ Every write to any mutable table produces an immutable `activity_log` row: resou
 **Idempotency keys on all writes**
 `POST`, `PUT`, `DELETE` operations accept `X-Idempotency-Key: <uuid>`. The engine checks `idempotency_keys` before processing. Duplicates return the stored response verbatim. TTL: 24 hours. Critical for financial writes where duplicates corrupt balances.
 
-**JWT on every route**
-Every request requires `Authorization: Bearer <token>`. No public endpoints. Unauthenticated requests return `401`.
+**Auth on every route — PAT only**
+Every request requires `Authorization: Bearer ewe_pat_…`. No public endpoints except `/health`. Unauthenticated requests return `401`.
+
+The JWT branch was **deleted 2026-08-03** (audit 2.1), not disabled: it picked its verification key from the algorithm named in the token's own header, and the HS256 key was `local-unused` — a string committed in `.env.example`. Anyone who could reach the port forged a token for any `user_id`. Do not reintroduce a signing path without an expiry requirement, a pinned algorithm, and a secret that startup refuses to accept as a placeholder. `tests/test_auth_over_the_wire.py` is the only module that exercises auth without the `conftest` override — the absence of such a test is why this survived from the day it shipped.
+
+**IDs-only in responses**
+Responses reference related resources by ID only. No `category_name` beside `category_id`, no `account_name`, ever. Clients resolve display names from their own replica. A hydrated name is a second copy of a mutable value that goes stale the moment the row is renamed.
+
+**Collection ordering**
+User-ordered collections use a per-scope `sort_order integer NOT NULL DEFAULT 0`, listed ASC. New rows append (`max+1` within the scope). Soft-deleted rows keep their slot and reclaim it on restore. Cross-scope values are meaningless and never compared. `sort_order` is writable via the normal `PUT` **except** where reordering cascades to other rows — those expose `PUT /{parent}/{id}/{children}/order` with `{"ordered_ids": [...]}`, reject `sort_order` in the plain `PUT` with `422`, and renumber inside one transaction. Bulk reorder accepts any subset: the submitted rows' existing slots are reused in the new order, everything else is untouched.
+
+**Tenant isolation is engine-side, not RLS**
+RLS policies (`auth.uid() = user_id`) exist on all 15 tables and `rowsecurity` is on, but they are **inert** — the engine connects as the table owner and `FORCE ROW LEVEL SECURITY` is not set, so Postgres bypasses them. The `user_id` predicate in every query is the *only* thing isolating data. Treat a missing `user_id` filter as a security defect, not a tidiness one. Before a second user exists, either connect as a non-owner role or issue `FORCE ROW LEVEL SECURITY`.
 
 **UUID-first**
 All resources are identified by a UUID generated client-side before server confirmation. The frontend always has the ID before making a write. Resources are never looked up by name or any mutable attribute.
 
-**Balance updates are atomic**
+**Balance updates are atomic** — ⏳ *scheduled for deletion by `docs/rework/WP3`*
 Whenever a transaction is created, updated, or deleted, `current_balance_cents` on the affected account(s) is updated in the same database transaction. Balance and transaction state are never out of sync.
+
+> This convention exists only to protect a stored derived value. WP3 deletes
+> `current_balance_cents` and computes the balance from the rows instead, at which point
+> this rule has nothing left to protect and is replaced by "balances are computed at read
+> time, never stored" — the same sentence the currency model already uses. Until WP3 lands
+> the rule above is live and must be honoured.
 
 **Batch = all or nothing**
 Any batch endpoint wraps all operations in a single DB transaction. All succeed or all fail. Partial success is never acceptable for financial data.
@@ -146,7 +186,7 @@ All errors use this exact shape — no deviations:
 | Skill | What it does |
 |---|---|
 | `audit-business-logic` | Scans the codebase and checks every endpoint/service against `engine-spec.md` |
-| `audit-coding-patterns` | Checks cross-cutting concerns (error format, null-over-omission, auth, idempotency, etc.) against `api-design-principles.md` |
+| `audit-coding-patterns` | Checks cross-cutting concerns (error format, null-over-omission, auth, idempotency, etc.) against the conventions in this file |
 | `audit-bloat` | Finds dead code, unused imports, redundant logic, and unused dependencies |
 | `audit-doc-drift` | Compares `engine-spec.md` against the implementation in both directions — planned gaps, undocumented behavior, divergences |
 | `audit-schema-drift` | Compares `schema-reference.md` against the SQL migrations in `sql/` — undocumented tables/columns, type and constraint mismatches |

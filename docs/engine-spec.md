@@ -2,7 +2,7 @@
 
 > The `expense_world_engine` is the Brain. This document defines every endpoint, every business logic rule, and every validation the engine enforces. Nothing exists for any client unless it is defined here first.
 >
-> Architecture: `api-design-principles.md` | Schema: `schema-reference.md`
+> Schema: `schema-reference.md` | Conventions: `../CLAUDE.md`
 
 ---
 
@@ -20,7 +20,9 @@
 
 **Sign convention — storage:** Internally, `amount_cents` is always stored as a positive integer. `transaction_type` (1=expense, 2=income, 3=transfer) and `transfer_direction` (1=debit, 2=credit) are set by the engine based on the inferred direction. Callers never interact with these fields on writes.
 
-**Sign convention — responses:** `amount_cents` in responses is always positive. `transaction_type` tells the client the direction. Pass `?debit_as_negative=true` on any amount-bearing read endpoint to receive negative amounts for expenses and outflows — useful for clients that prefer signed display. Supported on: `/transactions` list + detail, `/inbox` list + detail, `/reconciliations/{id}`, `/sync`. Accepted but a no-op on `/dashboard` and `/reports/monthly`, whose aggregates are already signed by construction (category spent is positive for income and negative for expense; totals return split positive inflow/outflow).
+This holds on **every** amount-bearing column in **every** table, including the inbox's `transfer_amount_cents` — no column's sign carries meaning anywhere in the engine. On an inbox transfer draft, `transfer_direction` describes the primary leg (the inbox row itself) and the sibling's direction is its inverse. ⚠️ The inbox was the one exception until 2026-08-03: it had transfer columns but no direction column, so the sign was load-bearing (audit WP7.2, `sql/019`).
+
+**Sign convention — responses:** `amount_cents` in responses is always positive. `transaction_type` tells the client the direction. Pass `?debit_as_negative=true` on any amount-bearing read endpoint to receive negative amounts for expenses and outflows — useful for clients that prefer signed display. Supported on: `/transactions` list + detail, `/inbox` list + detail, `/reconciliations/{id}`, `/sync`. On an inbox transfer row the flag negates *both* legs, in opposite directions — an inbox row carries the sibling amount too, and a transfer whose two amounts point the same way is nonsense. Accepted but a no-op on `/dashboard` and `/reports/monthly`, whose aggregates are already signed by construction (category spent is positive for income and negative for expense; totals return split positive inflow/outflow).
 
 **Null over omission:** All optional fields are always present in responses, set to `null` when empty. The response shape never changes based on data presence.
 
@@ -296,7 +298,7 @@ Undoes a soft-delete. Returns `404` if no soft-deleted category with that id exi
 ### `POST /categories/{id}/archive`
 Sets `is_archived = true`. The category disappears from default `GET /categories` listings and dashboard month panels but remains attached to historical transactions. Bumps `version` and writes an `UPDATED` activity log entry. Returns `404` if the category is missing or soft-deleted. Returns `403` for system categories (`is_system = true`) — the transfer pipeline relies on them remaining available, mirroring the delete guard.
 
-**Attach guard:** Once archived, the engine refuses to attach the category to any new or updated transaction. `POST /transactions`, `PUT /transactions/{id}`, `POST /transactions/batch`, and `POST /inbox/{id}/promote` all return `422 VALIDATION_ERROR` with `fields: {"category_id": "Must reference an active, non-archived category."}` if `category_id` references an archived row. The same guard fires on `POST /transactions/{id}/restore` if the original category has been archived in the meantime — the restore is rejected until the category is unarchived. Inbox items pointing at an archived category are also dropped from `GET /inbox?ready=true`. This is the same parity rule that already applies to archived accounts.
+**Attach guard:** Once archived, the engine refuses to attach the category to any new or updated transaction. `POST /transactions`, `PUT /transactions/{id}`, `POST /transactions/batch`, and `POST /inbox/{id}/promote` all return `422 VALIDATION_ERROR` with `fields: {"category_id": "Must reference an active, non-archived category."}` if `category_id` references an archived row. The same guard fires on `POST /transactions/{id}/restore` if the original category has been archived in the meantime — the restore is rejected until the category is unarchived. Inbox items pointing at an archived category are also dropped from `GET /inbox?ready=true` — except transfer items, which carry no category and are exempt from the guard on both sides. This is the same parity rule that already applies to archived accounts, including an inbox transfer item whose `transfer_account_id` is archived.
 
 ### `POST /categories/{id}/unarchive`
 Inverse of `/archive`: sets `is_archived = false` and bumps `version`. Returns `404` if no active category with that id exists. Writes an `UPDATED` activity log entry.
@@ -339,6 +341,8 @@ Returns all active inbox items (`status = 1`, `deleted_at IS NULL`).
 
 Optional filters: `?ready=true` (only items ready to promote — all required fields present and `date ≤ now()`), `?overdue=true` (items with `date` in the past).
 
+`?ready=true` is the exact complement of the promote validation below: every row it returns promotes, and every row that promotes appears in it. In particular transfer items are **included without a `category_id`** — promote auto-assigns `@Transfer`/`@Debt` and never reads the field — and are **excluded** when their `transfer_account_id` points at a deleted or archived account, which promote rejects.
+
 ### `POST /inbox`
 Creates a new inbox item.
 
@@ -346,13 +350,27 @@ Creates a new inbox item.
 
 `amount_cents` follows the standard sign convention: negative = expense, positive = income. The engine infers `transaction_type` from the sign and stores `amount_cents` as positive (same as the ledger). `transaction_type` is stored on the inbox row so direction is preserved through to promotion.
 
+**The `transfer` object** marks the item as a transfer draft. It takes two fields:
+
+```json
+"transfer": { "account_id": "<uuid>", "amount_cents": -5000 }
+```
+
+Unlike `POST /transactions`, it takes **no `id`** — that field is the sibling *ledger row's* UUID, and no ledger rows exist until promotion. The sibling's id is supplied later, as `transfer_id` on the promote call.
+
+`transfer.amount_cents` is signed and must point the opposite way to the item's own `amount_cents`; a same-sign pair returns `422` on `transfer.amount_cents` — the same rule §Transfers → *Zero-sum validation* applies to `POST /transactions`, enforced here at draft time rather than deferred to promotion. When the item has no `amount_cents` yet, the sibling's sign alone determines direction.
+
+Both amounts are stored **positive**. Direction lives on `transfer_direction` (1=debit, 2=credit), which describes the **primary** leg — the inbox row itself — exactly as it does on `expense_transactions`. The sibling's direction is its inverse and is never stored. Supplying the item's `amount_cents` in a later `PUT` restates the primary's sign and flips both legs; `transaction_type` stays `3`.
+
+Send `"transfer": null` on `PUT /inbox/{id}` to clear it: the three transfer columns are nulled and the item reverts to an expense or income based on its amount. This is the only field on an inbox item that accepts an explicit null.
+
 Auto-populates `exchange_rate` from `exchange_rates` table for the transaction's `date` and `account_id.currency_code` if both are present. If either field is absent, the column stores the DB default of `1.0` (partial inbox rows are allowed; rate is resolved at promote time). If both are present but no rate row exists on or before `date` for the pair, the request fails with `422 RATE_UNAVAILABLE` — no silent fallback. Same-currency accounts always resolve via the identity-rate short-circuit.
 
 **Response shape:** Inbox rows include both native AND home-currency amounts:
 - `amount_cents` + `amount_home_cents` — computed as `amount_cents × exchange_rate` at read time.
-- `transfer_amount_cents` + `transfer_amount_home_cents` — same computation, using the stored (signed) transfer amount.
+- `transfer_amount_cents` + `transfer_amount_home_cents` — same computation. Both are positive; `transfer_direction` carries the direction.
 
-Pass `?debit_as_negative=true` on `GET /inbox` or `GET /inbox/{id}` to have the primary `amount_cents` and `amount_home_cents` returned negated for EXPENSE items and for the outflow leg of transfer items. `transfer_amount_cents` is left as-stored (it's already signed on purpose — the promote flow uses it for zero-sum validation).
+Pass `?debit_as_negative=true` on `GET /inbox` or `GET /inbox/{id}` to have amounts returned negated for the debit side. For EXPENSE items and transfer items whose `transfer_direction` is DEBIT, the primary `amount_cents` and `amount_home_cents` are negated. On a transfer the sibling is negated in the **opposite** direction — the two legs of a transfer never point the same way.
 
 ### `GET /inbox/{id}`
 ### `PUT /inbox/{id}`
@@ -380,7 +398,7 @@ Promotes a ready inbox item to the ledger.
 ```
 
 - `id` — the client-supplied UUID for the newly-created ledger `expense_transactions` row.
-- `transfer_id` — the client-supplied UUID for the paired sibling ledger row when promoting a transfer inbox item. Required when the inbox row has `transfer_account_id` + `transfer_amount_cents` set; must be `null` (or omitted) otherwise. Returns `422` if mismatched.
+- `transfer_id` — the client-supplied UUID for the paired sibling ledger row when promoting a transfer inbox item. Required when the inbox row carries transfer fields; must be `null` (or omitted) otherwise. Returns `422` in **both** directions — missing when required, and present when not. (The three transfer columns are all-present-or-all-absent by database constraint, so any one of them identifies a transfer row.)
 
 **Validation (engine enforces, not the client):**
 - `title` is present and not `'UNTITLED'`
@@ -388,11 +406,13 @@ Promotes a ready inbox item to the ledger.
 - `date` is present and `≤ now()`
 - `account_id` is present and references an active, non-archived account
 - `category_id` is present and references an active category (non-transfer items only — transfer items auto-assign the system category)
+- `transfer_account_id` references an active, non-archived account (transfer items only) — reported on `transfer.account_id`
+- `transfer_id` is present for a transfer item and absent for a non-transfer one
 
-If any condition fails, returns `422` with the specific failing fields.
+If any condition fails, returns `422` with **all** the failing fields, not just the first.
 
 **On success (atomic):**
-1. Creates `expense_transactions` row(s) using the client-supplied `id` (and `transfer_id` for the sibling). `inbox_id` points back to this inbox item. Copies `transaction_type` from the inbox row. Computes `amount_home_cents` from `amount_cents × exchange_rate`.
+1. Creates `expense_transactions` row(s) using the client-supplied `id` (and `transfer_id` for the sibling). `inbox_id` points back to this inbox item. Copies `transaction_type` from the inbox row. Computes `amount_home_cents` from `amount_cents × exchange_rate`. For transfers, each leg's signed amount is reconstructed from the inbox row's `transfer_direction`: the primary takes that direction, the sibling the inverse.
 2. Sets `status = 2` (promoted) on the inbox row.
 3. Sets `deleted_at` on the inbox row (soft delete).
 4. Updates `current_balance_cents` on the account (decrements for expenses, increments for income).
@@ -429,7 +449,7 @@ Creates a transaction directly in the ledger, bypassing the inbox. Used by the C
 **Required:** `id` (client-supplied UUID), `title`, `amount_cents`, `date`, `account_id`, `category_id` (required for normal transactions; omit for transfers — the engine auto-assigns `@Transfer`/`@Debt` and discards any `category_id` passed alongside a `transfer` object)
 **Optional:** `description`, `exchange_rate` (auto-populated if omitted), `cleared`, `hashtag_ids`, `transfer`
 
-For transfer requests, the `transfer` object additionally requires its own `id` field — the UUID of the sibling ledger row. Both `id` and `transfer.id` must be distinct and client-generated. Example:
+For transfer requests, the `transfer` object additionally requires its own `id` field — the UUID of the sibling ledger row. Both `id` and `transfer.id` must be distinct and client-generated. **This is the one field that differs from `POST /inbox`'s `transfer` object, which must omit it** — a draft creates no ledger rows, so there is no sibling to name until promotion. Example:
 
 ```json
 {
@@ -517,17 +537,21 @@ Include a `transfer` object on any transaction create request:
 
 ```json
 {
+  "id": "<primary_uuid>",
   "title": "BCP to Chase",
   "amount_cents": -6000,
   "account_id": "<bcp_pen_id>",
   "category_id": "<other_category_id>",
   "date": "2024-03-15T00:00:00Z",
   "transfer": {
+    "id": "<sibling_uuid>",
     "account_id": "<chase_usd_id>",
     "amount_cents": 1500
   }
 }
 ```
+
+⚠️ **The two endpoints take different `transfer` shapes.** On `POST /transactions` the object requires an `id` — the sibling ledger row's client-supplied UUID, since both rows are written immediately. On `POST /inbox` it must be **omitted**: no ledger rows exist yet and the sibling's id arrives later as `transfer_id` on the promote call. See `POST /inbox` above.
 
 **Validation (all `422 VALIDATION_ERROR`, field-scoped, accumulated into one response):**
 - **The two sides must be different accounts.** A `transfer.account_id` equal to the request's own `account_id` returns `fields: {"transfer.account_id": "Must be a different account."}` — a transfer to itself moves no money and would write two rows that cancel on one balance. Checked before either account is loaded, so it fires even for an account that doesn't exist; if the same id is also missing or archived, the existence message wins the field (the checks share one key).
@@ -542,6 +566,8 @@ Include a `transfer` object on any transaction create request:
 5. Auto-creates `@Debt` or `@Transfer` system categories if they don't exist yet.
    - **Note:** The transfer engine does **not** auto-create person accounts. Both `account_id` values in the request must reference accounts that already exist and are non-archived. If `transfer.account_id` references a non-existent or archived person, the request returns `422 VALIDATION_ERROR`. Callers create person accounts explicitly via the People API before initiating a transfer to that person.
 6. **Zero-sum validation:** The engine does not enforce that the two `amount_cents` values are equal in raw number — they may be in different currencies. It does enforce that the two transactions are directionally opposite (one negative, one positive). Returns `422` if both are the same sign. **Explicit decision:** No magnitude equality check is performed even when both accounts share the same currency. This keeps the logic simple and allows users to record unequal amounts intentionally (e.g., fees absorbed during transfer).
+
+   **This is checked wherever both signs are supplied — including `POST`/`PUT /inbox`, before promotion.** A transfer draft is validated when it is written, not when it is promoted, because that is where the two signs still exist side by side; by promote time the row holds absolute amounts plus `transfer_direction`, and the legs are re-signed from that column and cannot disagree. ⚠️ Until 2026-08-03 the inbox had no direction column and promotion *derived* the primary's sign from the sibling's, so this rule was unreachable for drafts and a same-sign pair was silently rewritten. Audit WP7.2; fixed in `sql/019`.
 7. **Home currency zero-sum (cross-currency transfers):** For transfers between accounts in different currencies, the engine uses the **implied rate from the entered amounts** (the rate the user actually got), not the market rate, when computing `amount_home_cents`. The side whose currency matches `main_currency` is dominant — its home value equals its native amount. The other side's `amount_home_cents` is forced to equal the dominant side's by direct assignment, and its `exchange_rate` is derived from that (stored for audit/display). This guarantees the pair nets to zero in home currency by construction, matching how production fintech systems (Stripe, Wise, QuickBooks Online) treat the execution rate as the historical spot rate for the transaction. No separate FX gain/loss is recognized at transaction time — that's a period-end remeasurement concern handled elsewhere (if ever).
 8. Updates `current_balance_cents` on both accounts.
 9. Writes `activity_log` entries for both transactions.

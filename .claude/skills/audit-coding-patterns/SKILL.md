@@ -1,11 +1,11 @@
 ---
 name: audit-coding-patterns
-description: Audits the expense_world_engine codebase for consistency and adherence to the architectural patterns defined in api-design-principles.md. Use this skill whenever asked to audit coding patterns, check for inconsistencies, review API conventions, or verify that cross-cutting concerns (error format, null-over-omission, auth, idempotency, response shape, pagination, activity log) are applied uniformly across the codebase. Different from the business logic audit — this one looks for pattern consistency, not spec rule violations.
+description: Audits the expense_world_engine codebase for consistency and adherence to the architectural patterns defined in CLAUDE.md. Use this skill whenever asked to audit coding patterns, check for inconsistencies, review API conventions, or verify that cross-cutting concerns (error format, null-over-omission, auth, idempotency, response shape, pagination, activity log) are applied uniformly across the codebase. Different from the business logic audit — this one looks for pattern consistency, not spec rule violations.
 ---
 
 # Coding Patterns Audit
 
-This skill checks whether the cross-cutting patterns defined in `docs/api-design-principles.md` are applied consistently across the entire codebase. Where the business logic audit asks "does the code do the right thing?", this audit asks "does the code do it the same way everywhere?"
+This skill checks whether the cross-cutting patterns defined in `CLAUDE.md` ("Non-negotiable conventions") are applied consistently across the entire codebase. Where the business logic audit asks "does the code do the right thing?", this audit asks "does the code do it the same way everywhere?"
 
 Inconsistency is a debt that compounds. A response shape that's slightly different on one endpoint, a missing `null` here, a hardcoded name there — individually minor, collectively a reliability problem for clients.
 
@@ -77,19 +77,28 @@ Check for:
 - Response serialization that uses `.dict(exclude_none=True)` or equivalent
 - Any place where a field is only included in the response when it has a value
 
-**Home currency everywhere:** Every response containing an amount must include both the native amount and a home-currency version. Check for:
-- Any response model that has `amount_cents` but is missing `amount_home_cents`
-- Category totals that include `spent_cents` but not `spent_home_cents`
-- Account balance responses missing `current_balance_home_cents`
-- Dashboard/reporting responses missing `_home_cents` equivalents
-- Any aggregation endpoint that returns money without the home-currency version
+**Home currency by level, not everywhere.** ⚠️ This concern was inverted until 2026-08-02. It used to read *"every response containing an amount must include a home-currency version"* — written for the stored-column model, and it made every transaction carry a PEN value no client rendered. The rule now (CLAUDE.md → "Home currency"):
+
+| Level | Native | PEN |
+|---|---|---|
+| Individual records — transactions, inbox items | **only** | none |
+| Per-account figures — balances, reconciliations | **only** | none |
+| Cross-account aggregates — category, hashtag, month totals | none | **only** |
+
+Check for:
+- A `_home_cents` field on an individual record or a per-account figure — that is the regression this concern now hunts
+- A cross-currency aggregate returned *without* conversion (summing USD and PEN into one number is the defect, not the fix)
+- Conversion performed anywhere but read time, or by anything but the engine
+- A missing rate substituted with a native amount or `1.0` instead of surfacing `null` + `unconverted_count`
 
 ### Concern 3 — Auth + idempotency
 
-**Auth:** Every route must require JWT authentication. Check for:
-- Any route that doesn't have the JWT dependency injected
-- Any endpoint that is publicly accessible without a token
-- Routes where `user_id` is not extracted from the verified JWT (e.g., taken from the request body instead)
+**Auth: PAT only.** Every route takes `CurrentUser`; `/health` is the sole public endpoint. The JWT branch was deleted 2026-08-03 (audit 2.1 — it chose its key from the token's own header and the HS256 secret was published in `.env.example`). Check for:
+- Any `/v1` route without the `CurrentUser` dependency injected
+- Any endpoint publicly accessible without a token
+- `user_id` taken from a request body or query param instead of the authenticated principal
+- **Any reintroduced token-verification path.** If one exists it must pin the algorithm server-side, require `exp`, and refuse a placeholder secret at startup — the previous one did none of these
+- **A missing `user_id` predicate in any query.** RLS is inert (engine connects as table owner), so this is the only tenant guard — treat an unscoped query as a security defect, not a style nit
 
 **Idempotency:** Every write operation (POST, PUT, DELETE) should accept and check an `X-Idempotency-Key` header. Check for:
 - Write endpoints missing the idempotency key header parameter
@@ -124,6 +133,8 @@ Check for:
 - Read endpoints that return amounts but don't support the `debit_as_negative` flag
 - The flag being applied to responses where it shouldn't (e.g., home-currency amounts should follow the same flag)
 - Amount sign being baked into storage or response models rather than applied as a transformation at response time
+- **Direction expressed more than one way.** Every stored amount in the engine is positive, and direction lives on `transaction_type` + `transfer_direction` — on the inbox exactly as on the ledger. A column whose *sign* means something is the defect pattern here (audit WP7.2: the inbox's `transfer_amount_cents` was the last one, fixed in `sql/019`). Flag any new signed storage column, and any code that reads a sign to decide direction.
+- **Both legs of a transfer flipping together.** An inbox row carries both legs, so under the flag they must come back with opposite signs. Returning one flipped and one as-stored was WP10.2.
 
 ### Concern 6 — UUID discipline + IDs-only direction
 
@@ -152,7 +163,7 @@ Each agent returns a findings block:
 ### Findings
 
 #### [INCONSISTENT] Title
-**Principle:** api-design-principles.md §N
+**Principle:** CLAUDE.md — Non-negotiable conventions
 **Pattern expected:** What consistent code looks like
 **Violation found in:** file.py line N (or "across N files")
 **Example:** Brief code snippet or description of what was found

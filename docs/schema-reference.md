@@ -1,8 +1,7 @@
 # Expense Tracker — Schema Reference
 
 > Single source of truth for all database tables.
-> Architectural decisions: `api-design-principles.md`
-> Lesson sources: `lessons-todoist.md`, `lessons-ticktick.md`, `lessons-ynab.md`, `lessons-lunchmoney.md`, `lessons-splitwise.md`
+> Conventions: `../CLAUDE.md`
 
 ---
 
@@ -26,6 +25,7 @@ These rules apply to all mutable tables unless explicitly noted as an exception.
 | `transaction_type` | `expense_transactions` | 1 = expense, 2 = income, 3 = transfer |
 | `transaction_type` | `expense_transaction_inbox` | 1 = expense, 2 = income, 3 = transfer |
 | `transfer_direction` | `expense_transactions` | 1 = debit (balance decreases), 2 = credit (balance increases) |
+| `transfer_direction` | `expense_transaction_inbox` | same enum; describes the primary leg (the inbox row itself) |
 | `status` | `expense_transaction_inbox` | 1 = pending, 2 = promoted, 3 = dismissed |
 | `status` | `expense_reconciliations` | 1 = draft, 2 = completed |
 | `transaction_source` | `expense_transaction_hashtags` | 1 = inbox, 2 = ledger |
@@ -372,8 +372,15 @@ expense_transaction_inbox
                   — destination account for the paired transfer transaction
                   — only set when the inbox item represents a transfer
   - transfer_amount_cents bigint, nullable
-                  — signed amount for the paired transfer transaction
-                  — sign preserved from request for zero-sum validation on promote
+                  — amount for the paired transfer transaction, always positive
+                  — the request value is signed; the engine stores the magnitude
+  - transfer_direction smallint, nullable
+                  — 1=debit, 2=credit — same enum as expense_transactions
+                  — describes the PRIMARY leg (this inbox row); the sibling's
+                    direction is its inverse and is never stored
+                  — inferred by the engine from the signed amount_cents, or from
+                    the inverse of the signed transfer amount when the item has
+                    no amount yet
   - created_at    timestamptz, NOT NULL, default now()
   - updated_at    timestamptz, NOT NULL, default now()
   - version       integer, NOT NULL, default 1
@@ -387,7 +394,11 @@ expense_transaction_inbox
 4. Sets `deleted_at` on this inbox row (soft delete).
 5. Updates `current_balance_cents` on the account (decrements for expenses, increments for income).
 
-**Transfer promotion:** When `transfer_account_id` and `transfer_amount_cents` are both set, promoting creates a paired transfer instead of a single transaction. The `category_id` requirement is waived — categories are auto-assigned (`@Transfer` for real accounts, `@Debt` for person accounts). The primary's signed amount is reconstructed from the sign of `transfer_amount_cents` (opposite signs required).
+**Transfer promotion:** When the transfer columns are set, promoting creates a paired transfer instead of a single transaction. The `category_id` requirement is waived — categories are auto-assigned (`@Transfer` for real accounts, `@Debt` for person accounts), and `transfer_account_id` gets the same active/non-archived check the primary account does. Each leg's signed amount is reconstructed from `transfer_direction`: the primary takes that direction, the sibling the inverse.
+
+> **Changed in `sql/019`.** This previously read *"the primary's signed amount is reconstructed from the sign of `transfer_amount_cents` (opposite signs required)"*. There was no `transfer_direction` column, so the sibling's sign was the only direction signal on the row — and because the primary's own sign was discarded by `abs()` on write, promotion *imposed* opposite signs rather than requiring them. An item saved as two outflows promoted with one leg silently flipped (WP7.2). Opposite signs are now checked at `POST`/`PUT`, while both are still available.
+
+**Constraints (`sql/019`):** `transaction_type IN (1,2,3)`; `amount_cents > 0`; `transfer_amount_cents > 0`; and the three transfer columns are all-present or all-absent, with a populated triple forcing `transaction_type = 3`. The last one makes the half-transfer row — transfer columns set on a row typed 1 or 2 — unrepresentable rather than merely guarded in application code.
 
 `exchange_rate` is never a blocking field — it auto-populates from the reference table and does not prevent promotion.
 
@@ -490,7 +501,7 @@ Junction table. Links hashtags to transactions in either the inbox or the ledger
 
 A transaction with 3 hashtags produces 3 rows in this table — same `transaction_id`, three different `hashtag_id` values.
 
-**Parent version-bump rule (sync correctness):** any mutation to a junction row (insert, update, soft-delete) must, in the same DB transaction, also bump `version` and `updated_at` on the parent `expense_transactions` row. This is the bridge between junction-table storage and the embedded `hashtag_ids` array on the wire — without it, a hashtag-only edit would leave the parent transaction's `updated_at` stale and `GET /sync` would miss the change. The `DELETE /hashtags/{id}` cascade also bumps every transaction whose junction rows it soft-deletes. See [api-design-principles.md §3](api-design-principles.md) for the full sync model and [§N](api-design-principles.md) for the junction-vs-wire-format principle.
+**Parent version-bump rule (sync correctness):** any mutation to a junction row (insert, update, soft-delete) must, in the same DB transaction, also bump `version` and `updated_at` on the parent `expense_transactions` row. This is the bridge between junction-table storage and the embedded `hashtag_ids` array on the wire — without it, a hashtag-only edit would leave the parent transaction's `updated_at` stale and `GET /sync` would miss the change. The `DELETE /hashtags/{id}` cascade also bumps every transaction whose junction rows it soft-deletes. See `../CLAUDE.md` for the full sync model and [§N](api-design-principles.md) for the junction-vs-wire-format principle.
 
 ```
 expense_transaction_hashtags
@@ -573,7 +584,7 @@ Monthly per-category budget targets. Deferred to the budgeting phase. No schema 
 
 ### transaction_shares *(Phase 4+)*
 
-Cross-user shared expenses. Deferred to the people and sharing phase. When implemented, follow the Splitwise patterns documented in `lessons-splitwise.md`: separate `paid_share_cents` and `owed_share_cents`, pre-computed balance cache, settlements as standard transactions.
+Cross-user shared expenses. Deferred to the people and sharing phase. When implemented, follow the Splitwise sharing model (see git history for `docs/lessons-splitwise.md`): separate `paid_share_cents` and `owed_share_cents`, pre-computed balance cache, settlements as standard transactions.
 
 ---
 

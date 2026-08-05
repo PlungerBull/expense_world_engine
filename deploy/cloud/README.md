@@ -20,7 +20,7 @@
 
 1. Create (or revive) a Supabase project; apply `sql/001`→current, or restore the newest local backup directly (schema travels inside the dump).
 2. `pg_restore` the newest nightly backup — the entire ledger moves up unchanged (Postgres → Postgres, same schema, same engine).
-3. Configure Supabase Auth providers (Apple + Google sign-in) — the pre-client task already flagged in `docs/roadmap.md` "Web Dashboard — Expand Later".
+3. Configure Supabase Auth providers (Apple + Google sign-in) — the pre-client task already flagged in the web-dashboard phase (see git history for `docs/roadmap.md`).
 4. Deploy the engine (Render or any host): three env vars from `app/config.py`, pooler-aware pool sizing per the `app/config.py` comment, **plus `EXPENSE_ALLOW_REMOTE_DB=1`** — `app/config.py` refuses non-local `SUPABASE_DB_URL` hosts at startup (a local-profile safeguard added 2026-07-30), and a cloud database is exactly the case that must opt in.
 5. **Wire the FX daily fetch in the host's scheduler.** Without it no rows land in `exchange_rates`, and every cross-currency write (`POST /transactions`, a `PUT` that changes `date`, `POST /transactions/batch`, `POST /inbox`, `PUT /inbox/{id}` with a date change) fails `422 RATE_UNAVAILABLE` — same-currency writes are unaffected (identity short-circuit in `get_rate`). On Render, one-time via the dashboard (**New + → Cron Job**), billing required:
    - Connect the same GitHub repo as the web service · **Name:** `fetch-exchange-rates` · **Runtime:** Python
@@ -32,4 +32,4 @@
 6. Repoint clients (`expense config set --engine-url ...`) — replicas auto-wipe and cold-start by design.
 7. Retire the local launchd services; the Mac becomes just another client. **From this moment the cloud engine is again the single write authority — at no point do two engines accept writes.**
 
-Architecture invariants (one engine, thin clients, §3b) are deployment-independent; iOS's offline outbox is a client-repo concern (`docs/api-design-principles.md` §3b) and needs no engine changes.
+Architecture invariants (one engine, thin clients, §3b) are deployment-independent; iOS's offline outbox is a client-repo concern and needs no engine changes.

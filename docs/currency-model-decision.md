@@ -18,8 +18,7 @@ Nothing converted is ever stored.
 
 ## Where currency appears
 
-**Amended 2026-08-02** (decisions D-e, D-g, D-h, D-i in
-[`currency-rework/README.md`](currency-rework/README.md)). The original version of
+**Amended 2026-08-02.** The original version of
 this document assumed every response carrying an amount would carry a PEN version
 too — the convention inherited from the stored-column model. It doesn't.
 
@@ -74,7 +73,7 @@ used a different mechanism:
 |---|---|---|---|
 | Account balances | no | no — no `current_balance_home_cents` column exists | derived at read time |
 | Reconciliations | no | no — `round(begin * rate)` at serialization (`schemas/reconciliations.py:107`) | derived at read time |
-| Inbox | **yes** (`sql/003:62`, default `1.0`) | no — computed at serialization (`schemas/inbox.py:70`) | half derived |
+| Inbox | **yes** (`sql/003:62`, default `1.0`) | no — computed at serialization (`schemas/inbox.py:86`) | half derived |
 | Transactions | **yes** (`sql/003:82`) | **yes** (`sql/003:76`) | fully stored |
 
 `amount_home_cents` exists on exactly one table in the entire schema. Two of the
@@ -283,7 +282,7 @@ So `@Transfer ≠ 0` means exactly one of two things:
 
 Case 2 is pre-existing and documented: *"`spent_cents` can be negative for
 income-dominant categories or for lending-out months on `@Transfer`/`@Debt`"*
-(`roadmap.md:212`).
+(see git history for `docs/roadmap.md`).
 
 Both legs of a pair always share `primary_date` (`transfers.py:199,229`), so a
 transfer can never straddle a month boundary and produce a false non-zero.
@@ -320,8 +319,9 @@ archived-lifetime aggregators).
 and `SUM(CASE WHEN x > 0 THEN x ELSE 0 END)` silently scores a `NULL` row as zero,
 so an unflagged aggregate understates exactly like the fallback it replaced. Every
 home-value `SUM` must be paired with a count of unconvertible rows, and a non-zero
-count makes the aggregate `null` rather than a partial total. CR1 exports
-`UNCONVERTIBLE_FLAG_EXPR` for this; CR2 §2 wires it.
+count makes the aggregate `null` rather than a partial total.
+`app/helpers/home_currency.py` exports `UNCONVERTIBLE_FLAG_EXPR` for this;
+`docs/rework/WP2` wires it into the read paths.
 
 **Why the write should no longer fail.** Recording what happened must never be
 blocked by a rate lookup. Two consequences worth having:
@@ -352,8 +352,8 @@ Two consequences to know:
 - **This diverges from the write path**, which resolves rates from the *client's*
   offset date (`body.date` is an `AwareDatetime`; Pydantic preserves the offset).
   That offset is not recoverable from a stored `timestamptz`, so read-time SQL
-  cannot reproduce it. The divergence is deliberate, and it disappears once CR3
-  removes rate resolution from writes entirely.
+  cannot reproduce it. The divergence is deliberate, and it disappears once
+  `docs/rework/WP2` removes rate resolution from writes entirely.
 - **`display_timezone` is unvalidated user input** (`sql/002:22`, settable via
   `PUT /auth/settings`). It must reach SQL as a bind parameter, never interpolated.
   `compute_month_bounds` silently falls back to UTC on an invalid zone name while
@@ -491,8 +491,8 @@ ever be, and it shares that window with the reconciliation-chaining retirement
 ([TODO.md](../TODO.md)).
 
 Work: one migration dropping three columns; ~60 lines deleted from
-`helpers/transfers.py` (the whole dominant-side block, `:119-177`); the re-rate
-guards deleted from `helpers/transactions.py:523,529` and `helpers/inbox.py:200`;
+`helpers/transfers.py` (the whole dominant-side block, `:118-176`); the re-rate
+guards deleted from `helpers/transactions.py:523,529` and `helpers/inbox.py:304`;
 the 8 `COALESCE(t.amount_home_cents, …)` arms in `helpers/monthly_report.py`
 replaced with a lateral join to `exchange_rates`; `routers/dashboard.py` likewise;
 CLI changes above.

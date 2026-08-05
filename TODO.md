@@ -6,7 +6,7 @@ Operational / deployment tasks, plus accepted design changes awaiting scheduling
 
 > **Removed 2026-08-01: "Home-currency recalculation: switch from per-row UPDATEs to bulk SQL."** Closed, not deferred — the target narrowed from 1000+ public users to the owner alone that day, which retires the entire premise. Its stated trigger was Render's HTTP timeout, and Render left the path at Step 11; the follow-on concern (a long synchronous recalc pinning a pool connection) only bites with concurrent users. At one user the recalc is fast, rare, and correct. Full original entry in git history.
 >
-> **Superseded later the same day:** the recalculation itself is now **gone**. The home currency is locked to PEN (`sql/018`), `PUT /auth/settings` rejects `main_currency` with `422`, and `app/helpers/recalculate_home_currency.py` was deleted along with its tests — it carried a silent `1.0` rate fallback (audit finding WP1.1). The sentence above claiming "nothing was deleted" no longer holds. Row 1 of [docs/scaling-boundaries.md](docs/scaling-boundaries.md) is retired with it. The dominant-side zero-sum logic *does* survive, in [app/helpers/transfers.py](app/helpers/transfers.py).
+> **Superseded later the same day:** the recalculation itself is now **gone**. The home currency is locked to PEN (`sql/018`), `PUT /auth/settings` rejects `main_currency` with `422`, and `app/helpers/recalculate_home_currency.py` was deleted along with its tests — it carried a silent `1.0` rate fallback (audit finding WP1.1). The sentence above claiming "nothing was deleted" no longer holds. The corresponding single-user-shaped row in CLAUDE.md is retired with it. The dominant-side zero-sum logic *does* survive, in [app/helpers/transfers.py](app/helpers/transfers.py).
 
 **One open item** (next up) and **one parked item**. Everything below them is a closed record, kept for the dated history.
 
@@ -14,7 +14,7 @@ Operational / deployment tasks, plus accepted design changes awaiting scheduling
 
 ## Retire reconciliation chaining — replace with explicit values + a continuity check — 🔵 OPEN, decided 2026-08-01
 
-**Owner decision D3** of [docs/audit-2026-08-01-remediation-plan.md](audit-2026-08-01-remediation-plan.md). Tracked here rather than as an audit work package because it is a design change, not a defect fix — it *deletes* the code three audit findings were about.
+**Owner decision D3** of [docs/open-bugs.md](open-bugs.md). Tracked here rather than as an audit work package because it is a design change, not a defect fix — it *deletes* the code three audit findings were about.
 
 **What:** Remove the chained beginning-balance system. Every reconciliation stores `beginning_balance_cents` as a plain value. On `POST`, the engine prefills it from the previous row's `ending_balance_cents` as a **one-time suggestion** — no live link, no recomputation afterwards. Replace the cascade with a read-time continuity indicator on every reconciliation response:
 
@@ -50,7 +50,7 @@ Bulk reorder becomes a pure `sort_order` write with no balance math, and the §6
 
 ## Split transactions (`parent_transaction_id`) — 🅿️ PARKED, reviewed 2026-08-01
 
-**Owner decision D8** of [docs/audit-2026-08-01-remediation-plan.md](audit-2026-08-01-remediation-plan.md). Parked here so the reserved field has a tracked home and is not rediscovered as a mystery by the next audit.
+**Owner decision D8** of [docs/open-bugs.md](open-bugs.md). Parked here so the reserved field has a tracked home and is not rediscovered as a mystery by the next audit.
 
 **Status:** the column exists (`sql/003_expense_tables.sql:85`, self-referencing FK on `expense_transactions`), the field is on the wire in every transaction response (`app/schemas/transactions.py:63,114`), and it is **always `null`** — no endpoint accepts or writes it. This is an unbuilt feature, not a defect and not a vestige.
 
@@ -89,7 +89,7 @@ Bulk reorder becomes a pure `sort_order` write with no balance math, and the §6
 
 **Owner:** User (PlungerBull) will handle this directly against the database — not via engine code.
 
-**When:** ~~at the very end of engine work~~ **Updated 2026-07-30:** folded into local-deployment Step 11.5 ([docs/roadmap.md](docs/roadmap.md)) — runs right after the data migration and daily-fetch verification, followed by a home-currency recalc, so PEN/USD history converts at true point-in-time rates. Easier now: the target database is local Postgres, no pooler in the way.
+**When:** ~~at the very end of engine work~~ **Updated 2026-07-30:** folded into local-deployment Step 11.5 (local-deployment Step 11.5) — runs right after the data migration and daily-fetch verification, followed by a home-currency recalc, so PEN/USD history converts at true point-in-time rates. Easier now: the target database is local Postgres, no pooler in the way.
 
 **Reference (provider corrected 2026-07-30):** Frankfurter **cannot** serve this — it carries ECB reference rates only, and the ECB list has no PEN (discovered when the daily job first ran for real; the 15 pre-existing `rate=3.75` rows turned out to be hand-inserted placeholders, ~10% off market, and were deleted). The provider is now **fawazahmed0/currency-api** (keyless, CDN-hosted), which the daily job uses via `app.jobs.fetch_exchange_rates`. It supports dated queries for backfill — `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@YYYY-MM-DD/v1/currencies/usd.min.json` returns all USD rates for that date (lowercase codes) — and `_fetch_currency_api(version="YYYY-MM-DD")` in the job module already wraps this. Insert rows canonically as `(base_currency='USD', target_currency=<X>, rate_date=<date>, rate=<rate>)`, matching the daily job's format. **Run the backfill before importing historical spreadsheet data** — cross-currency writes for dates without rates fail with `422 RATE_UNAVAILABLE` by design.
 

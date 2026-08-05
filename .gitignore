@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# Env backups — .env is ignored above; backups of it hold the same secrets
+# (SUPABASE_DB_URL, and historically SUPABASE_JWT_SECRET). Never commit these.
+.env.bak*
+.env.*.bak

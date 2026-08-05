@@ -15,7 +15,7 @@ The caller's query contract
 ---------------------------
 
 These fragments are not self-contained. A query using them must expose three
-aliases, and they are part of the contract — CR2 and the parity test embed the
+aliases, and they are part of the contract — the read paths and the parity test embed the
 same scaffold rather than two::
 
     FROM expense_transactions t
@@ -96,8 +96,8 @@ consequences worth knowing:
 
   * Python and SQL disagree on a bad value: ``compute_month_bounds`` catches the
     bad zone and falls back to UTC, while ``AT TIME ZONE`` raises and would 500.
-    The root fix is validating ``display_timezone`` on write; that belongs to
-    CR4's fail-closed sweep, not here.
+    The root fix is validating ``display_timezone`` on write; that is tracked in
+    ``docs/rework/WP5``, not here.
   * Callers already have the value from ``monthly_report.get_user_report_settings``
     (already called by ``routers/dashboard.py`` and ``routers/reports.py``). Reuse
     it; do not add a second settings loader.
@@ -152,7 +152,8 @@ which Python's ``round()`` applies banker's rounding. These fragments keep full
 ``numeric`` precision and round half-away-from-zero. SQL and Python can therefore
 differ by one cent on a *converted amount* even when they agree on the rate, which
 is why the parity test compares rates rather than cents. The fix (``Decimal`` +
-``ROUND_HALF_UP`` throughout) is scheduled after CR5.
+``ROUND_HALF_UP`` throughout) is deliberately out of scope for the rework and
+remains unscheduled.
 """
 from textwrap import indent
 
@@ -235,7 +236,7 @@ def _signed(magnitude: str) -> str:
     ttype = f"{TXN_ALIAS}.transaction_type"
     direction = f"{TXN_ALIAS}.transfer_direction"
     # Nested one level so the composed expression stays readable in EXPLAIN
-    # output and in the queries CR2 splices it into.
+    # output and in the queries the read paths splice it into.
     body = indent(magnitude, " " * 8)
 
     return f"""CASE
