@@ -1,7 +1,7 @@
 """Domain constants for the expense engine.
 
 Using IntEnum so these are backwards-compatible with existing integer
-comparisons (e.g. ``transaction_type == TransactionType.EXPENSE``) while
+comparisons (e.g. ``transaction_type == TransactionType.OUTFLOW``) while
 still providing readable ``repr()`` output in logs and debuggers.
 """
 
@@ -40,14 +40,20 @@ SYSTEM_CATEGORY_DEFAULT_NAMES: dict[SystemCategoryKey, str] = {
 
 
 class TransactionType(IntEnum):
-    EXPENSE = 1
-    INCOME = 2
-    TRANSFER = 3
+    """Which way money moved on this row's account. Nothing else.
 
+    Present on every ledger row, never null, CHECK-enforced by sql/020.
+    There is deliberately no ``TRANSFER`` member: a transfer is two ordinary
+    rows, one OUTFLOW and one INFLOW, paired by ``transfer_transaction_id``.
+    That column is the discriminator — "the counterparty is an account you
+    also own" is a fact about the pairing, not about the direction.
 
-class TransferDirection(IntEnum):
-    DEBIT = 1
-    CREDIT = 2
+    The names are OUTFLOW/INFLOW rather than EXPENSE/INCOME because these
+    values type transfer legs too, and a transfer's outgoing leg is not an
+    expense. sql/020's header records why the two facts were separated.
+    """
+    OUTFLOW = 1
+    INFLOW = 2
 
 
 class ActivityAction(IntEnum):

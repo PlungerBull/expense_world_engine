@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, Field
 
+from app.constants import TransactionType
+
 
 class TransferField(BaseModel):
     id: UUID  # sibling transaction's client-supplied uuid
@@ -52,8 +54,9 @@ class TransactionResponse(BaseModel):
     description: Optional[str] = None
     amount_cents: int
     amount_home_cents: Optional[int] = None
+    # 1 = outflow, 2 = inflow. Direction, and nothing else — a transfer is
+    # identified by transfer_transaction_id, not by a third type value.
     transaction_type: int
-    transfer_direction: Optional[int] = None
     date: datetime
     account_id: str
     category_id: str
@@ -104,7 +107,6 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
         amount_cents=row["amount_cents"],
         amount_home_cents=row["amount_home_cents"],
         transaction_type=row["transaction_type"],
-        transfer_direction=row["transfer_direction"],
         date=row["date"],
         account_id=str(row["account_id"]),
         category_id=str(row["category_id"]),
@@ -122,20 +124,20 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
     ).model_dump(mode="json")
 
 
-def infer_transaction_type(amount_cents: int) -> int:
-    """Infer transaction_type from signed amount. Negative=expense(1), positive=income(2)."""
-    return 1 if amount_cents < 0 else 2
+def infer_transaction_type(amount_cents: int) -> TransactionType:
+    """Infer direction from a signed request amount.
 
+    Negative = OUTFLOW (money leaves the account), positive = INFLOW.
 
-def infer_transfer_direction(amount_cents: int) -> int:
-    """Infer transfer_direction for the leg holding this signed amount.
+    **This is the only place in the engine a sign is read.** Every write path
+    — ordinary transactions, batch, both transfer legs, and the inbox — routes
+    through here, so there is exactly one answer to "what does the sign mean".
+    Adding a second reader is the bug, not the fix.
 
-    Negative=debit(1) (money leaves the account), positive=credit(2).
+    Until WP1 there was a second, byte-identical copy of this rule named
+    ``infer_transfer_direction``, because transfers encoded their direction in
+    a separate column. That column is gone (sql/020) and so is the duplicate.
 
-    This is the engine's single signed-amount-to-direction rule — both the
-    ledger (``helpers/transfers.py``) and the inbox write path use it, so
-    there is one place to read when asking what a sign means. Callers must
-    reject zero first; ``0`` maps to CREDIT here the same way
-    ``infer_transaction_type`` maps it to INCOME.
+    Callers must reject zero first; ``0`` maps to INFLOW here.
     """
-    return 1 if amount_cents < 0 else 2
+    return TransactionType.OUTFLOW if amount_cents < 0 else TransactionType.INFLOW

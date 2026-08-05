@@ -201,7 +201,22 @@ this program removes:
 | 3.1 — delta sync can permanently drop committed writes | WP4, by deletion |
 | 1.4 — inbox items promote at exchange rate 1.0 | WP2, by deletion |
 | 1.5 — changing `account_id` never re-rates | WP2, by deletion |
-| 1.3 — every USD→USD transfer returns 500 | WP1, **probably** — prove it with a test, don't assume |
+| ~~1.3 — every USD→USD transfer returns 500~~ | ✅ **Closed by WP1**, by repair rather than deletion — owner decision, see below |
+| ~~1.2 — surviving dominant-side implementation is the buggy one~~ | ✅ **Closed by WP1** with 1.3 |
 | 4.1 — expired idempotency keys duplicate financial writes | **Nothing.** Survives the program. |
+
+> **WP1 deviated from its stated scope here, deliberately.** 1.3 would *not* have fallen out
+> of the transfer collapse — the `raise RuntimeError` is in the dominant-side currency block,
+> which WP1 declared out of scope and `open-bugs.md` assigned to WP2. Reproduced first
+> (`RuntimeError` at `transfers.py:165`, uncaught, 500), then fixed by reordering that block
+> to match `engine-spec.md` §Transfers point 7, which also fixed a second defect nobody had
+> filed: a home-currency primary with a caller-supplied `exchange_rate` valued itself at
+> `amount × rate`.
+>
+> **The block still forces the two legs to net to zero, so no FX spread is visible yet.**
+> That was the owner's explicit choice: WP2 should delete the forcing rule *and* introduce
+> `@FX` in one change, so the spread first appears already in its own category rather than
+> spending a package mixed into `@Transfer` alongside loans to people. WP2 inherits an
+> already-correct branch order to delete, not a buggy one.
 
 Delete the row from `open-bugs.md` when it closes — it is a work queue, not a changelog.

@@ -57,6 +57,9 @@ class InboxResponse(BaseModel):
     description: Optional[str] = None
     amount_cents: Optional[int] = None
     amount_home_cents: Optional[int] = None
+    # 1 = outflow, 2 = inflow — of the PRIMARY leg (the inbox row itself) when
+    # this is a transfer draft. Nullable: a sparse draft with no amount yet has
+    # no direction. The sibling's direction is the inverse and is never stored.
     transaction_type: Optional[int] = None
     date: Optional[datetime] = None
     account_id: Optional[str] = None
@@ -65,7 +68,6 @@ class InboxResponse(BaseModel):
     status: int
     transfer_account_id: Optional[str] = None
     transfer_amount_cents: Optional[int] = None  # always positive
-    transfer_direction: Optional[int] = None  # of the PRIMARY leg: 1=debit, 2=credit
     transfer_amount_home_cents: Optional[int] = None
     created_at: datetime
     updated_at: datetime
@@ -92,7 +94,6 @@ def inbox_from_row(row) -> dict:
         status=row["status"],
         transfer_account_id=str(row["transfer_account_id"]) if row["transfer_account_id"] else None,
         transfer_amount_cents=transfer_amount_cents,
-        transfer_direction=row["transfer_direction"],
         transfer_amount_home_cents=(
             round(transfer_amount_cents * rate) if transfer_amount_cents is not None else None
         ),

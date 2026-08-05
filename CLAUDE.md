@@ -75,17 +75,14 @@ is not a factor.
 These apply everywhere, no exceptions:
 
 **Sign convention**
-- Requests: `amount_cents` is signed. Negative = expense/outflow. Positive = income/inflow. The engine infers `transaction_type` from the sign — callers never set it manually. Transfers are identified by the presence of a `transfer` field, not by sign.
-- Storage: `amount_cents` is always stored as a positive integer. `transaction_type` (1=expense, 2=income, 3=transfer) and `transfer_direction` (1=debit, 2=credit) encode direction.
+- Requests: `amount_cents` is signed. Negative = outflow. Positive = inflow. The engine infers `transaction_type` from the sign — callers never set it manually. Transfers are identified by the presence of a `transfer` field, not by sign.
+- Storage: `amount_cents` is always stored as a positive integer. `transaction_type` (1 = outflow, 2 = inflow) encodes direction, on **every** row, never null. Enforced by the database — `CHECK (transaction_type IN (1, 2))` and `CHECK (amount_cents > 0)` (`sql/020`).
 - Responses: `amount_cents` is always positive. `transaction_type` tells direction. The `?debit_as_negative=true` flag is a caller-side preference, not a schema property.
-- **No column's sign means anything, anywhere.** Direction is always a separate typed column. `infer_transaction_type` / `infer_transfer_direction` (`app/schemas/transactions.py`) are the only places a sign is read — adding a second is the bug, not the fix.
-
-> ⏳ **`transaction_type = 3` and `transfer_direction` are scheduled for deletion by
-> `docs/rework/WP1`.** Direction collapses into `transaction_type` (1 = outflow, 2 = inflow,
-> on every row, never null) and a transfer becomes two ordinary rows paired by
-> `transfer_transaction_id`. After WP1 there is exactly *one* place a sign is read, which is
-> what this rule was aiming at. Until WP1 lands the three-value encoding above is live.
+- **A transfer is two ordinary rows paired by `transfer_transaction_id`.** That FK is the *only* discriminator — there is no transfer transaction type, and a transfer leg is an ordinary outflow or inflow. "Who the counterparty was" is a fact about the pairing; "which way the money moved" is a fact about the row. Keeping them in one column is what forced direction into a second column in the first place (`transaction_type = 3` + `transfer_direction`, deleted by `sql/020`).
+- **No column's sign means anything, anywhere.** Direction is always a separate typed column. `infer_transaction_type` (`app/schemas/transactions.py`) is the **single** place a sign is read — adding a second is the bug, not the fix. Its former twin `infer_transfer_direction` was byte-identical, which is what the duplication cost.
+- **One rendering of the sign matrix, in Python and in SQL.** `helpers/balance._delta_for_apply` for writes, `helpers/home_currency.signed_expr` for reads. `monthly_report.py` and `dashboard.py` call the latter rather than carrying their own copies — four literal copies drifting is audit finding WP9.1.
 - **This holds on the inbox identically.** The inbox is a draft ledger row: looser about *which fields are null*, never about *how a field encodes its meaning*. `transfer_amount_cents` was the one exception — signed until `sql/019` (2026-08-03), which is what let a same-sign transfer draft promote with a leg silently flipped (audit WP7.2). The lesson: a table that mirrors another copies the whole encoding or none of it — a half-copied convention makes the missing half load-bearing without anyone deciding it should be.
+- ⚠️ **When a CHECK enforces a closed enum, spell out `IS NOT NULL`.** A `CHECK` rejects a row only when it evaluates to `FALSE`; `NULL` passes. `transaction_type IN (1, 2)` is `NULL` — not `FALSE` — on a null column, so a coherence constraint written that way silently admits the row it was added to forbid. `sql/020`'s `inbox_transfer_fields_coherent` carries the explicit guard and a test pins it.
 
 **Home currency**
 **The engine is the only thing that does currency conversion. Clients never compute it.** That part is absolute.

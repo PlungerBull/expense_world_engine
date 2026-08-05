@@ -39,7 +39,7 @@ import pytest
 
 from app import db
 from app.helpers.exchange_rate import clear_rate_cache, get_rate
-from app.constants import TransactionType, TransferDirection
+from app.constants import TransactionType
 from app.helpers.home_currency import (
     ACCOUNT_ALIAS,
     HOME_CENTS_EXPR,
@@ -166,8 +166,7 @@ async def fx(test_data, db_pool):
 
 async def _seed_txn(conn, fx: Fixtures, user_id: str, category_id: str,
                     account_id: str, when: datetime,
-                    txn_type: int = int(TransactionType.EXPENSE),
-                    direction: int = None) -> str:
+                    txn_type: int = int(TransactionType.OUTFLOW)) -> str:
     """Insert one ledger row, leaving ``amount_home_cents`` NULL.
 
     NULL on purpose: the whole point of these fragments is that the home value is
@@ -178,11 +177,11 @@ async def _seed_txn(conn, fx: Fixtures, user_id: str, category_id: str,
     await conn.execute(
         """INSERT INTO expense_transactions
             (id, user_id, title, amount_cents, amount_home_cents, transaction_type,
-             transfer_direction, date, account_id, category_id, exchange_rate,
+             date, account_id, category_id, exchange_rate,
              cleared, created_at, updated_at)
            VALUES ($1, $2, 'parity', $3, NULL, $4,
-             $5, $6, $7, $8, 1.0, false, now(), now())""",
-        txn_id, user_id, AMOUNT_CENTS, txn_type, direction,
+             $5, $6, $7, 1.0, false, now(), now())""",
+        txn_id, user_id, AMOUNT_CENTS, txn_type,
         when, account_id, category_id,
     )
     fx.txn_ids.append(txn_id)
@@ -272,28 +271,30 @@ async def test_home_currency_row_needs_no_rate(fx, test_data):
 # The sign matrix
 # ---------------------------------------------------------------------------
 
-# (label, transaction_type, transfer_direction, expected sign)
+# (label, transaction_type, expected sign)
+#
+# Two cases, not four. A transfer leg is an ordinary row after WP1 — its
+# direction lives in transaction_type like every other row's — so "transfer
+# credit" and "transfer debit" are not separate classifications to test, they
+# are inflow and outflow. sql/020 makes any third value unstorable, which is
+# asserted directly in tests/test_wp1_transfer_collapse.py.
 SIGN_CASES = [
-    ("income", int(TransactionType.INCOME), None, 1),
-    ("expense", int(TransactionType.EXPENSE), None, -1),
-    ("transfer credit", int(TransactionType.TRANSFER),
-     int(TransferDirection.CREDIT), 1),
-    ("transfer debit", int(TransactionType.TRANSFER),
-     int(TransferDirection.DEBIT), -1),
+    ("inflow", int(TransactionType.INFLOW), 1),
+    ("outflow", int(TransactionType.OUTFLOW), -1),
 ]
 
 
 @pytest.mark.parametrize(
-    "label,txn_type,direction,sign",
+    "label,txn_type,sign",
     SIGN_CASES,
     ids=[c[0] for c in SIGN_CASES],
 )
 async def test_sign_matrix_applies_to_native_and_home_alike(
-    fx, test_data, label, txn_type, direction, sign
+    fx, test_data, label, txn_type, sign
 ):
-    """Income and transfer credits are inflow; expenses and transfer debits outflow.
+    """Inflows are positive, outflows negative — in native and home alike.
 
-    Collapsing three duplicated copies of this matrix into one definition is what
+    Collapsing the duplicated copies of this matrix into one definition is what
     audit finding WP9.1 asks for, its stated risk being that /dashboard and
     /reports/monthly drift and disagree about the same month. The home form must
     be the native rule applied to the converted magnitude — same sign, same
@@ -303,7 +304,7 @@ async def test_sign_matrix_applies_to_native_and_home_alike(
         txn_id = await _seed_txn(
             conn, fx, test_data.user_id, test_data.category_id,
             fx.usd_account_id, _midday("2010-06-15"),
-            txn_type=txn_type, direction=direction,
+            txn_type=txn_type,
         )
         row = await conn.fetchrow(SCAFFOLD, txn_id, "UTC")
 

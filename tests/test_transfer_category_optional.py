@@ -70,7 +70,10 @@ async def test_transfer_without_category_id_succeeds(client, test_data):
         )
         assert r.status_code == 201, r.text
         body = r.json()
-        assert body["transaction_type"] == 3  # TRANSFER
+        # Posted with a negative amount, so this leg is the outflow. Transfers
+        # are identified by the pairing FK, not by a type value.
+        assert body["transaction_type"] == 1  # OUTFLOW
+        assert body["transfer_transaction_id"] is not None
         # The engine assigned a category even though the caller sent none.
         assert body["category_id"] is not None
     finally:

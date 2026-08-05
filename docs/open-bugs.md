@@ -14,15 +14,6 @@ Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high
 
 ## 🔴 Critical
 
-### 1.3 — Every USD→USD transfer returns 500
-`helpers/transfers.py` — the dominant-side block tests the caller's rate override
-*before* the currency-match rule (violating spec §Transfers point 7), and its final
-`raise RuntimeError` is reachable whenever neither leg matches `main_currency`.
-**Reproduced 2026-08-03:** `POST /transactions` USD→USD with PEN home →
-`RuntimeError: neither leg (USD, USD) matches main_currency ('PEN')`, uncaught, 500.
-**Fix:** deleted, not repaired — the dominant-side rule goes when home values stop
-being stored. See `docs/rework/WP2`.
-
 ### 1.4 — Inbox items promote at exchange rate 1.0
 `helpers/inbox.py` — `exchange_rate` defaults to `1.0` via `COALESCE`; the PUT
 re-rate fires only on a `date` change, never on `account_id`; promote uses the stored
@@ -65,14 +56,13 @@ Add a purge job — the table grows unbounded today.
 
 - **6.1 `extra="forbid"` sweep** — request schemas silently drop unknown fields. Fail closed: unknown input must `422`.
 - **6.2 UUID path/query params typed `str`** — malformed input reaches SQL and 500s instead of `422`.
-- **6.3 CHECK constraints for closed enums** — *partially shipped:* `sql/019` covers `expense_transaction_inbox`. Still open for `expense_transactions` (`transaction_type IN (1,2,3)`; `transfer_direction` present exactly when type = 3), `transaction_source`, reconciliation `status`, `activity_log.actor_type`, `exchange_rates.rate > 0`, `user_settings` enums.
+- **6.3 CHECK constraints for closed enums** — *partially shipped:* `sql/019` covers `expense_transaction_inbox`, `sql/020` covers `expense_transactions` (`transaction_type IN (1,2)` plus `amount_cents > 0`). Still open for `transaction_source`, reconciliation `status`, `activity_log.actor_type`, `exchange_rates.rate > 0`, `user_settings` enums. ⚠️ Write these as `col IS NOT NULL AND col IN (…)` on any nullable column — a `CHECK` passes on `NULL`, so the bare `IN` admits exactly the row it was added to forbid (found while writing `sql/020`).
 - **7.4 Reserved system-category names can permanently 500 transfers** — nothing stops a user claiming `@Debt`/`@Transfer`/`@Opening`; `ensure_system_category`'s `ON CONFLICT (user_id, system_key)` arbiter does not cover the `(user_id, LOWER(name))` index, so the `UniqueViolationError` escapes uncaught. Reject reserved names at the boundary *and* wrap the seeding INSERT.
 
 ---
 
 ## 🟡 Medium
 
-- **1.2** The surviving dominant-side implementation is the buggy one. Closes with 1.3.
 - **1.7** Rate hygiene — provider-rate validation, negative-lookup cache TTL, archived-account currencies missing from the fetch target list, `Decimal`/`ROUND_HALF_UP` instead of float.
 - **2.3** `resolve_home_rates` reads an account with no `user_id` filter. Closes when the currency work deletes that helper; **until then it is a live cross-tenant read** — RLS is inert, so query scoping is the only guard.
 - **2.4** PAT plaintext sits 24 h in `idempotency_keys.response_snapshot`, cancelling "only the hash is stored". Exempt `POST /auth/pat` from snapshot storage; return `409` on replay.

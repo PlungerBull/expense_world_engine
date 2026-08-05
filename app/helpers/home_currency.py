@@ -67,10 +67,12 @@ where the join lives, so interpolating UNCONVERTIBLE_FLAG_EXPR into an outer
 the CTE (``... AS is_unconvertible``) and sum it by name outside.
 
 What the flag does *not* cover: it measures convertibility, not classifiability.
-The ``ELSE 0`` arm of the sign matrix silently drops a row whose
-``transaction_type`` is out of range from both the native and home totals without
-raising the flag. Pre-existing, and near-unreachable now that the expressions
-interpolate ``app.constants`` members, but it is the one remaining silent drop.
+The ``ELSE 0`` arm of the sign matrix would drop a row whose ``transaction_type``
+is out of range from both the native and home totals without raising the flag.
+That was the one remaining silent drop until sql/020 made it unreachable —
+``transaction_type`` is now ``NOT NULL`` with ``CHECK (… IN (1, 2))``, so the
+only rows reaching ``ELSE`` are LEFT JOIN misses, which must score 0. See
+``signed_expr``.
 
 
 Rate dates resolve in the user's display_timezone
@@ -157,7 +159,7 @@ remains unscheduled.
 """
 from textwrap import indent
 
-from app.constants import HOME_CURRENCY, TransactionType, TransferDirection
+from app.constants import HOME_CURRENCY, TransactionType
 
 # Table aliases the fragments below reference. Part of the contract — callers
 # and tests build their scaffold from these rather than hardcoding letters.
@@ -215,41 +217,46 @@ HOME_CENTS_EXPR = f"""CASE
 END"""
 
 
-def _signed(magnitude: str) -> str:
+def signed_expr(magnitude: str) -> str:
     """Apply the sign matrix to an unsigned magnitude expression.
 
-    Income and transfer credits are inflow (positive); expenses and transfer
-    debits are outflow (negative). Written once so the native and home forms
-    cannot drift apart — three duplicated copies of this matrix across
-    routers/dashboard.py and helpers/monthly_report.py are what audit finding
-    WP9.1 is about, its stated risk being that /dashboard and /reports/monthly
-    disagree about the same month.
+    Inflows are positive, outflows negative. That is the entire rule: after
+    WP1 a transfer leg is an ordinary row and needs no branch of its own,
+    where this used to need four arms to express two outcomes.
+
+    **This is the only rendering of the sign matrix in the engine.** It used to
+    be one of five — two literal copies in helpers/monthly_report.py, two in
+    routers/dashboard.py, and this builder, which nothing imported. That is
+    audit finding WP9.1, whose stated risk was /dashboard and /reports/monthly
+    disagreeing about the same month. Callers pass their own magnitude:
+    ``t.amount_cents`` for the native form, ``HOME_CENTS_EXPR`` for the
+    converted one, and (until docs/rework/WP2 lands) the read paths' remaining
+    ``COALESCE(t.amount_home_cents, t.amount_cents)``.
 
     Integers come from app.constants rather than being written as literals, so a
     renumbering cannot silently desync the SQL from the enum (audit WP9.9).
+
+    On ``ELSE 0``: this is not a fail-open arm. ``transaction_type`` is
+    ``NOT NULL`` with ``CHECK (transaction_type IN (1, 2))`` (sql/020), so no
+    stored row can miss both branches. The only way to reach ``ELSE`` is a
+    LEFT JOIN miss — a category or hashtag with no transactions at all, where
+    ``t.*`` is entirely NULL — and those must report 0, not NULL, which is the
+    invariant the caller contract's LEFT JOIN exists to preserve. Before
+    sql/020 this arm also swallowed rows whose direction the engine could not
+    read; that state is now unrepresentable.
     """
-    expense = int(TransactionType.EXPENSE)
-    income = int(TransactionType.INCOME)
-    transfer = int(TransactionType.TRANSFER)
-    debit = int(TransferDirection.DEBIT)
-    credit = int(TransferDirection.CREDIT)
+    outflow = int(TransactionType.OUTFLOW)
+    inflow = int(TransactionType.INFLOW)
     ttype = f"{TXN_ALIAS}.transaction_type"
-    direction = f"{TXN_ALIAS}.transfer_direction"
     # Nested one level so the composed expression stays readable in EXPLAIN
     # output and in the queries the read paths splice it into.
     body = indent(magnitude, " " * 8)
 
     return f"""CASE
-    WHEN {ttype} = {income} THEN (
+    WHEN {ttype} = {inflow} THEN (
 {body}
     )
-    WHEN {ttype} = {transfer} AND {direction} = {credit} THEN (
-{body}
-    )
-    WHEN {ttype} = {expense} THEN -(
-{body}
-    )
-    WHEN {ttype} = {transfer} AND {direction} = {debit} THEN -(
+    WHEN {ttype} = {outflow} THEN -(
 {body}
     )
     ELSE 0
@@ -257,7 +264,7 @@ END"""
 
 
 # Native signed amount — the account's own currency, no conversion.
-SIGNED_CENTS_EXPR = _signed(f"{TXN_ALIAS}.amount_cents")
+SIGNED_CENTS_EXPR = signed_expr(f"{TXN_ALIAS}.amount_cents")
 
 # Home signed amount. Wraps HOME_CENTS_EXPR by reference rather than re-deriving
 # the multiplication with a sign inside it, so there is exactly one definition of
@@ -265,7 +272,7 @@ SIGNED_CENTS_EXPR = _signed(f"{TXN_ALIAS}.amount_cents")
 # round(numeric) is half-away-from-zero, an odd function, so round(-x * r) and
 # -round(x * r) agree for every input. The rule is about single definition, and
 # it matches the magnitude-then-round convention in helpers/transactions.py.)
-SIGNED_HOME_CENTS_EXPR = _signed(HOME_CENTS_EXPR)
+SIGNED_HOME_CENTS_EXPR = signed_expr(HOME_CENTS_EXPR)
 
 
 # 1 when a real transaction row has no home value, else 0. See "The aggregation

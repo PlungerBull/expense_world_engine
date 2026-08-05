@@ -563,7 +563,6 @@ async def update_transaction(
         await reverse_balance(
             conn, str(before_row["account_id"]), user_id,
             before_row["amount_cents"], before_row["transaction_type"],
-            transfer_direction=before_row["transfer_direction"],
         )
         effective_account_id = fields.get("account_id") or str(before_row["account_id"])
         effective_amount = fields.get("amount_cents", before_row["amount_cents"])
@@ -571,7 +570,6 @@ async def update_transaction(
         await apply_balance(
             conn, effective_account_id, user_id,
             effective_amount, effective_type,
-            transfer_direction=before_row["transfer_direction"],
         )
 
     if fields:
@@ -685,7 +683,6 @@ async def delete_transaction(
     await reverse_balance(
         conn, str(row["account_id"]), user_id,
         row["amount_cents"], row["transaction_type"],
-        transfer_direction=row["transfer_direction"],
     )
 
     # Soft-delete junction rows
@@ -727,7 +724,6 @@ async def delete_transaction(
             await reverse_balance(
                 conn, str(sibling_row["account_id"]), user_id,
                 sibling_row["amount_cents"], sibling_row["transaction_type"],
-                transfer_direction=sibling_row["transfer_direction"],
             )
 
             await conn.execute(
@@ -990,7 +986,6 @@ async def restore_transaction(
     await apply_balance(
         conn, str(row["account_id"]), user_id,
         row["amount_cents"], row["transaction_type"],
-        transfer_direction=row["transfer_direction"],
     )
 
     # 7. Re-activate cascaded junction rows on the primary.
@@ -1041,7 +1036,6 @@ async def restore_transaction(
         await apply_balance(
             conn, str(sibling_row["account_id"]), user_id,
             sibling_row["amount_cents"], sibling_row["transaction_type"],
-            transfer_direction=sibling_row["transfer_direction"],
         )
 
         await conn.execute(
@@ -1250,7 +1244,7 @@ async def create_batch(
         # this is a deliberate simplification vs ``apply_balance`` which
         # handles the full matrix but would require K individual
         # UPDATEs instead of the optimised accumulate-then-apply.
-        if transaction_type == TransactionType.EXPENSE:
+        if transaction_type == TransactionType.OUTFLOW:
             delta = -amount_cents
         else:
             delta = amount_cents

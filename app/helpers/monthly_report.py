@@ -4,10 +4,12 @@ One source of truth for the SQL so the two endpoints are identical by constructi
 every non-deleted category (even zero-flow ones), hashtag_breakdown grouped by
 (category_id, sorted hashtag-id array), and totals for inflow/outflow/net.
 
-Signed semantics: every row contributes a signed amount derived from transaction_type
-and transfer_direction. Expenses and transfer debits are negative (outflow); income
-and transfer credits are positive (inflow). Categories sum the signed amounts, so a
-real-to-real transfer naturally cancels to zero under @Transfer, and a loan to a
+Signed semantics: every row contributes a signed amount derived from
+transaction_type alone — outflows negative, inflows positive. The expressions come
+from ``helpers/home_currency.signed_expr``, the engine's single rendering of that
+rule; this module used to carry two literal copies of a four-branch version, which
+is audit finding WP9.1. Categories sum the signed amounts, so a real-to-real
+transfer naturally cancels to zero under @Transfer, and a loan to a
 person shows as negative @Transfer (real leg) + positive @Debt (person leg). Totals
 split the signed values into inflow (positive) and outflow (|negative|); net is
 inflow - outflow and is unaffected by internal movement volume.
@@ -31,6 +33,14 @@ from zoneinfo import ZoneInfo
 import asyncpg
 
 from app.errors import settings_missing
+from app.helpers.home_currency import signed_expr
+
+# Built once at import. The COALESCE is the surviving fallback that treats USD
+# cents as PEN cents on a row with no stored home value — known-wrong, and
+# replaced by a real read-time conversion in docs/rework/WP2, which swaps only
+# this argument.
+_SIGNED_CENTS_SQL = signed_expr("t.amount_cents")
+_SIGNED_HOME_CENTS_SQL = signed_expr("COALESCE(t.amount_home_cents, t.amount_cents)")
 
 
 async def get_user_report_settings(
@@ -103,25 +113,13 @@ async def compute_month_flow(
     )
 
     breakdown_rows = await conn.fetch(
-        """
+        f"""
         WITH signed_txns AS (
             SELECT
                 t.id,
                 t.category_id,
-                CASE
-                    WHEN t.transaction_type = 2 THEN  t.amount_cents
-                    WHEN t.transaction_type = 3 AND t.transfer_direction = 2 THEN  t.amount_cents
-                    WHEN t.transaction_type = 1 THEN -t.amount_cents
-                    WHEN t.transaction_type = 3 AND t.transfer_direction = 1 THEN -t.amount_cents
-                    ELSE 0
-                END AS signed_cents,
-                CASE
-                    WHEN t.transaction_type = 2 THEN  COALESCE(t.amount_home_cents, t.amount_cents)
-                    WHEN t.transaction_type = 3 AND t.transfer_direction = 2 THEN  COALESCE(t.amount_home_cents, t.amount_cents)
-                    WHEN t.transaction_type = 1 THEN -COALESCE(t.amount_home_cents, t.amount_cents)
-                    WHEN t.transaction_type = 3 AND t.transfer_direction = 1 THEN -COALESCE(t.amount_home_cents, t.amount_cents)
-                    ELSE 0
-                END AS signed_home_cents,
+                {_SIGNED_CENTS_SQL} AS signed_cents,
+                {_SIGNED_HOME_CENTS_SQL} AS signed_home_cents,
                 COALESCE(
                     (
                         SELECT array_agg(th.hashtag_id::text ORDER BY th.hashtag_id::text)
@@ -184,23 +182,11 @@ async def compute_month_flow(
         )
 
     totals_row = await conn.fetchrow(
-        """
+        f"""
         WITH signed_txns AS (
             SELECT
-                CASE
-                    WHEN t.transaction_type = 2 THEN  t.amount_cents
-                    WHEN t.transaction_type = 3 AND t.transfer_direction = 2 THEN  t.amount_cents
-                    WHEN t.transaction_type = 1 THEN -t.amount_cents
-                    WHEN t.transaction_type = 3 AND t.transfer_direction = 1 THEN -t.amount_cents
-                    ELSE 0
-                END AS signed_cents,
-                CASE
-                    WHEN t.transaction_type = 2 THEN  COALESCE(t.amount_home_cents, t.amount_cents)
-                    WHEN t.transaction_type = 3 AND t.transfer_direction = 2 THEN  COALESCE(t.amount_home_cents, t.amount_cents)
-                    WHEN t.transaction_type = 1 THEN -COALESCE(t.amount_home_cents, t.amount_cents)
-                    WHEN t.transaction_type = 3 AND t.transfer_direction = 1 THEN -COALESCE(t.amount_home_cents, t.amount_cents)
-                    ELSE 0
-                END AS signed_home_cents
+                {_SIGNED_CENTS_SQL} AS signed_cents,
+                {_SIGNED_HOME_CENTS_SQL} AS signed_home_cents
             FROM expense_transactions t
             WHERE t.user_id = $1
               AND t.deleted_at IS NULL

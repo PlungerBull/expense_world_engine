@@ -7,6 +7,7 @@ from fastapi import APIRouter, Query
 from app import db
 from app.deps import CurrentUser
 from app.helpers.exchange_rate import batch_get_rates
+from app.helpers.home_currency import signed_expr
 from app.helpers.monthly_report import (
     compute_month_bounds,
     compute_month_flow,
@@ -94,30 +95,22 @@ async def _load_accounts(
 
 
 # Signed-amount expressions reused by the lifetime aggregators below.
-# Mirrors the convention in helpers/monthly_report.compute_month_flow:
-# expenses and transfer debits are negative, income and transfer credits
-# are positive. Kept here as module-level constants so the categories and
-# hashtags queries stay textually identical (drift here is a real bug
-# class — the two aggregates would disagree on what a transfer means).
-_SIGNED_CENTS_SQL = """
-    CASE
-        WHEN t.transaction_type = 2 THEN  t.amount_cents
-        WHEN t.transaction_type = 3 AND t.transfer_direction = 2 THEN  t.amount_cents
-        WHEN t.transaction_type = 1 THEN -t.amount_cents
-        WHEN t.transaction_type = 3 AND t.transfer_direction = 1 THEN -t.amount_cents
-        ELSE 0
-    END
-"""
+#
+# Both are built by helpers/home_currency.signed_expr, which is the engine's
+# single rendering of the sign matrix — this module and
+# helpers/monthly_report.py used to carry their own literal copies of it, and
+# audit finding WP9.1 is about exactly that: /dashboard and /reports/monthly
+# drifting until they disagreed about the same month. Only the magnitude
+# differs between the two, which is the point.
+#
+# The COALESCE below is the surviving fallback that treats USD cents as PEN
+# cents when a row has no stored home value. It is wrong and it is known —
+# docs/rework/WP2 replaces this argument with a real read-time conversion.
+_SIGNED_CENTS_SQL = signed_expr("t.amount_cents")
 
-_SIGNED_HOME_CENTS_SQL = """
-    CASE
-        WHEN t.transaction_type = 2 THEN  COALESCE(t.amount_home_cents, t.amount_cents)
-        WHEN t.transaction_type = 3 AND t.transfer_direction = 2 THEN  COALESCE(t.amount_home_cents, t.amount_cents)
-        WHEN t.transaction_type = 1 THEN -COALESCE(t.amount_home_cents, t.amount_cents)
-        WHEN t.transaction_type = 3 AND t.transfer_direction = 1 THEN -COALESCE(t.amount_home_cents, t.amount_cents)
-        ELSE 0
-    END
-"""
+_SIGNED_HOME_CENTS_SQL = signed_expr(
+    "COALESCE(t.amount_home_cents, t.amount_cents)"
+)
 
 
 async def _load_archived_categories(

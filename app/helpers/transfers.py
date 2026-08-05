@@ -6,14 +6,15 @@ import asyncpg
 
 from app.constants import (
     ActivityAction,
+    HOME_CURRENCY,
     SystemCategoryKey,
-    TransactionType,
 )
-from app.errors import conflict, validation_error
+from app.errors import conflict, settings_missing, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
 from app.helpers.categories import ensure_system_category
-from app.schemas.transactions import infer_transfer_direction, transaction_from_row
+from app.helpers.exchange_rate import lookup_exchange_rate
+from app.schemas.transactions import infer_transaction_type, transaction_from_row
 
 
 async def create_transfer_pair(
@@ -41,6 +42,12 @@ async def create_transfer_pair(
     # ------------------------------------------------------------------
     # 1. Zero-sum validation — opposite signs, neither zero
     # ------------------------------------------------------------------
+    # This guard is the ONLY thing enforcing "a transfer is not two outflows".
+    # It cannot move to the database: after WP1 each leg is an ordinary row
+    # whose direction is self-consistent, so the invariant spans two rows and
+    # no CHECK constraint can express it. The inbox enforces the same rule at
+    # its own write time (helpers/inbox._resolve_transfer_type), because that
+    # is where both signs still exist side by side.
     errors: dict = {}
 
     if primary_amount_cents == 0:
@@ -107,67 +114,96 @@ async def create_transfer_pair(
     )
 
     # ------------------------------------------------------------------
-    # 5. Normalize amounts and determine transfer_direction
+    # 5. Normalize amounts and derive each leg's direction
     # ------------------------------------------------------------------
+    # Each leg reads its OWN sign through the one shared rule. The guard above
+    # has already established that the two signs oppose, so the pair is one
+    # outflow and one inflow by construction rather than by assertion.
     primary_abs = abs(primary_amount_cents)
-    primary_direction = infer_transfer_direction(primary_amount_cents)
+    primary_type = infer_transaction_type(primary_amount_cents)
 
     sibling_abs = abs(transfer_amount_cents)
-    sibling_direction = infer_transfer_direction(transfer_amount_cents)
+    sibling_type = infer_transaction_type(transfer_amount_cents)
 
     # ------------------------------------------------------------------
     # 6. Exchange rates and amount_home_cents (dominant-side rule)
     # ------------------------------------------------------------------
     # Cross-currency transfers must net to zero in home currency. We achieve
-    # this by forcing the sibling's home value to equal the primary's, and
-    # deriving the sibling's rate from that. The "dominant" side (the one
-    # whose home value is computed independently) is picked in this order:
+    # this by forcing the non-dominant side's home value to equal the dominant
+    # side's by direct assignment — never recomputed via rate — so integer
+    # rounding can't introduce a net leak. The sibling's per-row exchange_rate
+    # is then derived from that forced home value, for audit/display.
     #
-    #   1. If the caller supplied a primary_exchange_rate, the primary wins.
-    #   2. If the primary's currency == main currency, the primary wins (rate 1.0).
-    #   3. If the sibling's currency  == main currency, the sibling wins (rate 1.0).
+    # The "dominant" side (the one whose home value is computed independently)
+    # is picked in the order engine-spec.md §Transfers point 7 states:
     #
-    # Phase 1 supports only USD and PEN (sql/015 CHECK), so main_currency
-    # always matches one of the two legs — no 3-currency fallback is needed.
-    # The auth trigger (sql/006) guarantees user_settings exists for every
-    # authenticated user, so settings_row is None only under corrupted state;
-    # we raise loudly in that case rather than silently picking a fallback.
+    #   1. The primary's currency == home  → primary dominant, rate 1.0.
+    #   2. The sibling's currency == home  → sibling dominant, rate 1.0.
+    #   3. Neither matches                 → primary dominant, at the caller's
+    #      rate if supplied, else the market rate for its date.
     #
-    # In every case the non-dominant side's amount_home_cents is forced to
-    # equal the dominant side's by direct assignment — never recomputed via
-    # rate — so integer rounding can't introduce a net leak. Per-row
-    # exchange_rate is still stored for audit/display, derived from the
-    # forced home value.
+    # ⚠️ Branch order is load-bearing, and getting it wrong was open bug 1.3.
+    # This block used to test the caller's rate override FIRST, which produced
+    # two defects:
+    #
+    #   * a home-currency primary with a supplied rate computed
+    #     `home = amount × rate` — wrong, since a PEN amount's home value is
+    #     itself; and
+    #   * there was no rule at all for case 3, so the block ended in
+    #     `raise RuntimeError` and EVERY USD→USD transfer returned an uncaught
+    #     500 under a PEN home currency.
+    #
+    # Case 3 is now a real rule rather than a dead end: the primary is valued
+    # at the market rate through the same helper create_transaction already
+    # uses, so a same-currency foreign transfer prices like any other row.
+    #
+    # This block is scheduled for deletion by docs/rework/WP2, which stops
+    # storing home values altogether and surfaces the FX spread as @FX instead
+    # of forcing it to zero. Until then the pair still nets to zero.
     primary_currency = primary_account["currency_code"]
     sibling_currency = transfer_account["currency_code"]
 
+    # sql/018 locks main_currency to PEN, and helpers/home_currency.py's SQL
+    # fragments interpolate HOME_CURRENCY as a literal on that basis. Asserting
+    # the two agree costs nothing here and makes a lifted CHECK fail loudly
+    # instead of silently pricing a non-PEN ledger in PEN. It also removes the
+    # old `settings_row is None → main_currency = None → nothing matches` path,
+    # which was the second route into the 500 above.
     settings_row = await conn.fetchrow(
         "SELECT main_currency FROM user_settings WHERE user_id = $1", user_id,
     )
-    main_currency = settings_row["main_currency"] if settings_row else None
+    if settings_row is None:
+        raise settings_missing()
+    if settings_row["main_currency"] != HOME_CURRENCY:
+        raise RuntimeError(
+            f"user_settings.main_currency is {settings_row['main_currency']!r} "
+            f"but the engine converts to {HOME_CURRENCY!r} (app.constants."
+            "HOME_CURRENCY). sql/018 is supposed to make this unreachable; if "
+            "that CHECK was lifted, helpers/home_currency.py must be revisited "
+            "at the same time."
+        )
 
-    if primary_exchange_rate is not None:
-        # Caller override: primary dominant with the given rate
-        primary_home = round(primary_abs * primary_exchange_rate)
-        sibling_home = primary_home
-        sibling_exchange_rate = sibling_home / sibling_abs
-    elif primary_currency == main_currency:
+    if primary_currency == HOME_CURRENCY:
         primary_exchange_rate = 1.0
         primary_home = primary_abs
         sibling_home = primary_home
         sibling_exchange_rate = sibling_home / sibling_abs
-    elif sibling_currency == main_currency:
+    elif sibling_currency == HOME_CURRENCY:
         sibling_exchange_rate = 1.0
         sibling_home = sibling_abs
         primary_home = sibling_home
         primary_exchange_rate = primary_home / primary_abs
     else:
-        raise RuntimeError(
-            f"Transfer dominant-side rule failed: neither leg ({primary_currency}, "
-            f"{sibling_currency}) matches main_currency ({main_currency!r}). "
-            "Under the Phase 1 PEN/USD-only policy (sql/015) this state is "
-            "unreachable for valid data — likely indicates missing user_settings."
-        )
+        # Neither leg is in the home currency — e.g. USD→USD under a PEN home.
+        # The primary is dominant, valued at the caller's rate if they gave one
+        # and otherwise at the market rate on its date.
+        if primary_exchange_rate is None:
+            primary_exchange_rate = await lookup_exchange_rate(
+                conn, primary_account_id, primary_date, user_id
+            )
+        primary_home = round(primary_abs * primary_exchange_rate)
+        sibling_home = primary_home
+        sibling_exchange_rate = sibling_home / sibling_abs
 
     if primary_id == sibling_id:
         raise validation_error(
@@ -183,9 +219,9 @@ async def create_transfer_pair(
             """
             INSERT INTO expense_transactions
                 (id, user_id, title, description, amount_cents, amount_home_cents,
-                 transaction_type, transfer_direction, date, account_id, category_id,
+                 transaction_type, date, account_id, category_id,
                  exchange_rate, cleared, inbox_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, 3, $7, $8, $9, $10, $11, $12, $13, now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), now())
             RETURNING *
             """,
             primary_id,
@@ -194,7 +230,7 @@ async def create_transfer_pair(
             primary_description,
             primary_abs,
             primary_home,
-            primary_direction,
+            primary_type,
             primary_date,
             primary_account_id,
             primary_category_id,
@@ -213,9 +249,9 @@ async def create_transfer_pair(
             """
             INSERT INTO expense_transactions
                 (id, user_id, title, description, amount_cents, amount_home_cents,
-                 transaction_type, transfer_direction, date, account_id, category_id,
+                 transaction_type, date, account_id, category_id,
                  exchange_rate, cleared, transfer_transaction_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, 3, $7, $8, $9, $10, $11, $12, $13, now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), now())
             RETURNING *
             """,
             sibling_id,
@@ -224,7 +260,7 @@ async def create_transfer_pair(
             primary_description,
             sibling_abs,
             sibling_home,
-            sibling_direction,
+            sibling_type,
             primary_date,
             transfer_account_id,
             sibling_category_id,
@@ -255,23 +291,13 @@ async def create_transfer_pair(
 
     # ------------------------------------------------------------------
     # 10. Update balances on both accounts via the shared helper so the
-    #     transfer-direction sign matrix lives in one place (helpers/balance.py).
+    #     sign matrix lives in one place (helpers/balance.py).
     # ------------------------------------------------------------------
     await apply_balance(
-        conn,
-        primary_account_id,
-        user_id,
-        primary_abs,
-        TransactionType.TRANSFER,
-        transfer_direction=primary_direction,
+        conn, primary_account_id, user_id, primary_abs, primary_type,
     )
     await apply_balance(
-        conn,
-        transfer_account_id,
-        user_id,
-        sibling_abs,
-        TransactionType.TRANSFER,
-        transfer_direction=sibling_direction,
+        conn, transfer_account_id, user_id, sibling_abs, sibling_type,
     )
 
     # ------------------------------------------------------------------

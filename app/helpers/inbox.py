@@ -31,7 +31,7 @@ from uuid import UUID
 
 import asyncpg
 
-from app.constants import ActivityAction, InboxStatus, TransactionType, TransferDirection
+from app.constants import ActivityAction, InboxStatus, TransactionType
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
@@ -42,19 +42,20 @@ from app.helpers.validation import extract_update_fields
 from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
 from app.schemas.transactions import (
     infer_transaction_type,
-    infer_transfer_direction,
     transaction_from_row,
 )
 
 
-def _resolve_transfer_direction(
+def _resolve_transfer_type(
     primary_signed: Optional[int],
     sibling_signed: int,
 ) -> int:
-    """Derive the PRIMARY leg's ``transfer_direction`` from the signed inputs.
+    """Derive the PRIMARY leg's ``transaction_type`` from the signed inputs.
 
-    The inbox row is the primary leg, so its direction is the same field the
-    ledger carries. The sibling's direction is the inverse and is never stored.
+    The inbox row *is* the primary leg, so its direction is the same field the
+    ledger carries — after WP1 that is ``transaction_type`` itself, not a
+    separate column. The sibling's direction is the inverse and is never
+    stored.
 
     Rules, in order:
 
@@ -76,8 +77,8 @@ def _resolve_transfer_direction(
             {"transfer.amount_cents": "Must have opposite sign to amount_cents."},
         )
     if primary_signed is not None:
-        return infer_transfer_direction(primary_signed)
-    return infer_transfer_direction(-sibling_signed)
+        return infer_transaction_type(primary_signed)
+    return infer_transaction_type(-sibling_signed)
 
 
 # ---------------------------------------------------------------------------
@@ -96,14 +97,16 @@ async def create_inbox_item(
     transaction_type, abs the amount) and auto-populates the exchange
     rate if both account and date are known.
 
-    Transfer fields (if provided) set ``transaction_type`` to ``TRANSFER``
-    and stash the sibling account, its absolute amount, and the primary
-    leg's ``transfer_direction`` for later use when the item is promoted.
+    Transfer fields (if provided) stash the sibling account and its absolute
+    amount for later use when the item is promoted. The primary leg's
+    direction lands in ``transaction_type`` like any other row's — a transfer
+    draft is not a third kind of thing.
     """
     # Signs are consumed in this block and nowhere else. Everything below sees
     # only absolute amounts plus the encoded direction — the same contract the
-    # ledger has. transaction_type is assigned exactly once, at the end, so a
-    # transfer can never be overwritten by the primary amount's sign.
+    # ledger has. transaction_type is assigned exactly once, from whichever
+    # sign is authoritative, so the two amounts can never each write it and
+    # disagree.
     primary_signed = body.amount_cents
     if primary_signed is not None and primary_signed == 0:
         raise validation_error(
@@ -124,15 +127,13 @@ async def create_inbox_item(
 
     amount_cents = abs(primary_signed) if primary_signed is not None else None
     transfer_amount_cents = abs(sibling_signed) if sibling_signed is not None else None
-    transfer_direction = (
-        _resolve_transfer_direction(primary_signed, sibling_signed)
-        if sibling_signed is not None
-        else None
-    )
 
+    # Assigned exactly once. On a transfer draft the sibling's sign
+    # participates (it is what keeps a draft with no primary amount
+    # directional); otherwise the primary's sign is the whole answer.
     transaction_type: Optional[int] = None
     if sibling_signed is not None:
-        transaction_type = TransactionType.TRANSFER
+        transaction_type = _resolve_transfer_type(primary_signed, sibling_signed)
     elif primary_signed is not None:
         transaction_type = infer_transaction_type(primary_signed)
 
@@ -147,9 +148,9 @@ async def create_inbox_item(
             INSERT INTO expense_transaction_inbox
                 (id, user_id, title, description, amount_cents, transaction_type,
                  date, account_id, category_id, exchange_rate,
-                 transfer_account_id, transfer_amount_cents, transfer_direction,
+                 transfer_account_id, transfer_amount_cents,
                  created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 1.0), $11, $12, $13, now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 1.0), $11, $12, now(), now())
             RETURNING *
             """,
             body.id,
@@ -164,7 +165,6 @@ async def create_inbox_item(
             exchange_rate,
             transfer_account_id,
             transfer_amount_cents,
-            transfer_direction,
         )
     except asyncpg.UniqueViolationError:
         raise conflict(f"An inbox item with id '{body.id}' already exists.")
@@ -254,44 +254,39 @@ async def update_inbox_item(
 
     before = inbox_from_row(before_row)
 
-    # Resolve direction and type against the MERGED state (stored row + this
-    # patch), assigning transaction_type exactly once. Deriving it in one place
-    # is what stops an `amount_cents` in the same request from downgrading a
-    # transfer to an expense — previously the amount block ran last and won,
-    # leaving transfer columns set on a row typed 1 or 2.
-    was_transfer = before_row["transfer_account_id"] is not None
-
+    # Resolve direction against the MERGED state (stored row + this patch),
+    # assigning transaction_type exactly once. Deriving it in one place is what
+    # stops an `amount_cents` in the same request from clobbering the transfer
+    # columns — previously the amount block ran last and won, leaving transfer
+    # columns set on a row whose type disagreed with them.
     if transfer_given and transfer is None:
         # Explicit null — the draft stops being a transfer.
+        #
+        # transaction_type needs no repair here. Before WP1 it held the value
+        # 3, so clearing the transfer columns destroyed the row's only record
+        # of which way it pointed and the direction had to be recovered from
+        # transfer_direction on the way out. Now transaction_type already IS
+        # that direction, so leaving it untouched is correct — dropping the
+        # counterparty does not change which way the money moved.
         fields["transfer_account_id"] = None
         fields["transfer_amount_cents"] = None
-        fields["transfer_direction"] = None
         if primary_signed is not None:
             fields["transaction_type"] = infer_transaction_type(primary_signed)
         elif before_row["amount_cents"] is None:
+            # No amount on either side of the merge — nothing to have a
+            # direction about.
             fields["transaction_type"] = None
-        elif was_transfer:
-            # No new amount, and the stored one is absolute — the stored
-            # direction is the only surviving record of which way it pointed.
-            fields["transaction_type"] = (
-                TransactionType.EXPENSE
-                if before_row["transfer_direction"] == TransferDirection.DEBIT
-                else TransactionType.INCOME
-            )
     elif transfer is not None:
         fields["transfer_account_id"] = transfer["account_id"]
         fields["transfer_amount_cents"] = abs(sibling_signed)
-        fields["transfer_direction"] = _resolve_transfer_direction(
+        fields["transaction_type"] = _resolve_transfer_type(
             primary_signed, sibling_signed
         )
-        fields["transaction_type"] = TransactionType.TRANSFER
-    elif was_transfer:
-        if primary_signed is not None:
-            # Restating the primary's sign flips both legs; the sibling's amount
-            # is absolute and its direction is implied, so nothing else moves.
-            fields["transfer_direction"] = infer_transfer_direction(primary_signed)
-            fields["transaction_type"] = TransactionType.TRANSFER
     elif primary_signed is not None:
+        # Covers both cases: restating the primary's sign on an existing
+        # transfer draft flips both legs (the sibling's amount is absolute and
+        # its direction is implied), and on an ordinary draft it is simply the
+        # direction. One rule, because a transfer leg is now an ordinary row.
         fields["transaction_type"] = infer_transaction_type(primary_signed)
 
     # Auto-populate exchange_rate if date changes and account_id is set
@@ -557,10 +552,12 @@ async def promote_inbox_item(
         # shape POST /transactions hands it; here the signs are reconstructed
         # from an explicit column rather than inferred from the sibling, so its
         # opposite-sign guard passes because the stored row is well-formed —
-        # not because promote forced the primary to agree.
+        # not because promote forced the primary to agree. That column is now
+        # transaction_type; sql/020's coherence CHECK guarantees it is 1 or 2
+        # on any row carrying transfer columns.
         primary_abs = inbox_row["amount_cents"]
         sibling_abs = inbox_row["transfer_amount_cents"]
-        if inbox_row["transfer_direction"] == TransferDirection.DEBIT:
+        if inbox_row["transaction_type"] == TransactionType.OUTFLOW:
             primary_signed, sibling_signed = -primary_abs, sibling_abs
         else:
             primary_signed, sibling_signed = primary_abs, -sibling_abs
@@ -584,8 +581,16 @@ async def promote_inbox_item(
 
     # 4b. Normal (non-transfer) promotion branch
     else:
-        # Determine transaction_type — use stored value, or default to expense
-        transaction_type = inbox_row["transaction_type"] or TransactionType.EXPENSE
+        # amount_cents is a promote prerequisite (validated above), and every
+        # write path that sets it sets transaction_type in the same statement,
+        # so a null here means the row was written by something that is not
+        # this engine. Fail closed rather than substituting a direction.
+        transaction_type = inbox_row["transaction_type"]
+        if transaction_type is None:
+            raise validation_error(
+                "Inbox item is not ready to promote.",
+                {"transaction_type": "Missing direction on a row with an amount."},
+            )
 
         # Compute amount_home_cents
         exchange_rate = float(inbox_row["exchange_rate"])

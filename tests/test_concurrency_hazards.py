@@ -221,8 +221,11 @@ async def test_transfer_pair_is_created_atomically(client, test_data):
         sibling_txn_id = primary_response["transfer_transaction_id"]
 
         assert sibling_txn_id is not None, "Primary must link to its sibling"
-        assert primary_response["transaction_type"] == 3  # TRANSFER
-        assert primary_response["transfer_direction"] == 1  # DEBIT (primary is outflow)
+        # The primary was posted with a negative amount, so it is the outflow
+        # leg. There is no transfer-specific type: transfer_transaction_id
+        # above is what says this is a transfer.
+        assert primary_response["transaction_type"] == 1  # OUTFLOW
+        assert "transfer_direction" not in primary_response
 
         # Both transactions must exist in the DB, both must link to each
         # other, and both must be non-deleted.
@@ -246,8 +249,11 @@ async def test_transfer_pair_is_created_atomically(client, test_data):
             assert str(primary_row["transfer_transaction_id"]) == sibling_txn_id
             assert str(sibling_row["transfer_transaction_id"]) == primary_txn_id
 
-            # Opposite directions (the zero-sum invariant).
-            assert primary_row["transfer_direction"] != sibling_row["transfer_direction"]
+            # Opposite directions (the zero-sum invariant). One leg outflow,
+            # one inflow — read off transaction_type now that direction lives
+            # there on every row.
+            assert primary_row["transaction_type"] == 1  # OUTFLOW
+            assert sibling_row["transaction_type"] == 2  # INFLOW
 
             # Both account balances moved together. If one moved without
             # the other, we have broken atomicity.

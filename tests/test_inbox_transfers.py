@@ -1,20 +1,27 @@
 """Inbox transfer drafts: direction is stored, not inferred from a sign.
 
-Before `sql/019` the inbox had no `transfer_direction` column, so the sign of
+Before `sql/019` the inbox had no direction column at all, so the sign of
 `transfer_amount_cents` was the only direction signal on the row. The primary
 leg's own sign was discarded by `abs()` on write and re-derived at promote time
 as the *negation* of the sibling's, which made `create_transfer_pair`'s
 opposite-sign guard unreachable from this path — two outflows promoted cleanly
 with one leg silently flipped (WP7.2).
 
-Nothing in the suite exercised any of it. These tests pin the corrected
-contract end to end:
+`sql/019` fixed that with a dedicated `transfer_direction` column. WP1
+(`sql/020`) then removed that column, not by reverting the lesson but by
+finishing it: direction now lives in `transaction_type` on **every** row —
+1 = outflow, 2 = inflow — and a transfer is identified by its transfer columns
+rather than by a third type value. So the assertions below read
+`transaction_type` where they used to read `transfer_direction`; the contract
+they pin is otherwise unchanged.
 
-  * signed in the request, absolute in storage beside `transfer_direction`,
-    absolute in the response beside `transfer_direction`
+These tests pin that contract end to end:
+
+  * signed in the request, absolute in storage beside `transaction_type`,
+    absolute in the response beside `transaction_type`
   * a contradictory pair is a 422, not a silent coercion
-  * `transaction_type` survives an `amount_cents` edit in the same request
-  * `transfer: null` un-marks a draft
+  * the transfer columns survive an `amount_cents` edit in the same request
+  * `transfer: null` un-marks a draft and preserves its direction
   * `?debit_as_negative=true` flips both legs, in opposite directions
   * `?ready=true` and promote agree on what is promotable
   * the half-transfer row is impossible at the database level
@@ -121,13 +128,13 @@ async def test_transfer_draft_stores_absolute_amount_and_direction(client, test_
 
         assert body["amount_cents"] == 5000
         assert body["transfer_amount_cents"] == 5000  # positive, was signed before
-        assert body["transfer_direction"] == 1  # DEBIT — the primary pays
-        assert body["transaction_type"] == 3
+        assert body["transaction_type"] == 1  # OUTFLOW — the primary pays
+        assert "transfer_direction" not in body
 
         row = await _inbox_row(inbox_id)
         assert row["transfer_amount_cents"] == 5000
-        assert row["transfer_direction"] == 1
-        assert row["transaction_type"] == 3
+        assert row["transaction_type"] == 1
+        assert row["transfer_account_id"] is not None
     finally:
         await _cleanup_account(sibling)
 
@@ -148,7 +155,7 @@ async def test_incoming_transfer_draft_stores_credit_direction(client, test_data
         assert r.status_code == 201, r.text
         body = r.json()
         assert body["transfer_amount_cents"] == 5000
-        assert body["transfer_direction"] == 2  # CREDIT — the primary receives
+        assert body["transaction_type"] == 2  # INFLOW — the primary receives
     finally:
         await _cleanup_account(sibling)
 
@@ -250,9 +257,11 @@ async def test_transfer_draft_without_primary_amount_keeps_direction(client, tes
         body = r.json()
         assert body["amount_cents"] is None
         assert body["transfer_amount_cents"] == 2500
-        # Sibling receives, so the primary is the one paying.
-        assert body["transfer_direction"] == 1
-        assert body["transaction_type"] == 3
+        # Sibling receives, so the primary is the one paying. This is the case
+        # that needs the sibling's sign: with no primary amount, the sibling is
+        # the only thing that can say which way the draft points.
+        assert body["transaction_type"] == 1  # OUTFLOW
+        assert body["transfer_account_id"] is not None
     finally:
         await _cleanup_account(sibling)
 
@@ -262,12 +271,13 @@ async def test_transfer_draft_without_primary_amount_keeps_direction(client, tes
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_put_with_amount_and_transfer_keeps_transfer_type(client, test_data):
-    """`amount_cents` in the same request must not downgrade a transfer.
+async def test_put_with_amount_and_transfer_keeps_transfer_columns(client, test_data):
+    """`amount_cents` in the same request must not clobber the transfer columns.
 
     The amount block used to run after the transfer block and overwrite
-    transaction_type with EXPENSE/INCOME, leaving transfer columns set on a row
-    typed 1 or 2 — promote treated it as a transfer, the read path did not.
+    transaction_type, leaving transfer columns set on a row whose type
+    disagreed with them — promote treated it as a transfer, the read path did
+    not. Both are now derived in one place from the merged state.
     """
     sibling = await _make_account(test_data.user_id, "put-both")
     try:
@@ -289,8 +299,8 @@ async def test_put_with_amount_and_transfer_keeps_transfer_type(client, test_dat
         )
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body["transaction_type"] == 3
-        assert body["transfer_direction"] == 1
+        assert body["transaction_type"] == 1  # OUTFLOW, from the primary's sign
+        assert body["transfer_account_id"] == sibling
         assert body["amount_cents"] == 3000
         assert body["transfer_amount_cents"] == 3000
     finally:
@@ -299,7 +309,7 @@ async def test_put_with_amount_and_transfer_keeps_transfer_type(client, test_dat
 
 @pytest.mark.asyncio
 async def test_put_amount_alone_flips_an_existing_transfer(client, test_data):
-    """Restating the primary's sign flips the draft's direction, keeping type 3."""
+    """Restating the primary's sign flips the draft, keeping it a transfer."""
     sibling = await _make_account(test_data.user_id, "put-amount-only")
     try:
         r, inbox_id = await _post_inbox(
@@ -311,13 +321,13 @@ async def test_put_amount_alone_flips_an_existing_transfer(client, test_data):
             transfer={"account_id": sibling, "amount_cents": 4000},
         )
         assert r.status_code == 201, r.text
-        assert r.json()["transfer_direction"] == 1
+        assert r.json()["transaction_type"] == 1  # OUTFLOW
 
         r = await _put_inbox(client, inbox_id, {"amount_cents": 4000})
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body["transaction_type"] == 3
-        assert body["transfer_direction"] == 2  # now the primary receives
+        assert body["transaction_type"] == 2  # INFLOW — now the primary receives
+        assert body["transfer_account_id"] == sibling  # still a transfer
         assert body["transfer_amount_cents"] == 4000  # still absolute
     finally:
         await _cleanup_account(sibling)
@@ -342,16 +352,18 @@ async def test_transfer_null_reverts_draft_to_expense(client, test_data):
             transfer={"account_id": sibling, "amount_cents": 7000},
         )
         assert r.status_code == 201, r.text
-        assert r.json()["transaction_type"] == 3
+        assert r.json()["transaction_type"] == 1  # OUTFLOW
 
         r = await _put_inbox(client, inbox_id, {"transfer": None})
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["transfer_account_id"] is None
         assert body["transfer_amount_cents"] is None
-        assert body["transfer_direction"] is None
-        # DEBIT primary -> it was an outflow -> expense.
-        assert body["transaction_type"] == 1
+        # Direction survives the clear untouched. Dropping the counterparty
+        # does not change which way the money moved, and transaction_type has
+        # held that fact all along — it no longer has to be recovered from a
+        # separate column on the way out.
+        assert body["transaction_type"] == 1  # still OUTFLOW
         assert body["amount_cents"] == 7000  # untouched
     finally:
         await _cleanup_account(sibling)
@@ -359,7 +371,7 @@ async def test_transfer_null_reverts_draft_to_expense(client, test_data):
 
 @pytest.mark.asyncio
 async def test_transfer_null_on_incoming_draft_becomes_income(client, test_data):
-    """The stored direction is the only record of which way an absolute amount pointed."""
+    """The mirror case: an inflow draft stays an inflow when un-marked."""
     sibling = await _make_account(test_data.user_id, "clearable-in")
     try:
         r, inbox_id = await _post_inbox(
@@ -374,7 +386,7 @@ async def test_transfer_null_on_incoming_draft_becomes_income(client, test_data)
 
         r = await _put_inbox(client, inbox_id, {"transfer": None})
         assert r.status_code == 200, r.text
-        assert r.json()["transaction_type"] == 2  # INCOME
+        assert r.json()["transaction_type"] == 2  # INFLOW
     finally:
         await _cleanup_account(sibling)
 
@@ -468,15 +480,15 @@ async def test_promote_outgoing_transfer_moves_both_balances(client, test_data):
         )
         assert r.status_code == 200, r.text
         primary = r.json()
-        assert primary["transaction_type"] == 3
-        assert primary["transfer_direction"] == 1  # DEBIT
+        assert primary["transaction_type"] == 1  # OUTFLOW
+        assert primary["transfer_transaction_id"] == sibling_id
         assert primary["amount_cents"] == 5000
 
         async with db.pool.acquire() as conn:
             sibling_row = await conn.fetchrow(
                 "SELECT * FROM expense_transactions WHERE id = $1", sibling_id
             )
-        assert sibling_row["transfer_direction"] == 2  # CREDIT
+        assert sibling_row["transaction_type"] == 2  # INFLOW
         assert sibling_row["amount_cents"] == 5000
 
         assert await _balance(source) == source_before - 5000
@@ -515,7 +527,7 @@ async def test_promote_incoming_transfer_moves_balances_the_other_way(client, te
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
         assert r.status_code == 200, r.text
-        assert r.json()["transfer_direction"] == 2  # CREDIT
+        assert r.json()["transaction_type"] == 2  # INFLOW
 
         assert await _balance(primary_account) == primary_before + 3000
         assert await _balance(other) == other_before - 3000
@@ -679,10 +691,12 @@ async def test_ready_filter_still_requires_category_for_non_transfers(client, te
 
 @pytest.mark.asyncio
 async def test_half_transfer_row_violates_check_constraint(test_data):
-    """Fail closed: transfer columns are all-or-nothing and force type 3.
+    """Fail closed: the transfer columns are all-or-nothing.
 
     The Python guards above make this unreachable through the API; the
-    constraint makes it unreachable full stop.
+    constraint makes it unreachable full stop. sql/020 rewrote this CHECK
+    without `transfer_direction` — the direction requirement did not go away,
+    it moved onto `transaction_type IN (1, 2)`, which is asserted below.
     """
     async with db.pool.acquire() as conn:
         with pytest.raises(asyncpg.CheckViolationError):
@@ -690,9 +704,31 @@ async def test_half_transfer_row_violates_check_constraint(test_data):
                 """
                 INSERT INTO expense_transaction_inbox
                     (id, user_id, title, amount_cents, transaction_type,
-                     transfer_account_id, transfer_amount_cents, transfer_direction,
+                     transfer_account_id, transfer_amount_cents,
                      created_at, updated_at)
-                VALUES ($1, $2, 'half-transfer', 1000, 1, $3, 1000, NULL, now(), now())
+                VALUES ($1, $2, 'half-transfer', 1000, 1, $3, NULL, now(), now())
+                """,
+                str(uuid.uuid4()), test_data.user_id, test_data.account_id,
+            )
+
+
+@pytest.mark.asyncio
+async def test_directionless_transfer_draft_violates_check_constraint(test_data):
+    """A populated transfer triple with no direction is still impossible.
+
+    This is the invariant `sql/019` added and `sql/020` carried over: before
+    019 the inbox could hold a transfer whose direction nothing recorded. The
+    column enforcing it changed; the guarantee did not.
+    """
+    async with db.pool.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                """
+                INSERT INTO expense_transaction_inbox
+                    (id, user_id, title, amount_cents, transaction_type,
+                     transfer_account_id, transfer_amount_cents,
+                     created_at, updated_at)
+                VALUES ($1, $2, 'no-direction', 1000, NULL, $3, 1000, now(), now())
                 """,
                 str(uuid.uuid4()), test_data.user_id, test_data.account_id,
             )
@@ -706,9 +742,9 @@ async def test_negative_transfer_amount_violates_check_constraint(test_data):
                 """
                 INSERT INTO expense_transaction_inbox
                     (id, user_id, title, amount_cents, transaction_type,
-                     transfer_account_id, transfer_amount_cents, transfer_direction,
+                     transfer_account_id, transfer_amount_cents,
                      created_at, updated_at)
-                VALUES ($1, $2, 'negative-sibling', 1000, 3, $3, -1000, 1, now(), now())
+                VALUES ($1, $2, 'negative-sibling', 1000, 1, $3, -1000, now(), now())
                 """,
                 str(uuid.uuid4()), test_data.user_id, test_data.account_id,
             )

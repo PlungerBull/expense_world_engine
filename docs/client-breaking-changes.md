@@ -11,6 +11,94 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-05 — `transaction_type` is direction on every row; `transfer_direction` deleted; `transaction_type = 3` retired
+
+**Engine change.** `transaction_type` was carrying two unrelated facts: which way
+money moved (1 = expense, 2 = income) and who the counterparty was (3 = transfer).
+Because `3` occupied a slot in what is otherwise a direction column, direction for
+transfers lived in a *second* column, `transfer_direction` (1 = debit, 2 = credit),
+meaningful only when the first column held one specific value.
+
+`sql/020` collapses them. `transaction_type` is now **1 = outflow, 2 = inflow**, on
+every row, never null, with `CHECK (transaction_type IN (1, 2))` and
+`CHECK (amount_cents > 0)`. `transfer_direction` is dropped from
+`expense_transactions` *and* `expense_transaction_inbox`. **A transfer is two
+ordinary rows paired by `transfer_transaction_id`** — that FK is now the only
+discriminator.
+
+This is `docs/rework/WP1`. It also closes open bugs 1.3 (every USD→USD transfer
+returned an uncaught 500) and 6.3's `expense_transactions` half.
+
+**Severity: breaking, but nothing in the CLI to break.** Verified by reading
+`expense_world_CLI`: **`transaction_type` and `transfer_direction` appear zero times
+in that repo.** Neither field is read, branched on, cached, or sent. The CLI already
+detects transfers exactly the way the engine now requires.
+
+### What breaks
+
+**1. `transfer_direction` is gone from every response.** It disappears from
+`GET/POST/PUT /transactions`, `/inbox`, and `/sync`. It was never accepted on a
+request, so no write contract changes.
+
+**2. `transaction_type` never returns `3` again.** A transfer's outgoing leg
+returns `1`, its incoming leg `2` — the same values an ordinary expense and income
+return. Any client branching on `== 3` to mean "transfer" silently stops matching.
+
+**3. Transfer detection moves to `transfer_transaction_id != null`.** This is the
+only supported discriminator. It is not new — the column has always been there and
+has always been reciprocal on both legs.
+
+**4. A same-currency transfer's legs are now distinguishable only by
+`transaction_type` + `transfer_transaction_id`.** Previously `transfer_direction`
+answered "which leg is this"; `transaction_type` answers it now.
+
+⚠️ **Hard requirement on the engine side, stated so it is not lost:**
+`transfer_transaction_id` must keep being emitted at top level on `/sync` and on the
+transaction GET/list bodies. It is load-bearing for the CLI at
+`expense/tui/screens/quick_log.py:171-174`, which uses it to lock `amount`/`account`/
+`date` on a transfer leg. If it ever stops being emitted the lock silently stops
+applying and the user gets an engine `422` on save instead of faded fields.
+
+### What the CLI must do
+
+| Location | Current behaviour | Required change |
+|---|---|---|
+| `expense/cache/db.py:142` | stores `transfer_transaction_id`, never queried | **none** |
+| `expense/cache/sync.py:51` | extracts `transfer_transaction_id` from `/sync` rows | **none** |
+| `expense/tui/screens/quick_log.py:171-174` | locks fields when `rec.get("transfer_transaction_id")` | **none** — already the correct discriminator |
+| `expense/commands/log_cmd.py:101-108`, `quick_log.py:478-489` | send a nested `transfer` object | **none** — request shape unchanged |
+| `transactions get`, `reconcile get` | dump every key of the response generically | **none** — two fewer lines in the human dump |
+
+**Nothing is required.** The entry exists because the wire shape changed, not
+because there is work to do.
+
+### What does *not* change
+
+- The request contract. `amount_cents` is still signed on the way in, transfers are
+  still identified by the presence of a `transfer` object, and callers still never
+  set `transaction_type`.
+- `amount_cents` in responses — still always positive.
+- `?debit_as_negative=true` — still a display preference, still flips the outflow
+  leg and, on an inbox transfer draft, still flips the two legs opposite ways.
+- Transfer legs still cancel, and transfers are still included in dashboards and
+  reports.
+- Cross-currency transfers still net to exactly zero in home currency. The FX spread
+  becomes visible in `docs/rework/WP2`, together with the `@FX` category that will
+  hold it — deliberately not in this change.
+
+### Engine references
+
+- `sql/020_transfer_direction_collapse.sql` — the migration, and why dropping
+  `sql/019`'s column is not a reversal of it
+- `docs/rework/WP1-transfer-collapse.md` — the work package
+- `CLAUDE.md` § "Sign convention" — rewritten in this change
+- `docs/open-bugs.md` — 1.2 and 1.3 deleted; 6.3 amended
+- `tests/test_wp1_transfer_collapse.py` — the new invariants, including the USD→USD
+  regression
+- `tests/test_inbox_transfers.py` — still the inbox transfer contract, end to end
+
+---
+
 ## 2026-08-03 — Inbox transfers carry `transfer_direction`; `transfer_amount_cents` is now positive
 
 **Engine change.** The inbox stored no direction column, so the *sign* of
@@ -194,6 +282,11 @@ response forever.
 > that reads those keys will find them absent. Each work package appends its own
 > entry here as it lands; this pointer exists so nobody plans against the sentence
 > above in the meantime.
+>
+> ✅ **The WP1 half of this landed 2026-08-05** — see the entry at the top of this
+> file. The currency half (`amount_home_cents`, `current_balance_home_cents`, the
+> reconciliation home balances, the native report aggregates) is still pending in
+> WP2/WP3.
 
 ### Engine references
 

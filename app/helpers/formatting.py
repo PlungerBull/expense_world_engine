@@ -5,28 +5,23 @@ transactions.py and reconciliations.py routers.
 
 ``debit_as_negative`` is a caller-side display preference, never a schema
 property — these functions work on a shallow copy and the stored row is
-untouched. Both variants read direction from the same two channels the ledger
-and the inbox now share: ``transaction_type``, plus ``transfer_direction`` for
-transfers.
+untouched. Both variants read direction from the one channel the ledger and
+the inbox share: ``transaction_type``. Transfers need no special case, because
+after WP1 a transfer leg is an ordinary outflow or inflow.
 """
 
 from typing import Optional
 
-from app.constants import TransactionType, TransferDirection
+from app.constants import TransactionType
 
 
-def _is_debit(transaction_type: Optional[int], transfer_direction: Optional[int]) -> bool:
+def _is_debit(transaction_type: Optional[int]) -> bool:
     """Does this row's primary side reduce its account's balance?
 
     ``None`` type means an inbox row with no amount yet — not a debit, not a
     credit, nothing to flip.
     """
-    if transaction_type == TransactionType.EXPENSE:
-        return True
-    return (
-        transaction_type == TransactionType.TRANSFER
-        and transfer_direction == TransferDirection.DEBIT
-    )
+    return transaction_type == TransactionType.OUTFLOW
 
 
 def apply_debit_as_negative(data: dict) -> dict:
@@ -35,7 +30,7 @@ def apply_debit_as_negative(data: dict) -> dict:
     Returns a shallow copy with ``amount_cents`` and ``amount_home_cents``
     negated when the transaction is an expense or a transfer-debit.
     """
-    if not _is_debit(data["transaction_type"], data.get("transfer_direction")):
+    if not _is_debit(data["transaction_type"]):
         return data
 
     data = {**data}
@@ -49,14 +44,19 @@ def apply_debit_as_negative_inbox(data: dict) -> dict:
     """Post-process an inbox dict to negate amounts for expenses/transfer-debits.
 
     Same direction rule as the ledger variant — an inbox row stores its amounts
-    positive and carries ``transaction_type`` + ``transfer_direction`` exactly
-    as ``expense_transactions`` does.
+    positive and carries ``transaction_type`` exactly as
+    ``expense_transactions`` does.
 
     The one addition is ``transfer_amount_cents``: an inbox row holds both legs
     of a transfer, so the sibling is negated in the *opposite* direction to the
     primary. It used to be emitted as-stored beside a flipped primary, which
     rendered a transfer as two amounts pointing the same way
     (WP10.2, docs/audit-2026-08-01-remediation-plan.md:297).
+
+    There is no longer a transfer branch: ``transaction_type`` does not
+    distinguish transfers from ordinary rows, which is the point of WP1. The
+    sibling keys are simply ``None`` on an ordinary row, so the per-key
+    presence check does the discriminating that ``== TRANSFER`` used to.
 
     Rows with no amount yet (``transaction_type`` still ``None``) pass through
     unchanged.
@@ -65,19 +65,18 @@ def apply_debit_as_negative_inbox(data: dict) -> dict:
     if transaction_type is None:
         return data
 
-    primary_is_debit = _is_debit(transaction_type, data.get("transfer_direction"))
+    primary_is_debit = _is_debit(transaction_type)
     data = {**data}
 
     if primary_is_debit:
         for key in ("amount_cents", "amount_home_cents"):
             if data.get(key) is not None:
                 data[key] = -data[key]
-
-    if transaction_type == TransactionType.TRANSFER:
-        # The sibling always moves the other way.
-        if not primary_is_debit:
-            for key in ("transfer_amount_cents", "transfer_amount_home_cents"):
-                if data.get(key) is not None:
-                    data[key] = -data[key]
+    else:
+        # The sibling always moves the other way. Only reachable on a transfer
+        # draft; on an ordinary row these keys are absent.
+        for key in ("transfer_amount_cents", "transfer_amount_home_cents"):
+            if data.get(key) is not None:
+                data[key] = -data[key]
 
     return data

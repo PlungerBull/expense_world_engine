@@ -7,10 +7,14 @@ the transfer helper — each copy with its own slightly different control flow.
 
 The sign convention is encoded here once:
 
-    EXPENSE        → subtract amount
-    INCOME         → add amount
-    TRANSFER+DEBIT → subtract amount
-    TRANSFER+CREDIT→ add amount
+    OUTFLOW → subtract amount
+    INFLOW  → add amount
+
+That is the whole matrix. Until WP1 it had four rows, because transfers
+carried their direction in a second column (``transfer_direction``) that was
+meaningful only when ``transaction_type`` held one specific value. sql/020
+collapsed the two columns into one, so a transfer leg is now an ordinary
+outflow or inflow and needs no branch of its own.
 
 ``reverse_*`` is the exact negation of ``apply_*`` and is used when
 un-applying a transaction (update that changes amount/account, delete,
@@ -33,34 +37,30 @@ computes a delta from it — those flows lock the TRANSACTION row so the
 amount it reads is stable.
 """
 
-from typing import Optional
-
 import asyncpg
 
-from app.constants import TransactionType, TransferDirection
+from app.constants import TransactionType
 
 
-def _delta_for_apply(
-    amount_cents: int,
-    transaction_type: int,
-    transfer_direction: Optional[int],
-) -> Optional[int]:
+def _delta_for_apply(amount_cents: int, transaction_type: int) -> int:
     """Compute the balance delta for applying a transaction.
 
-    Returns ``None`` if the combination is unrecognised (caller should treat
-    as a no-op, matching the pre-refactor behaviour of the private helpers
-    in ``routers/transactions.py``).
+    Raises ``ValueError`` on an unrecognised type. It used to return ``None``
+    and let both callers silently no-op, which meant a row whose direction the
+    engine could not read moved no balance and said nothing — the exact silent
+    drop WP1 removes. ``sql/020``'s ``CHECK (transaction_type IN (1, 2))``
+    makes this branch unreachable for stored rows, so reaching it is a bug in
+    the caller, not bad data.
     """
-    if transaction_type == TransactionType.EXPENSE:
+    if transaction_type == TransactionType.OUTFLOW:
         return -amount_cents
-    if transaction_type == TransactionType.INCOME:
+    if transaction_type == TransactionType.INFLOW:
         return amount_cents
-    if transaction_type == TransactionType.TRANSFER:
-        if transfer_direction == TransferDirection.DEBIT:
-            return -amount_cents
-        if transfer_direction == TransferDirection.CREDIT:
-            return amount_cents
-    return None
+    raise ValueError(
+        f"Unknown transaction_type {transaction_type!r}: expected "
+        f"{int(TransactionType.OUTFLOW)} (outflow) or "
+        f"{int(TransactionType.INFLOW)} (inflow)."
+    )
 
 
 async def apply_balance(
@@ -69,17 +69,14 @@ async def apply_balance(
     user_id: str,
     amount_cents: int,
     transaction_type: int,
-    transfer_direction: Optional[int] = None,
 ) -> None:
     """Apply a transaction's balance contribution to its account.
 
     ``amount_cents`` is always positive (storage convention). The sign is
-    derived from ``transaction_type`` and ``transfer_direction`` per the
-    matrix documented at module level.
+    derived from ``transaction_type`` per the matrix documented at module
+    level.
     """
-    delta = _delta_for_apply(amount_cents, transaction_type, transfer_direction)
-    if delta is None:
-        return
+    delta = _delta_for_apply(amount_cents, transaction_type)
     await conn.execute(
         """
         UPDATE expense_bank_accounts
@@ -99,7 +96,6 @@ async def reverse_balance(
     user_id: str,
     amount_cents: int,
     transaction_type: int,
-    transfer_direction: Optional[int] = None,
 ) -> None:
     """Reverse a transaction's balance contribution.
 
@@ -107,11 +103,8 @@ async def reverse_balance(
     amount/account before the new values are applied). This is the exact
     negation of ``apply_balance``.
     """
-    delta = _delta_for_apply(amount_cents, transaction_type, transfer_direction)
-    if delta is None:
-        return
     # Reverse sign: what was applied, now un-applied.
-    delta = -delta
+    delta = -_delta_for_apply(amount_cents, transaction_type)
     await conn.execute(
         """
         UPDATE expense_bank_accounts
