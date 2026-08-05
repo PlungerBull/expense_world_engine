@@ -35,7 +35,6 @@ from app.constants import ActivityAction, InboxStatus, TransactionType
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
-from app.helpers.exchange_rate import lookup_exchange_rate
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.validation import extract_update_fields
@@ -137,20 +136,22 @@ async def create_inbox_item(
     elif primary_signed is not None:
         transaction_type = infer_transaction_type(primary_signed)
 
-    # Auto-populate exchange_rate if both account_id and date are present
-    exchange_rate = body.exchange_rate
-    if exchange_rate is None and body.account_id and body.date:
-        exchange_rate = await lookup_exchange_rate(conn, body.account_id, body.date, user_id)
-
+    # No rate is looked up and none is stored. This is where open bug 1.4 was:
+    # the lookup fired only when BOTH account_id and date were present, and the
+    # column's `DEFAULT 1.0` (plus a `COALESCE($10, 1.0)` right here) covered
+    # the gap — so the ordinary capture case, a receipt with no date yet, wrote
+    # rate 1.0 and a $100 draft promoted as 100 PEN cents. It failed closed when
+    # it looked and found nothing, and failed open when it did not look at all.
+    # sql/021 deleted the column; a draft now carries its native amount only.
     try:
         row = await conn.fetchrow(
             """
             INSERT INTO expense_transaction_inbox
                 (id, user_id, title, description, amount_cents, transaction_type,
-                 date, account_id, category_id, exchange_rate,
+                 date, account_id, category_id,
                  transfer_account_id, transfer_amount_cents,
                  created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 1.0), $11, $12, now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
             RETURNING *
             """,
             body.id,
@@ -162,7 +163,6 @@ async def create_inbox_item(
             body.date,
             body.account_id,
             body.category_id,
-            exchange_rate,
             transfer_account_id,
             transfer_amount_cents,
         )
@@ -289,16 +289,10 @@ async def update_inbox_item(
         # direction. One rule, because a transfer leg is now an ordinary row.
         fields["transaction_type"] = infer_transaction_type(primary_signed)
 
-    # Auto-populate exchange_rate if date changes and account_id is set
-    # (unless user explicitly supplied exchange_rate in this request)
-    if "date" in fields and "exchange_rate" not in fields:
-        account_id = fields.get("account_id") or (
-            str(before_row["account_id"]) if before_row["account_id"] else None
-        )
-        if account_id and fields["date"]:
-            fields["exchange_rate"] = await lookup_exchange_rate(
-                conn, account_id, fields["date"], user_id
-            )
+    # Nothing re-rates here. The `date`-keyed re-rate block that used to sit at
+    # this point was the second half of open bug 1.4: because it fired only on a
+    # date change, a draft that got its account_id filled in later kept the 1.0
+    # it was created with, for good. Nothing derived is stored now.
 
     after_row = await dynamic_update(conn, "expense_transaction_inbox", fields, inbox_id, user_id)
     if after_row is None:
@@ -572,7 +566,6 @@ async def promote_inbox_item(
             primary_amount_cents=primary_signed,
             primary_account_id=str(inbox_row["account_id"]),
             primary_date=inbox_row["date"],
-            primary_exchange_rate=float(inbox_row["exchange_rate"]),
             primary_cleared=False,
             transfer_account_id=str(inbox_row["transfer_account_id"]),
             transfer_amount_cents=sibling_signed,
@@ -592,19 +585,18 @@ async def promote_inbox_item(
                 {"transaction_type": "Missing direction on a row with an amount."},
             )
 
-        # Compute amount_home_cents
-        exchange_rate = float(inbox_row["exchange_rate"])
-        amount_home_cents = round(inbox_row["amount_cents"] * exchange_rate)
-
-        # Create expense_transactions row
+        # Create expense_transactions row. Promotion copies native amounts and
+        # nothing else — it used to carry the draft's stored rate across, which
+        # is how a 1.0 written at capture time became a permanent fact about a
+        # USD ledger row (open bug 1.4).
         try:
             txn_row = await conn.fetchrow(
                 """
                 INSERT INTO expense_transactions
-                    (id, user_id, title, description, amount_cents, amount_home_cents,
-                     transaction_type, date, account_id, category_id, exchange_rate,
+                    (id, user_id, title, description, amount_cents,
+                     transaction_type, date, account_id, category_id,
                      inbox_id, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
                 RETURNING *
                 """,
                 target_id,
@@ -612,12 +604,10 @@ async def promote_inbox_item(
                 inbox_row["title"],
                 inbox_row["description"],
                 inbox_row["amount_cents"],
-                amount_home_cents,
                 transaction_type,
                 inbox_row["date"],
                 inbox_row["account_id"],
                 inbox_row["category_id"],
-                inbox_row["exchange_rate"],
                 inbox_row["id"],
             )
         except asyncpg.UniqueViolationError:

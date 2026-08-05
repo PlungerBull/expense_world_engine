@@ -11,6 +11,127 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-05 — currency converts at read time; `exchange_rate` and every `amount_home_cents` deleted; report aggregates are home-only and nullable
+
+**Engine change.** Three columns stored a currency conversion frozen at write time:
+`expense_transactions.amount_home_cents`, `expense_transactions.exchange_rate`, and
+`expense_transaction_inbox.exchange_rate`. A derived value with a second source of
+truth goes stale, and both of them had: an inbox draft captured without a date kept
+the column's `DEFAULT 1.0`, so a $100 receipt promoted as 100 PEN cents (open bug
+1.4); and moving a transaction to an account in another currency never re-rated it,
+because the trigger keyed on `date` and the *account* decides the currency (1.5).
+
+`sql/021` drops all three. Conversion is now a read-time lookup of the rate for the
+row's date — carried forward from the most recent rate on or before it, cast in the
+user's `display_timezone` — implemented once in `app/helpers/home_currency.py`.
+
+This is `docs/rework/WP2`. It also closes open bug 2.3 (a cross-tenant account read)
+by deleting the helper that had it.
+
+**Severity: breaking, and there is real work to do.** Unlike the WP1 entry, the CLI
+both sends and renders the affected fields.
+
+### What breaks
+
+**1. `exchange_rate` is rejected on every write, with `422`.** Not ignored — the four
+request schemas that carried it now set `extra="forbid"`, so a client still sending it
+gets `{"code": "VALIDATION_ERROR", "fields": {"exchange_rate": "Extra inputs are not
+permitted"}}`. On the batch endpoint the key is nested: `transactions.0.exchange_rate`.
+
+**2. `amount_home_cents` and `exchange_rate` are gone from every transaction
+response** — `GET/POST/PUT /transactions`, `/transactions/batch`, `/sync`, and the
+embedded transaction list on reconciliation detail. **Absent, not null.**
+
+**3. The inbox loses `amount_home_cents`, `transfer_amount_home_cents` and
+`exchange_rate`.** Same rule: an inbox draft belongs to one account, so it has one
+currency and nothing to convert.
+
+**4. Reconciliations lose `beginning_balance_home_cents` and
+`ending_balance_home_cents`.** A reconciliation is scoped to one account. This was the
+"known inconsistency, deliberately left" in `docs/currency-model-decision.md`.
+
+**5. The native cross-account aggregates are deleted, not nulled.** `spent_cents` per
+category and per hashtag combination, and `inflow_cents` / `outflow_cents` /
+`net_cents` on month totals, no longer exist on `/dashboard` or `/reports/monthly`.
+`GROUP BY category_id` has no currency partition, so a category holding $15 and S/25
+reported `4000` — a number in no currency. **Only the `_home_cents` forms remain.**
+
+**6. Every remaining home aggregate is nullable, and carries an `unconverted_count`.**
+When any row in a group has no resolvable rate, the figure is `null` and the count
+says how many rows are behind it. `spent_home_cents`, the three month totals, and each
+`hashtag_breakdown` row all follow this. A client that assumes an integer will crash.
+
+⚠️ **A `null` here is not "zero" and not "missing".** It means the engine refused to
+report a partial total. Render it as unavailable, with the count — never as `0`, and
+never by falling back to a native figure, which is the exact bug being deleted
+(`COALESCE(amount_home_cents, amount_cents)` read USD cents as PEN cents, a 3.58×
+understatement).
+
+**7. `/dashboard` loses `archived_categories` and `archived_hashtags`.**
+`archived_accounts` stays — an archived account still holds real money; an archived
+category holds only history, and soft delete already hides a row from pickers.
+`?include_archived=true` now controls the accounts panel alone.
+
+**8. A cross-currency transfer no longer nets to zero.** `@Transfer` shows the FX
+spread. Send $1,000 and receive S/3,450 on a day the market rate is 3.58 and the
+dollars were worth S/3,580 — `@Transfer` reports **−S/130**, the spread the bank
+charged, which the old write-time rule hid by assigning both legs the same home value.
+So a non-zero `@Transfer` means one of exactly two things: an FX spread, or a
+loan/repayment with a person. **There is no `@FX` category** — owner decision,
+2026-08-05, superseding the closing bullet of the entry below.
+
+**9. `422 RATE_UNAVAILABLE` no longer exists.** The write path performs no rate
+lookup, so a cross-currency transaction is recordable while the FX job is stale, and
+one dated before the provider floor (2024-03-02) is recordable at all. Any client
+branching on that code is branching on something unreachable.
+
+### What the CLI must do
+
+| Location | Current behaviour | Required change |
+|---|---|---|
+| `expense/commands/log_cmd.py:34,94` | `--exchange-rate` option, sent in the payload | **remove** — the request now `422`s |
+| `expense/commands/inbox_cmd.py:226,278` | `--exchange-rate` on add and update | **remove** |
+| `expense/commands/transactions_cmd.py:305` | `--exchange-rate` on update | **remove**; also update the help text at `:52`, which lists it among the transfer-leg read-only fields |
+| `expense/commands/accounts_cmd.py:248` | `--exchange-rate` on opening balance | **remove** |
+| `expense/import_/apply.py:198-216` | sends `exchange_rate` in the payload | **stop sending it** |
+| `expense/import_/parse.py:206-213` | skips USD rows with no rate (`usd-no-rate`) | **delete the skip** — a USD row lands on the USD account and needs no rate to be recorded |
+| `expense/commands/reports_cmd.py:42,53,112,121,126` | reads `spent_home_cents` / `net_home_cents` as numbers | **handle `null`** and surface `unconverted_count` |
+| `expense/tui/screens/home.py:105-111` | reads `net_home_cents`, `outflow_home_cents` | **handle `null`** |
+| `expense/tui/screens/outstanding.py:54` | `totals.get(f"{key}_home_cents")` | **handle `null`** |
+| `expense/commands/_resource.py:453,461` | derives `_home_cents` from a native key | the native aggregate keys are gone — read the home keys directly |
+| `dashboard` command | renders archived category / hashtag panels | **remove both**; `archived_accounts` is unchanged |
+| `expense/tui/screens/home.py:105-107` | `current_balance_home_cents` | **none** — account balances keep their home value |
+
+### What does *not* change
+
+- **`current_balance_home_cents` on accounts and dashboard accounts stays.** The
+  account list is the only surface showing all your money at once, and reading
+  `S/8,500` beside `$1,200` with no common unit is what makes it unusable. It is still
+  computed at today's rate and still `null` when no rate resolves.
+- Native `amount_cents` on every record — still there, still always positive, still
+  with `transaction_type` carrying direction.
+- `?debit_as_negative=true` — still a display preference. There is simply one amount
+  to flip now instead of two.
+- Transfers stay visible in dashboards and reports and are never excluded from totals.
+  Same-currency transfers still cancel to exactly zero.
+- The engine remains the only thing that converts currency. Clients never compute it —
+  that part is absolute, and removing the per-row rate makes it enforceable rather than
+  merely stated.
+
+### Engine references
+
+- `sql/021_read_time_currency.sql` — the migration and why a stored conversion never
+  held a fact
+- `docs/rework/WP2-read-time-currency.md` — the work package
+- `docs/currency-model-decision.md` — the design record, amended to match what shipped
+- `CLAUDE.md` § "Home currency" — rewritten in this change
+- `docs/open-bugs.md` — 1.4, 1.5 and 2.3 deleted; 1.7 and 6.1 amended; **6.5 added**
+- `tests/test_wp2_read_time_currency.py` — the new invariants, including the
+  unconvertible contract and the FX spread
+- `tests/test_home_currency_parity.py` — why the SQL and Python conversions still agree
+
+---
+
 ## 2026-08-05 — `transaction_type` is direction on every row; `transfer_direction` deleted; `transaction_type = 3` retired
 
 **Engine change.** `transaction_type` was carrying two unrelated facts: which way
@@ -83,8 +204,10 @@ because there is work to do.
 - Transfer legs still cancel, and transfers are still included in dashboards and
   reports.
 - Cross-currency transfers still net to exactly zero in home currency. The FX spread
-  becomes visible in `docs/rework/WP2`, together with the `@FX` category that will
-  hold it — deliberately not in this change.
+  becomes visible in `docs/rework/WP2` — deliberately not in this change.
+  ⚠️ *Superseded the same day:* this bullet said the spread would arrive "together
+  with the `@FX` category that will hold it". It did not. The owner chose to leave the
+  spread in `@Transfer`; see the entry above and `docs/currency-model-decision.md`.
 
 ### Engine references
 

@@ -8,23 +8,48 @@ Signed semantics: every row contributes a signed amount derived from
 transaction_type alone — outflows negative, inflows positive. The expressions come
 from ``helpers/home_currency.signed_expr``, the engine's single rendering of that
 rule; this module used to carry two literal copies of a four-branch version, which
-is audit finding WP9.1. Categories sum the signed amounts, so a real-to-real
-transfer naturally cancels to zero under @Transfer, and a loan to a
+is audit finding WP9.1. Categories sum the signed amounts, so a same-currency
+real-to-real transfer naturally cancels to zero under @Transfer, and a loan to a
 person shows as negative @Transfer (real leg) + positive @Debt (person leg). Totals
 split the signed values into inflow (positive) and outflow (|negative|); net is
 inflow - outflow and is unaffected by internal movement volume.
 
-`spent_cents` on a category can therefore be negative — the field name is retained
-for spec-contract reasons but semantically it is "signed net flow through this
-category this month".
+`spent_home_cents` on a category can therefore be negative — the field name is
+retained for spec-contract reasons but semantically it is "signed net flow through
+this category this month".
+
+Everything reported here is in the HOME currency, and only in the home currency.
+There are no native cross-account aggregates, because ``GROUP BY category_id`` has
+no currency partition: a category holding $15 and S/25 would report 4000, a number
+in no currency at all. Conversion happens exactly where figures are combined.
+
+@Transfer no longer always reads zero. Both legs of a cross-currency transfer are
+converted at their own account's rate for the day, so a $1,000 → S/3,450 exchange on
+a day the market rate is 3.58 reports −S/130: the spread the bank actually charged.
+It used to be forced to zero by assignment at write time. So `@Transfer != 0` means
+one of exactly two things — an FX spread, or a loan/repayment with a person, whose
+other leg landed in @Debt with nothing to cancel against. See
+docs/currency-model-decision.md.
 
 Opening balances (transactions under the ``opening_balance`` system category) are
 excluded entirely: no category row in the panel, no contribution to totals. An
 opening balance is where tracking starts, not money that moved — including it
 would report phantom income in the seed month. Exclusion keys off ``system_key``,
 so renaming the @Opening display name never breaks it. Transfers, by contrast,
-ARE included: both legs carry signed amounts that cancel in ``net`` (gross
-inflow/outflow do include internal movement volume).
+ARE included: both legs carry signed amounts (gross inflow/outflow do include
+internal movement volume).
+
+Unconvertible rows
+------------------
+
+A row whose date has no resolvable rate has no home value, and NULL is the signal
+for that — never a native amount wearing a home label. But a per-row NULL does not
+survive aggregation: ``SUM`` skips NULLs, and ``SUM(CASE WHEN x > 0 THEN x ELSE 0
+END)`` scores a NULL row as *zero*, which cannot even fail loudly. So every home
+SUM here is paired with ``SUM(is_unconvertible)``, and a non-zero count makes the
+figure ``null`` rather than a partial total. Both the SQL and the Python rollup
+enforce that, because the category total is summed from its breakdown rows in
+Python.
 """
 from datetime import datetime, timezone
 from typing import Optional
@@ -32,28 +57,58 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from app.constants import HOME_CURRENCY
 from app.errors import settings_missing
-from app.helpers.home_currency import signed_expr
+from app.helpers.home_currency import (
+    HOME_CENTS_EXPR,
+    UNCONVERTIBLE_FLAG_EXPR,
+    home_rate_join,
+    signed_expr,
+)
 
-# Built once at import. The COALESCE is the surviving fallback that treats USD
-# cents as PEN cents on a row with no stored home value — known-wrong, and
-# replaced by a real read-time conversion in docs/rework/WP2, which swaps only
-# this argument.
-_SIGNED_CENTS_SQL = signed_expr("t.amount_cents")
-_SIGNED_HOME_CENTS_SQL = signed_expr("COALESCE(t.amount_home_cents, t.amount_cents)")
+# Built once at import. The magnitude is the read-time conversion, not a stored
+# column: helpers/home_currency.HOME_CENTS_EXPR resolves the rate for the row's
+# date through the lateral join below. Until sql/021 this read
+# ``COALESCE(t.amount_home_cents, t.amount_cents)``, which did not convert — it
+# relabelled, reading USD cents as PEN cents.
+_SIGNED_HOME_CENTS_SQL = signed_expr(HOME_CENTS_EXPR)
+
+# Both queries below bind $1 user_id, $2 start, $3 end — so the timezone, which
+# must be BOUND and never interpolated (it is unvalidated user input), is $4.
+_HOME_RATE_JOIN = home_rate_join("$4")
 
 
 async def get_user_report_settings(
     conn: asyncpg.Connection,
     user_id: str,
 ) -> dict:
-    """Load main_currency + display_timezone for a user, or 422 if they haven't bootstrapped."""
+    """Load main_currency + display_timezone for a user, or 422 if they haven't bootstrapped.
+
+    Also asserts that the user's ``main_currency`` is the currency
+    ``helpers/home_currency.py`` interpolates into its SQL as a literal. That
+    module cannot bind the value — its fragments are spliced into queries with
+    differing ``$N`` numbering — and interpolation is only safe because sql/018
+    locks ``main_currency`` to ``'PEN'``. The obligation to check is stated in
+    that module's docstring; this is the chokepoint for it, because every query
+    that converts reaches SQL through a caller of this function.
+
+    Before WP2 the assertion lived in helpers/transfers.py, which was the only
+    place holding both values at once. Conversion has moved to the read path, so
+    the check moved with it.
+    """
     row = await conn.fetchrow(
         "SELECT main_currency, display_timezone FROM user_settings WHERE user_id = $1",
         user_id,
     )
     if row is None:
         raise settings_missing()
+    if row["main_currency"] != HOME_CURRENCY:
+        raise RuntimeError(
+            f"user_settings.main_currency is {row['main_currency']!r} but the "
+            f"engine converts to {HOME_CURRENCY!r} (app.constants.HOME_CURRENCY). "
+            "sql/018 is supposed to make this unreachable; if that CHECK was "
+            "lifted, helpers/home_currency.py must be revisited at the same time."
+        )
     return {"main_currency": row["main_currency"], "display_timezone": row["display_timezone"]}
 
 
@@ -91,15 +146,25 @@ async def compute_month_flow(
     user_id: str,
     start_utc: datetime,
     end_utc: datetime,
+    display_timezone: str,
 ) -> dict:
     """Run the monthly flow queries for a user and return {categories, totals}.
 
     - categories: every non-deleted category except the opening_balance system row,
       sorted by sort_order, with hashtag_breakdown rows that sum exactly to the
-      category's spent_cents (invariant enforced by construction — the category
+      category's spent_home_cents (invariant enforced by construction — the category
       total is computed from the breakdown, not separately).
-    - totals: inflow/outflow/net in both native and home currency. Transfers are
-      included (legs cancel in net); opening-balance transactions are excluded.
+    - totals: inflow/outflow/net in home currency. Transfers are included;
+      opening-balance transactions are excluded.
+
+    ``display_timezone`` decides which calendar day each row is priced on, and it
+    is the same zone ``compute_month_bounds`` uses to bucket months — so a
+    transaction at 2026-03-31T23:00-05:00 is counted in March *and* priced at the
+    March 31 rate. Callers already hold it from ``get_user_report_settings``; it is
+    a parameter rather than a second settings lookup for that reason.
+
+    Any figure derived from unconvertible rows is ``None``, never a partial total,
+    and the object carrying it reports how many rows could not be converted.
     """
     categories_rows = await conn.fetch(
         """
@@ -112,14 +177,18 @@ async def compute_month_flow(
         user_id,
     )
 
+    # The `a` and `r` aliases the fragments reference exist only inside this CTE,
+    # so the unconvertible flag is projected here and summed by name outside —
+    # interpolating it into the outer SELECT is a hard SQL error, not a style
+    # choice. See helpers/home_currency.py, "The aggregation contract".
     breakdown_rows = await conn.fetch(
         f"""
         WITH signed_txns AS (
             SELECT
                 t.id,
                 t.category_id,
-                {_SIGNED_CENTS_SQL} AS signed_cents,
                 {_SIGNED_HOME_CENTS_SQL} AS signed_home_cents,
+                {UNCONVERTIBLE_FLAG_EXPR} AS is_unconvertible,
                 COALESCE(
                     (
                         SELECT array_agg(th.hashtag_id::text ORDER BY th.hashtag_id::text)
@@ -130,6 +199,8 @@ async def compute_month_flow(
                     ARRAY[]::text[]
                 ) AS hashtag_ids
             FROM expense_transactions t
+            LEFT JOIN expense_bank_accounts a ON a.id = t.account_id
+            {_HOME_RATE_JOIN}
             WHERE t.user_id = $1
               AND t.deleted_at IS NULL
               AND t.date >= $2
@@ -143,8 +214,8 @@ async def compute_month_flow(
         SELECT
             category_id,
             hashtag_ids,
-            SUM(signed_cents)::bigint      AS spent_cents,
-            SUM(signed_home_cents)::bigint AS spent_home_cents
+            SUM(signed_home_cents)::bigint AS spent_home_cents,
+            SUM(is_unconvertible)::bigint  AS unconverted_count
         FROM signed_txns
         GROUP BY category_id, hashtag_ids
         ORDER BY category_id, hashtag_ids
@@ -152,16 +223,22 @@ async def compute_month_flow(
         user_id,
         start_utc,
         end_utc,
+        display_timezone,
     )
 
     breakdowns_by_category: dict[str, list[dict]] = {}
     for row in breakdown_rows:
         cat_id = str(row["category_id"])
+        unconverted = int(row["unconverted_count"])
         breakdowns_by_category.setdefault(cat_id, []).append(
             {
                 "hashtag_ids": list(row["hashtag_ids"]),
-                "spent_cents": int(row["spent_cents"]),
-                "spent_home_cents": int(row["spent_home_cents"]),
+                # A group with even one unconvertible row reports nothing rather
+                # than a total that silently omits it.
+                "spent_home_cents": (
+                    None if unconverted else int(row["spent_home_cents"])
+                ),
+                "unconverted_count": unconverted,
             }
         )
 
@@ -169,14 +246,15 @@ async def compute_month_flow(
     for row in categories_rows:
         cat_id = str(row["id"])
         rows = breakdowns_by_category.get(cat_id, [])
-        spent_cents = sum(r["spent_cents"] for r in rows)
-        spent_home_cents = sum(r["spent_home_cents"] for r in rows)
+        unconverted = sum(r["unconverted_count"] for r in rows)
         categories.append(
             {
                 "id": cat_id,
                 "name": row["name"],
-                "spent_cents": spent_cents,
-                "spent_home_cents": spent_home_cents,
+                "spent_home_cents": (
+                    None if unconverted else sum(r["spent_home_cents"] for r in rows)
+                ),
+                "unconverted_count": unconverted,
                 "hashtag_breakdown": rows,
             }
         )
@@ -185,9 +263,11 @@ async def compute_month_flow(
         f"""
         WITH signed_txns AS (
             SELECT
-                {_SIGNED_CENTS_SQL} AS signed_cents,
-                {_SIGNED_HOME_CENTS_SQL} AS signed_home_cents
+                {_SIGNED_HOME_CENTS_SQL} AS signed_home_cents,
+                {UNCONVERTIBLE_FLAG_EXPR} AS is_unconvertible
             FROM expense_transactions t
+            LEFT JOIN expense_bank_accounts a ON a.id = t.account_id
+            {_HOME_RATE_JOIN}
             WHERE t.user_id = $1
               AND t.deleted_at IS NULL
               AND t.date >= $2
@@ -199,29 +279,38 @@ async def compute_month_flow(
               )
         )
         SELECT
-            COALESCE(SUM(CASE WHEN signed_cents      > 0 THEN  signed_cents      ELSE 0 END), 0)::bigint AS inflow_cents,
             COALESCE(SUM(CASE WHEN signed_home_cents > 0 THEN  signed_home_cents ELSE 0 END), 0)::bigint AS inflow_home_cents,
-            COALESCE(SUM(CASE WHEN signed_cents      < 0 THEN -signed_cents      ELSE 0 END), 0)::bigint AS outflow_cents,
-            COALESCE(SUM(CASE WHEN signed_home_cents < 0 THEN -signed_home_cents ELSE 0 END), 0)::bigint AS outflow_home_cents
+            COALESCE(SUM(CASE WHEN signed_home_cents < 0 THEN -signed_home_cents ELSE 0 END), 0)::bigint AS outflow_home_cents,
+            COALESCE(SUM(is_unconvertible), 0)::bigint AS unconverted_count
         FROM signed_txns
         """,
         user_id,
         start_utc,
         end_utc,
+        display_timezone,
     )
 
-    inflow_cents = int(totals_row["inflow_cents"])
-    inflow_home_cents = int(totals_row["inflow_home_cents"])
-    outflow_cents = int(totals_row["outflow_cents"])
-    outflow_home_cents = int(totals_row["outflow_home_cents"])
-
-    totals = {
-        "inflow_cents": inflow_cents,
-        "inflow_home_cents": inflow_home_cents,
-        "outflow_cents": outflow_cents,
-        "outflow_home_cents": outflow_home_cents,
-        "net_cents": inflow_cents - outflow_cents,
-        "net_home_cents": inflow_home_cents - outflow_home_cents,
-    }
+    # This is the shape the aggregation contract exists for. `NULL > 0` is NULL,
+    # not true, so an unconvertible row takes the ELSE arm and scores zero — a
+    # month where nothing converted would report 0, not null, and look like a
+    # month where nothing happened. The count is the only thing that can tell
+    # them apart.
+    unconverted = int(totals_row["unconverted_count"])
+    if unconverted:
+        totals = {
+            "inflow_home_cents": None,
+            "outflow_home_cents": None,
+            "net_home_cents": None,
+            "unconverted_count": unconverted,
+        }
+    else:
+        inflow_home_cents = int(totals_row["inflow_home_cents"])
+        outflow_home_cents = int(totals_row["outflow_home_cents"])
+        totals = {
+            "inflow_home_cents": inflow_home_cents,
+            "outflow_home_cents": outflow_home_cents,
+            "net_home_cents": inflow_home_cents - outflow_home_cents,
+            "unconverted_count": 0,
+        }
 
     return {"categories": categories, "totals": totals}

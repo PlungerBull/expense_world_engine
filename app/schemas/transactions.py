@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from app.constants import TransactionType
 
@@ -14,6 +14,12 @@ class TransferField(BaseModel):
 
 
 class TransactionCreateRequest(BaseModel):
+    # Unknown fields 422 rather than being silently dropped. This is what makes
+    # the removal of `exchange_rate` (sql/021) visible to a client still sending
+    # it: the engine no longer stores a rate anywhere, and a caller who believes
+    # the value matters deserves to be told it does not.
+    model_config = ConfigDict(extra="forbid")
+
     id: UUID
     title: str
     amount_cents: int  # signed: negative=expense, positive=income
@@ -24,20 +30,20 @@ class TransactionCreateRequest(BaseModel):
     # create_transaction, not here, since it depends on the transfer field.
     category_id: Optional[str] = None
     description: Optional[str] = None
-    exchange_rate: Optional[float] = None
     cleared: Optional[bool] = None
     hashtag_ids: Optional[list[str]] = None
     transfer: Optional[TransferField] = None
 
 
 class TransactionUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: Optional[str] = None
     amount_cents: Optional[int] = None  # signed: negative=expense, positive=income
     date: Optional[AwareDatetime] = None
     account_id: Optional[str] = None
     category_id: Optional[str] = None
     description: Optional[str] = None
-    exchange_rate: Optional[float] = None
     cleared: Optional[bool] = None
     hashtag_ids: Optional[list[str]] = None
     reconciliation_id: Optional[str] = None
@@ -52,15 +58,19 @@ class TransactionResponse(BaseModel):
     user_id: str
     title: str
     description: Optional[str] = None
+    # Native only. A transaction belongs to one account and the account governs
+    # the currency, so a home-currency figure on the row would be a second copy
+    # of a number nothing here combines. Conversion happens where currencies are
+    # combined — the monthly report and its totals — and nowhere else.
+    # Absent, not null: a permanently-null key on every transaction forever is
+    # dead weight, and this is the documented exception to null-over-omission.
     amount_cents: int
-    amount_home_cents: Optional[int] = None
     # 1 = outflow, 2 = inflow. Direction, and nothing else — a transfer is
     # identified by transfer_transaction_id, not by a third type value.
     transaction_type: int
     date: datetime
     account_id: str
     category_id: str
-    exchange_rate: float
     cleared: bool
     transfer_transaction_id: Optional[str] = None
     parent_transaction_id: Optional[str] = None
@@ -105,12 +115,10 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
         title=row["title"],
         description=row["description"],
         amount_cents=row["amount_cents"],
-        amount_home_cents=row["amount_home_cents"],
         transaction_type=row["transaction_type"],
         date=row["date"],
         account_id=str(row["account_id"]),
         category_id=str(row["category_id"]),
-        exchange_rate=float(row["exchange_rate"]),
         cleared=row["cleared"],
         transfer_transaction_id=str(row["transfer_transaction_id"]) if row["transfer_transaction_id"] else None,
         parent_transaction_id=str(row["parent_transaction_id"]) if row["parent_transaction_id"] else None,

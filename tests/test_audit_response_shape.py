@@ -2,14 +2,15 @@
 
 Covers the wire-contract guarantees clients depend on:
 
-  * Inbox responses include `amount_home_cents` and (for transfer rows)
-    `transfer_amount_home_cents`, computed from the stored exchange_rate.
-  * Reconciliation responses include `beginning_balance_home_cents` and
-    `ending_balance_home_cents`, resolved through the same dedup-batched
-    rate lookup the list endpoint uses.
-  * `?debit_as_negative=true` flips the sign of `amount_cents` and
-    `amount_home_cents` on /inbox and /sync (the two endpoints that
-    grew the flag in Sprint 1.4 / 1.5).
+  * Inbox and reconciliation responses carry NO home-currency values, and no
+    exchange rate. Both are single-currency surfaces — an inbox draft belongs
+    to one account, a reconciliation belongs to one account, and the account
+    governs the currency — so there is nothing to combine and nothing to
+    convert. This file used to assert the opposite; docs/rework/WP2 inverted it
+    when sql/021 deleted the stored conversions.
+  * `?debit_as_negative=true` flips the sign of `amount_cents` on /inbox and
+    /sync (the two endpoints that grew the flag in Sprint 1.4 / 1.5). There is
+    one amount to flip now, not two.
   * The system_key column on expense_categories survives a display-name
     rename — a renamed @Transfer / @Debt is still found by the transfer
     pipeline, so subsequent transfers reuse the same row instead of
@@ -86,18 +87,19 @@ async def _restore_balance(account_id: str, delta: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Inbox amount_home_cents
+# Inbox carries native amounts only
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_inbox_response_includes_home_cents_computed_from_rate(
-    client, test_data,
-):
-    """Inbox responses include amount_home_cents = round(amount_cents *
-    exchange_rate). For test_data.account_id (PEN), the seeded USD->PEN
-    rate is 3.4, so a 1000-cent expense at rate=3.4 produces a stored
-    amount_cents=1000 and amount_home_cents=3400.
+async def test_inbox_response_carries_no_home_value_or_rate(client, test_data):
+    """An inbox draft reports its native amount and nothing derived from a rate.
+
+    This asserted the inverse until sql/021: the row stored an `exchange_rate`
+    and the serializer multiplied by it. That is how a $100 receipt captured
+    without a date — the ordinary case — promoted as 100 PEN cents, because the
+    column defaulted to 1.0 and nothing ever revisited it (open bug 1.4). A
+    draft belongs to one account, so there is no second currency to express.
     """
     inbox_id = str(uuid.uuid4())
     create_r = await client.post(
@@ -109,7 +111,6 @@ async def test_inbox_response_includes_home_cents_computed_from_rate(
             "date": "2026-04-12T12:00:00Z",
             "account_id": test_data.account_id,
             "category_id": test_data.category_id,
-            "exchange_rate": 3.4,
         },
         headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
@@ -118,34 +119,63 @@ async def test_inbox_response_includes_home_cents_computed_from_rate(
     try:
         body = create_r.json()
         assert body["amount_cents"] == 1000  # stored positive
-        assert body["amount_home_cents"] == 3400, (
-            f"Expected 1000 * 3.4 = 3400, got {body['amount_home_cents']}"
-        )
-        # transfer fields absent → home variant is null, not missing.
-        assert "transfer_amount_home_cents" in body
-        assert body["transfer_amount_home_cents"] is None
+        for gone in (
+            "amount_home_cents",
+            "transfer_amount_home_cents",
+            "exchange_rate",
+        ):
+            assert gone not in body, f"{gone} should be absent, not null: {body}"
 
         # Same shape on the GET path.
         get_r = await client.get(f"/v1/inbox/{inbox_id}")
         assert get_r.status_code == 200
         get_body = get_r.json()
-        assert get_body["amount_home_cents"] == 3400
+        assert get_body["amount_cents"] == 1000
+        assert "amount_home_cents" not in get_body
 
     finally:
         await _cleanup_inbox(inbox_id, test_data.user_id)
 
 
+@pytest.mark.asyncio
+async def test_inbox_rejects_a_supplied_exchange_rate(client, test_data):
+    """`exchange_rate` on the request 422s rather than being silently dropped.
+
+    Fail closed: a client that believes the value matters is told it does not.
+    """
+    r = await client.post(
+        "/v1/inbox",
+        json={
+            "id": str(uuid.uuid4()),
+            "title": f"rate-rejected-{uuid.uuid4()}",
+            "amount_cents": -1000,
+            "account_id": test_data.account_id,
+            "exchange_rate": 3.4,
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert r.status_code == 422, r.text
+    assert "exchange_rate" in (r.json()["error"].get("fields") or {}), r.text
+
+
 # ---------------------------------------------------------------------------
-# Reconciliation home_cents
+# Reconciliations carry native balances only
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_response_includes_home_cents(client, test_data):
-    """POST /v1/reconciliations and GET /v1/reconciliations/{id} both
-    include beginning/ending_balance_home_cents fields. For a same-
-    currency account (PEN main currency), the home values equal the
-    native values via the identity rate.
+async def test_reconciliation_response_carries_no_home_value(client, test_data):
+    """A reconciliation reports native balances and no home-currency pair.
+
+    It is scoped to ONE account, and the account governs the currency — so a
+    reconciliation is single-currency and has nothing to convert. The two
+    `*_home_cents` fields that used to sit here were the last per-account home
+    values in the engine, kept out of inertia; docs/currency-model-decision.md
+    flagged that as a known inconsistency and docs/rework/WP2 settled it.
+
+    Deleting the helper behind them also closed open bug 2.3: it selected
+    accounts with no `user_id` predicate, and engine-side scoping is the only
+    tenant guard there is (RLS is inert under the owner connection).
     """
     recon_id = str(uuid.uuid4())
     create_r = await client.post(
@@ -163,19 +193,17 @@ async def test_reconciliation_response_includes_home_cents(client, test_data):
 
     try:
         body = create_r.json()
-        assert "beginning_balance_home_cents" in body, (
-            f"Missing beginning_balance_home_cents in response: {body}"
-        )
-        assert "ending_balance_home_cents" in body
         assert body["beginning_balance_cents"] == 1000
         assert body["ending_balance_cents"] == 5000
+        assert "beginning_balance_home_cents" not in body, body
+        assert "ending_balance_home_cents" not in body, body
 
-        # Detail endpoint surfaces the same fields.
+        # Detail endpoint agrees.
         get_r = await client.get(f"/v1/reconciliations/{recon_id}")
         assert get_r.status_code == 200
         get_body = get_r.json()
-        assert "beginning_balance_home_cents" in get_body
-        assert "ending_balance_home_cents" in get_body
+        assert "beginning_balance_home_cents" not in get_body
+        assert "ending_balance_home_cents" not in get_body
 
     finally:
         await _cleanup_recon(recon_id, test_data.user_id)
@@ -189,8 +217,10 @@ async def test_reconciliation_response_includes_home_cents(client, test_data):
 @pytest.mark.asyncio
 async def test_debit_as_negative_flips_inbox_expense_amounts(client, test_data):
     """For an EXPENSE inbox row, ?debit_as_negative=true returns
-    amount_cents and amount_home_cents as negative. Default behavior
-    keeps both positive.
+    amount_cents as negative. Default behavior keeps it positive.
+
+    One amount, not two: the row carries no home-currency value to flip
+    alongside it (sql/021).
     """
     inbox_id = str(uuid.uuid4())
     await client.post(
@@ -202,7 +232,6 @@ async def test_debit_as_negative_flips_inbox_expense_amounts(client, test_data):
             "date": "2026-04-12T12:00:00Z",
             "account_id": test_data.account_id,
             "category_id": test_data.category_id,
-            "exchange_rate": 1.0,
         },
         headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
@@ -212,7 +241,6 @@ async def test_debit_as_negative_flips_inbox_expense_amounts(client, test_data):
         r_default = await client.get(f"/v1/inbox/{inbox_id}")
         assert r_default.status_code == 200
         assert r_default.json()["amount_cents"] == 500
-        assert r_default.json()["amount_home_cents"] == 500
 
         # With flag — negative on the expense leg.
         r_flag = await client.get(
@@ -221,7 +249,6 @@ async def test_debit_as_negative_flips_inbox_expense_amounts(client, test_data):
         )
         assert r_flag.status_code == 200
         assert r_flag.json()["amount_cents"] == -500
-        assert r_flag.json()["amount_home_cents"] == -500
 
     finally:
         await _cleanup_inbox(inbox_id, test_data.user_id)

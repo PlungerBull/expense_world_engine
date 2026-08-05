@@ -192,7 +192,6 @@ async def create_opening_balance(
             date=body.date,
             account_id=account_id,
             category_id=category_id,
-            exchange_rate=body.exchange_rate,
         ),
     )
 

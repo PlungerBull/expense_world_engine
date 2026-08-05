@@ -7,7 +7,6 @@ from fastapi import APIRouter, Query
 from app import db
 from app.deps import CurrentUser
 from app.helpers.exchange_rate import batch_get_rates
-from app.helpers.home_currency import signed_expr
 from app.helpers.monthly_report import (
     compute_month_bounds,
     compute_month_flow,
@@ -94,111 +93,18 @@ async def _load_accounts(
     return result
 
 
-# Signed-amount expressions reused by the lifetime aggregators below.
+# The `archived_categories` and `archived_hashtags` panels were here — two
+# lifetime aggregators over `is_archived` rows. They are gone (docs/rework/WP2).
 #
-# Both are built by helpers/home_currency.signed_expr, which is the engine's
-# single rendering of the sign matrix — this module and
-# helpers/monthly_report.py used to carry their own literal copies of it, and
-# audit finding WP9.1 is about exactly that: /dashboard and /reports/monthly
-# drifting until they disagreed about the same month. Only the magnitude
-# differs between the two, which is the point.
+# Not because converting them was hard, but because archiving a category was
+# never a distinct feature: soft delete already hides a row from pickers while
+# leaving past transactions that reference it fully intact, which is what
+# archiving was for. These panels were `expense_categories.is_archived` and
+# `expense_hashtags.is_archived`'s last readers, and docs/rework/WP5 removes
+# both columns.
 #
-# The COALESCE below is the surviving fallback that treats USD cents as PEN
-# cents when a row has no stored home value. It is wrong and it is known —
-# docs/rework/WP2 replaces this argument with a real read-time conversion.
-_SIGNED_CENTS_SQL = signed_expr("t.amount_cents")
-
-_SIGNED_HOME_CENTS_SQL = signed_expr(
-    "COALESCE(t.amount_home_cents, t.amount_cents)"
-)
-
-
-async def _load_archived_categories(
-    conn: asyncpg.Connection,
-    user_id: str,
-) -> list[dict]:
-    """Lifetime signed flow per archived (non-deleted) category.
-
-    Categories with no transactions ever appear with zero totals — the
-    LEFT JOIN preserves them. Sort matches the active categories panel
-    so the client can render both lists identically.
-    """
-    rows = await conn.fetch(
-        f"""
-        SELECT
-            c.id,
-            c.name,
-            COALESCE(SUM({_SIGNED_CENTS_SQL}), 0)::bigint      AS lifetime_spent_cents,
-            COALESCE(SUM({_SIGNED_HOME_CENTS_SQL}), 0)::bigint AS lifetime_spent_home_cents
-        FROM expense_categories c
-        LEFT JOIN expense_transactions t
-               ON t.category_id = c.id
-              AND t.user_id     = c.user_id
-              AND t.deleted_at IS NULL
-        WHERE c.user_id     = $1
-          AND c.is_archived = true
-          AND c.deleted_at IS NULL
-        GROUP BY c.id, c.name, c.sort_order
-        ORDER BY c.sort_order ASC, c.name ASC
-        """,
-        user_id,
-    )
-    return [
-        {
-            "id": str(r["id"]),
-            "name": r["name"],
-            "lifetime_spent_cents": int(r["lifetime_spent_cents"]),
-            "lifetime_spent_home_cents": int(r["lifetime_spent_home_cents"]),
-        }
-        for r in rows
-    ]
-
-
-async def _load_archived_hashtags(
-    conn: asyncpg.Connection,
-    user_id: str,
-) -> list[dict]:
-    """Lifetime signed flow per archived (non-deleted) hashtag.
-
-    Joins through `expense_transaction_hashtags` (ledger-side rows only,
-    `transaction_source = 1`). A transaction with N hashtags is counted
-    once under each — the lifetime totals across hashtags don't sum to
-    the flow total, by design (each hashtag's view is independent).
-    """
-    rows = await conn.fetch(
-        f"""
-        SELECT
-            h.id,
-            h.name,
-            COALESCE(SUM({_SIGNED_CENTS_SQL}), 0)::bigint      AS lifetime_spent_cents,
-            COALESCE(SUM({_SIGNED_HOME_CENTS_SQL}), 0)::bigint AS lifetime_spent_home_cents
-        FROM expense_hashtags h
-        LEFT JOIN expense_transaction_hashtags th
-               ON th.hashtag_id          = h.id
-              AND th.user_id             = h.user_id
-              AND th.transaction_source  = 1
-              AND th.deleted_at IS NULL
-        LEFT JOIN expense_transactions t
-               ON t.id         = th.transaction_id
-              AND t.user_id    = h.user_id
-              AND t.deleted_at IS NULL
-        WHERE h.user_id     = $1
-          AND h.is_archived = true
-          AND h.deleted_at IS NULL
-        GROUP BY h.id, h.name, h.sort_order
-        ORDER BY h.sort_order ASC, h.name ASC
-        """,
-        user_id,
-    )
-    return [
-        {
-            "id": str(r["id"]),
-            "name": r["name"],
-            "lifetime_spent_cents": int(r["lifetime_spent_cents"]),
-            "lifetime_spent_home_cents": int(r["lifetime_spent_home_cents"]),
-        }
-        for r in rows
-    ]
+# `archived_accounts` stays, and the asymmetry is deliberate: an archived
+# ACCOUNT still holds real money; an archived category holds only history.
 
 
 @router.get("")
@@ -207,9 +113,8 @@ async def get_dashboard(
     include_archived: bool = Query(
         False,
         description=(
-            "When true, response includes `archived_accounts`, "
-            "`archived_categories`, `archived_hashtags` panels with lifetime "
-            "totals. When false (default), those fields are returned as null."
+            "When true, the response includes the `archived_accounts` panel. "
+            "When false (default), that field is returned as null."
         ),
     ),
     debit_as_negative: bool = Query(
@@ -217,7 +122,7 @@ async def get_dashboard(
         description=(
             "Accepted for API consistency with other read endpoints. Dashboard "
             "aggregates are already signed by construction (per-category "
-            "spent_cents is positive for income and negative for expense; "
+            "spent_home_cents is positive for income and negative for expense; "
             "totals return split positive inflow/outflow). The flag is a no-op."
         ),
     ),
@@ -234,18 +139,16 @@ async def get_dashboard(
         people = await _load_accounts(
             conn, auth_user.id, settings["main_currency"], is_person=True
         )
-        flow = await compute_month_flow(conn, auth_user.id, start_utc, end_utc)
+        flow = await compute_month_flow(
+            conn, auth_user.id, start_utc, end_utc, settings["display_timezone"]
+        )
 
         archived_accounts: Optional[list[dict]] = None
-        archived_categories: Optional[list[dict]] = None
-        archived_hashtags: Optional[list[dict]] = None
         if include_archived:
             archived_accounts = await _load_accounts(
                 conn, auth_user.id, settings["main_currency"],
                 is_person=False, archived=True,
             )
-            archived_categories = await _load_archived_categories(conn, auth_user.id)
-            archived_hashtags = await _load_archived_hashtags(conn, auth_user.id)
 
     return DashboardResponse(
         month={"year": year, "month": month},
@@ -254,6 +157,4 @@ async def get_dashboard(
         categories=flow["categories"],
         totals=flow["totals"],
         archived_accounts=archived_accounts,
-        archived_categories=archived_categories,
-        archived_hashtags=archived_hashtags,
     ).model_dump(mode="json")

@@ -27,16 +27,15 @@ def _is_debit(transaction_type: Optional[int]) -> bool:
 def apply_debit_as_negative(data: dict) -> dict:
     """Post-process a transaction dict to negate amounts for expenses/debits.
 
-    Returns a shallow copy with ``amount_cents`` and ``amount_home_cents``
-    negated when the transaction is an expense or a transfer-debit.
+    Returns a shallow copy with ``amount_cents`` negated when the transaction is
+    an expense or a transfer-debit. There is one amount to flip: a transaction
+    carries no home-currency value (sql/021).
     """
     if not _is_debit(data["transaction_type"]):
         return data
 
     data = {**data}
     data["amount_cents"] = -data["amount_cents"]
-    if data["amount_home_cents"] is not None:
-        data["amount_home_cents"] = -data["amount_home_cents"]
     return data
 
 
@@ -69,14 +68,12 @@ def apply_debit_as_negative_inbox(data: dict) -> dict:
     data = {**data}
 
     if primary_is_debit:
-        for key in ("amount_cents", "amount_home_cents"):
-            if data.get(key) is not None:
-                data[key] = -data[key]
+        if data.get("amount_cents") is not None:
+            data["amount_cents"] = -data["amount_cents"]
     else:
         # The sibling always moves the other way. Only reachable on a transfer
-        # draft; on an ordinary row these keys are absent.
-        for key in ("transfer_amount_cents", "transfer_amount_home_cents"):
-            if data.get(key) is not None:
-                data[key] = -data[key]
+        # draft; on an ordinary row this key is absent.
+        if data.get("transfer_amount_cents") is not None:
+            data["transfer_amount_cents"] = -data["transfer_amount_cents"]
 
     return data

@@ -14,22 +14,6 @@ Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high
 
 ## 🔴 Critical
 
-### 1.4 — Inbox items promote at exchange rate 1.0
-`helpers/inbox.py` — `exchange_rate` defaults to `1.0` via `COALESCE`; the PUT
-re-rate fires only on a `date` change, never on `account_id`; promote uses the stored
-value verbatim. **Reproduced 2026-08-03:** a USD inbox item created without a date
-stores rate `1.0`, so $100 is worth 100 PEN cents.
-⚠️ Note the asymmetry — with a date present and no rate available the engine
-correctly returns `422 RATE_UNAVAILABLE`. It fails closed when it looks and finds
-nothing, and **fails open when it does not look at all.**
-**Fix:** stop storing a rate at all. `docs/rework/WP2`.
-
-### 1.5 — `PUT /transactions/{id}` changing `account_id` never re-rates
-`helpers/transactions.py` — the re-rate trigger checks `date` only, but the account
-determines the source currency. **Reproduced 2026-08-03:** a PEN transaction moved to
-a USD account keeps `home=10000 rate=1.0`, unchanged.
-**Fix:** nothing stored, nothing to go stale. `docs/rework/WP2`.
-
 ### 3.1 — Delta sync can permanently drop committed writes
 `helpers/sync.py` — the checkpoint stores `now()` at transaction *start*; writers
 stamp `updated_at` at *their* start; the delta reads `WHERE updated_at > $2`. A writer
@@ -54,7 +38,8 @@ Add a purge job — the table grows unbounded today.
 
 ## 🟠 High
 
-- **6.1 `extra="forbid"` sweep** — request schemas silently drop unknown fields. Fail closed: unknown input must `422`.
+- **6.1 `extra="forbid"` sweep** — request schemas silently drop unknown fields. Fail closed: unknown input must `422`. *Partially shipped:* the four schemas that lost `exchange_rate` in `sql/021` carry it (`TransactionCreateRequest`, `TransactionUpdateRequest`, `InboxCreateRequest`, `InboxUpdateRequest`), as does `OpeningBalanceRequest`. Every other request schema is still open.
+- **6.5 The transfer-leg edit guard is a deny-list, and it forgets `category_id`** — `helpers/transactions.update_transaction` blocks `{amount_cents, account_id, date}` on a row with a `transfer_transaction_id`, so a `PUT` can still move ONE leg out of `@Transfer`, stranding the other with nothing to cancel against — indistinguishable from a loan to a person, which is the other thing a non-zero `@Transfer` means. `CLAUDE.md`'s "fix at the root" corollary already describes this guard as having been inverted to an allow-list; it has not been. Invert it: enumerate what a transfer leg may change.
 - **6.2 UUID path/query params typed `str`** — malformed input reaches SQL and 500s instead of `422`.
 - **6.3 CHECK constraints for closed enums** — *partially shipped:* `sql/019` covers `expense_transaction_inbox`, `sql/020` covers `expense_transactions` (`transaction_type IN (1,2)` plus `amount_cents > 0`). Still open for `transaction_source`, reconciliation `status`, `activity_log.actor_type`, `exchange_rates.rate > 0`, `user_settings` enums. ⚠️ Write these as `col IS NOT NULL AND col IN (…)` on any nullable column — a `CHECK` passes on `NULL`, so the bare `IN` admits exactly the row it was added to forbid (found while writing `sql/020`).
 - **7.4 Reserved system-category names can permanently 500 transfers** — nothing stops a user claiming `@Debt`/`@Transfer`/`@Opening`; `ensure_system_category`'s `ON CONFLICT (user_id, system_key)` arbiter does not cover the `(user_id, LOWER(name))` index, so the `UniqueViolationError` escapes uncaught. Reject reserved names at the boundary *and* wrap the seeding INSERT.
@@ -63,8 +48,7 @@ Add a purge job — the table grows unbounded today.
 
 ## 🟡 Medium
 
-- **1.7** Rate hygiene — provider-rate validation, negative-lookup cache TTL, archived-account currencies missing from the fetch target list, `Decimal`/`ROUND_HALF_UP` instead of float.
-- **2.3** `resolve_home_rates` reads an account with no `user_id` filter. Closes when the currency work deletes that helper; **until then it is a live cross-tenant read** — RLS is inert, so query scoping is the only guard.
+- **1.7** Rate hygiene — provider-rate validation, negative-lookup cache TTL, archived-account currencies missing from the fetch target list, `Decimal`/`ROUND_HALF_UP` instead of float. ⚠️ **Higher stakes since `sql/021`:** `exchange_rates` is now the only source of every home-currency figure, so a bad provider row misprices reports rather than one write. The float/rounding half is why `tests/test_home_currency_parity.py` compares rates and not cents — SQL keeps full `numeric` and rounds half-away-from-zero, while `_fetch_rate_from_db` truncates to binary float and Python rounds half-to-even.
 - **2.4** PAT plaintext sits 24 h in `idempotency_keys.response_snapshot`, cancelling "only the hash is stored". Exempt `POST /auth/pat` from snapshot storage; return `409` on replay.
 - **5.3** `sort_order` in a `PUT` body: dead guard, silent `200`.
 - **5.5** Reconciliation state-machine gaps.
@@ -106,6 +90,10 @@ checkpoint lookup · `?search=` is unescaped `ILIKE` (escape `%`/`_`, and fix th
 `2.1` **JWT forgery — auth branch deleted 2026-08-03**, `tests/test_auth_over_the_wire.py`
 pins it · `2.2` JWKS fetch — `jwks.py` deleted with the branch ·
 `5.1`/`5.2`/`5.4` superseded by D3 · `7.2`/`7.3` inbox transfer direction, `sql/019` ·
-`10.2` inbox `debit_as_negative` flip.
+`10.2` inbox `debit_as_negative` flip · `1.3`/`1.2` transfer collapse, `sql/020` ·
+**`1.4`/`1.5`/`2.3` read-time currency, `sql/021`** — all three by deletion rather than
+repair: with no stored conversion there is no rate to default to `1.0`, nothing to go
+stale when an account changes, and no `resolve_home_rates` to read an account without
+a `user_id` filter.
 
 Details are in git history — `git log -- docs/open-bugs.md`.

@@ -1,5 +1,4 @@
 import logging
-from datetime import date as date_type
 from typing import Optional
 
 from fastapi import Request
@@ -93,29 +92,14 @@ def conflict(message: str) -> AppError:
     return AppError(409, "CONFLICT", message)
 
 
-def rate_unavailable(
-    from_currency: str,
-    to_currency: str,
-    as_of: date_type,
-) -> AppError:
-    # 422 rather than 409: the request is valid, the server simply can't
-    # compute amount_home_cents yet because no FX row exists on or before
-    # `as_of` for this pair. A dedicated code lets clients distinguish
-    # "retry after the daily fetch" from generic validation errors, and
-    # prevents the old silent 1.0 fallback that previously corrupted
-    # amount_home_cents on missing-rate days.
-    return AppError(
-        422,
-        "RATE_UNAVAILABLE",
-        f"Exchange rate for {from_currency}->{to_currency} on {as_of.isoformat()} is not available.",
-        {
-            "exchange_rate": (
-                f"No rate on or before {as_of.isoformat()} for "
-                f"{from_currency}->{to_currency}. Wait for the daily fetch "
-                f"or supply an explicit exchange_rate."
-            )
-        },
-    )
+# RATE_UNAVAILABLE was here. It existed because a write had to resolve a rate
+# before it could store amount_home_cents, so a stale FX table blocked recording
+# what happened. sql/021 deleted the stored conversion, so no write resolves a
+# rate any more and no write can fail this way. A missing rate is now a READ-time
+# condition, and it surfaces as a null aggregate plus a non-zero
+# `unconverted_count` — see helpers/home_currency.py. Do not reintroduce a
+# write-time rate error without first reintroducing a reason for writes to need
+# a rate.
 
 
 def settings_missing() -> AppError:

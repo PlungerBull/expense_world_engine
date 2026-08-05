@@ -27,7 +27,6 @@ class OpeningBalanceRequest(BaseModel):
     amount_cents: int  # signed: positive = money you had, negative = starting debt
     date: AwareDatetime
     title: Optional[str] = None  # defaults to "Opening balance"
-    exchange_rate: Optional[float] = None
 
 
 class AccountUpdateRequest(BaseModel):

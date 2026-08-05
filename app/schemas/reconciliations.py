@@ -60,12 +60,16 @@ class ReconciliationResponse(BaseModel):
     date_end: Optional[datetime] = None
     status: int
     sort_order: int
+    # Native only. A reconciliation is scoped to ONE account, and the account
+    # governs the currency — so there is nothing here to combine and nothing to
+    # convert. The two `*_home_cents` fields that used to sit beside these were
+    # the last surviving per-account home values, kept out of inertia rather
+    # than need; docs/currency-model-decision.md called that out as a known
+    # inconsistency and docs/rework/WP2 settled it.
     beginning_balance_cents: int
-    beginning_balance_home_cents: Optional[int] = None
     beginning_balance_source: Literal["manual", "chained"]
     chained_from_reconciliation_id: Optional[str] = None
     ending_balance_cents: int
-    ending_balance_home_cents: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     version: int
@@ -74,16 +78,9 @@ class ReconciliationResponse(BaseModel):
 
 def reconciliation_from_row(
     row,
-    rate: Optional[float] = None,
     chained_from_reconciliation_id: Optional[str] = None,
 ) -> dict:
     """Serialize a reconciliation row.
-
-    ``rate`` is the account's currency → user's home currency conversion
-    factor at the reconciliation's ``date_end`` (or ``now()`` if not set).
-    When ``rate`` is None (e.g. main_currency not configured or no rate
-    row available), both home-cents fields serialize as ``null`` so the
-    response shape stays stable.
 
     ``chained_from_reconciliation_id`` is the UUID of the previous neighbor
     in sort_order when the row's source is ``chained`` and a neighbor exists.
@@ -104,11 +101,9 @@ def reconciliation_from_row(
         status=row["status"],
         sort_order=row["sort_order"],
         beginning_balance_cents=begin,
-        beginning_balance_home_cents=round(begin * rate) if rate is not None else None,
         beginning_balance_source=source_label,
         chained_from_reconciliation_id=chained_from_reconciliation_id,
         ending_balance_cents=end,
-        ending_balance_home_cents=round(end * rate) if rate is not None else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         version=row["version"],

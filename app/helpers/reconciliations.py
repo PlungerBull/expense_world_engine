@@ -9,7 +9,7 @@ See ``app/helpers/balance.py`` for the convention: these functions do NOT
 open their own ``conn.transaction()`` — callers own transaction boundaries.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
@@ -22,73 +22,31 @@ from app.constants import (
 )
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
-from app.helpers.exchange_rate import get_rate
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.helpers.validation import validate_active_account
 from app.schemas.reconciliations import reconciliation_from_row
 
 
-async def resolve_home_rates(
-    conn: asyncpg.Connection,
-    user_id: str,
-    rows: list,
-) -> dict[str, Optional[float]]:
-    """Resolve the account-currency → home-currency rate for each reconciliation row.
-
-    Returns ``{reconciliation_id: rate|None}``. ``None`` means no rate is
-    available (main currency missing or no rate row), in which case the
-    serializer emits ``null`` for the ``_home_cents`` fields.
-
-    Deduplicates by ``(account_currency, date)`` so the rate helper is
-    hit once per distinct pair, not once per reconciliation. A list of
-    N reconciliations across K currencies produces at most K cache
-    lookups, not N.
-    """
-    if not rows:
-        return {}
-
-    settings_row = await conn.fetchrow(
-        "SELECT main_currency FROM user_settings WHERE user_id = $1", user_id
-    )
-    main_currency = settings_row["main_currency"] if settings_row else None
-    if main_currency is None:
-        return {str(row["id"]): None for row in rows}
-
-    # Pull currency for every referenced account in a single query.
-    account_ids = {str(row["account_id"]) for row in rows}
-    currency_rows = await conn.fetch(
-        "SELECT id, currency_code FROM expense_bank_accounts WHERE id = ANY($1::uuid[])",
-        list(account_ids),
-    )
-    currency_by_account = {str(r["id"]): r["currency_code"] for r in currency_rows}
-
-    today = datetime.now(timezone.utc).date()
-
-    # Cache per (currency, date) pair so cross-currency reconciliations
-    # on the same end-date reuse a single rate lookup.
-    rate_cache: dict[tuple[str, object], Optional[float]] = {}
-
-    async def _rate_for(currency: str, as_of) -> Optional[float]:
-        key = (currency, as_of)
-        if key in rate_cache:
-            return rate_cache[key]
-        if currency == main_currency:
-            rate_cache[key] = 1.0
-            return 1.0
-        result = await get_rate(conn, currency, main_currency, as_of)
-        value = result[0] if result is not None else None
-        rate_cache[key] = value
-        return value
-
-    out: dict[str, Optional[float]] = {}
-    for row in rows:
-        currency = currency_by_account.get(str(row["account_id"]))
-        if currency is None:
-            out[str(row["id"])] = None
-            continue
-        as_of = row["date_end"].date() if row["date_end"] is not None else today
-        out[str(row["id"])] = await _rate_for(currency, as_of)
-    return out
+# ``resolve_home_rates`` was here. It fed ``beginning_balance_home_cents`` and
+# ``ending_balance_home_cents`` on every reconciliation response; both fields are
+# gone (docs/rework/WP2), and so is it.
+#
+# Deleting it was the point, not a side effect. A reconciliation belongs to
+# exactly ONE account, and the account governs the currency — so a reconciliation
+# is single-currency and has nothing to convert. Home values belong on figures
+# that combine currencies, and this was never one. That is the inconsistency
+# docs/currency-model-decision.md flagged as "deliberately left".
+#
+# Two defects closed with it:
+#
+#   * open bug 2.3 — it selected accounts with `WHERE id = ANY($1::uuid[])` and
+#     NO `user_id` predicate. RLS is inert under the owner connection, so query
+#     scoping is the only tenant guard the engine has; a missing `user_id` filter
+#     is a security defect, not a tidiness one.
+#   * an N+1 hidden in a write path — the chained-recalc loop called it with a
+#     single-row list per iteration, so each activity-log snapshot cost a
+#     user_settings fetch plus an account-currency fetch, defeating the batching
+#     the function was built for.
 
 
 # ---------------------------------------------------------------------------
@@ -275,10 +233,8 @@ async def _cascade_chained_recalc(
                 # diffs. Stop early.
                 return recalculated
 
-            before_rate = await resolve_home_rates(conn, user_id, [row])
             before = reconciliation_from_row(
                 row,
-                before_rate.get(str(row["id"])),
                 chained_from_reconciliation_id=None,
             )
 
@@ -296,7 +252,6 @@ async def _cascade_chained_recalc(
                 new_beginning,
             )
 
-            after_rate = await resolve_home_rates(conn, user_id, [updated_row])
             # Look up the actual neighbor id for the after-snapshot.
             neighbor = await _previous_chained_neighbor(
                 conn, user_id, account_id, updated_row["sort_order"],
@@ -304,7 +259,6 @@ async def _cascade_chained_recalc(
             )
             after = reconciliation_from_row(
                 updated_row,
-                after_rate.get(str(updated_row["id"])),
                 chained_from_reconciliation_id=str(neighbor["id"]) if neighbor else None,
             )
             await write_activity_log(
@@ -349,10 +303,8 @@ async def _serialize_with_neighbor(
         )
         if neighbor is not None:
             chained_from = str(neighbor["id"])
-    rate_by_id = await resolve_home_rates(conn, user_id, [row])
     return reconciliation_from_row(
         row,
-        rate_by_id.get(str(row["id"])),
         chained_from_reconciliation_id=chained_from,
     )
 

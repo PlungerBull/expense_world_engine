@@ -6,14 +6,12 @@ import asyncpg
 
 from app.constants import (
     ActivityAction,
-    HOME_CURRENCY,
     SystemCategoryKey,
 )
-from app.errors import conflict, settings_missing, validation_error
+from app.errors import conflict, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
 from app.helpers.categories import ensure_system_category
-from app.helpers.exchange_rate import lookup_exchange_rate
 from app.schemas.transactions import infer_transaction_type, transaction_from_row
 
 
@@ -27,7 +25,6 @@ async def create_transfer_pair(
     primary_amount_cents: int,
     primary_account_id: str,
     primary_date: datetime,
-    primary_exchange_rate: Optional[float],
     primary_cleared: bool,
     transfer_account_id: str,
     transfer_amount_cents: int,
@@ -126,84 +123,33 @@ async def create_transfer_pair(
     sibling_type = infer_transaction_type(transfer_amount_cents)
 
     # ------------------------------------------------------------------
-    # 6. Exchange rates and amount_home_cents (dominant-side rule)
+    # 6. No currency work. Each leg stores its own native amount, full stop.
     # ------------------------------------------------------------------
-    # Cross-currency transfers must net to zero in home currency. We achieve
-    # this by forcing the non-dominant side's home value to equal the dominant
-    # side's by direct assignment — never recomputed via rate — so integer
-    # rounding can't introduce a net leak. The sibling's per-row exchange_rate
-    # is then derived from that forced home value, for audit/display.
+    # A ~75-line "dominant-side rule" used to live here. It picked one leg,
+    # valued it in home currency, and then FORCED the other leg's home value
+    # to equal it by direct assignment, so the pair always summed to exactly
+    # zero. sql/021 deleted the columns it wrote, and with them the rule.
     #
-    # The "dominant" side (the one whose home value is computed independently)
-    # is picked in the order engine-spec.md §Transfers point 7 states:
+    # What the forcing hid: send $1,000 and receive S/3,450 on a day the market
+    # rate is 3.58, and the dollars were worth S/3,580. The S/130 difference is
+    # a real cost really paid — the bank's spread — and assigning
+    # `sibling_home = primary_home` made it vanish. Converting each leg at its
+    # own date's rate now surfaces it, and it lands in @Transfer.
     #
-    #   1. The primary's currency == home  → primary dominant, rate 1.0.
-    #   2. The sibling's currency == home  → sibling dominant, rate 1.0.
-    #   3. Neither matches                 → primary dominant, at the caller's
-    #      rate if supplied, else the market rate for its date.
+    # So `@Transfer != 0` means exactly one of two things: an FX spread, or a
+    # loan/repayment with a person (one leg in @Transfer, the other in @Debt,
+    # nothing to cancel against). docs/currency-model-decision.md has the full
+    # matrix, and records why a separate @FX category stays deferred — owner
+    # decision, reaffirmed 2026-08-05.
     #
-    # ⚠️ Branch order is load-bearing, and getting it wrong was open bug 1.3.
-    # This block used to test the caller's rate override FIRST, which produced
-    # two defects:
-    #
-    #   * a home-currency primary with a supplied rate computed
-    #     `home = amount × rate` — wrong, since a PEN amount's home value is
-    #     itself; and
-    #   * there was no rule at all for case 3, so the block ended in
-    #     `raise RuntimeError` and EVERY USD→USD transfer returned an uncaught
-    #     500 under a PEN home currency.
-    #
-    # Case 3 is now a real rule rather than a dead end: the primary is valued
-    # at the market rate through the same helper create_transaction already
-    # uses, so a same-currency foreign transfer prices like any other row.
-    #
-    # This block is scheduled for deletion by docs/rework/WP2, which stops
-    # storing home values altogether and surfaces the FX spread as @FX instead
-    # of forcing it to zero. Until then the pair still nets to zero.
-    primary_currency = primary_account["currency_code"]
-    sibling_currency = transfer_account["currency_code"]
-
-    # sql/018 locks main_currency to PEN, and helpers/home_currency.py's SQL
-    # fragments interpolate HOME_CURRENCY as a literal on that basis. Asserting
-    # the two agree costs nothing here and makes a lifted CHECK fail loudly
-    # instead of silently pricing a non-PEN ledger in PEN. It also removes the
-    # old `settings_row is None → main_currency = None → nothing matches` path,
-    # which was the second route into the 500 above.
-    settings_row = await conn.fetchrow(
-        "SELECT main_currency FROM user_settings WHERE user_id = $1", user_id,
-    )
-    if settings_row is None:
-        raise settings_missing()
-    if settings_row["main_currency"] != HOME_CURRENCY:
-        raise RuntimeError(
-            f"user_settings.main_currency is {settings_row['main_currency']!r} "
-            f"but the engine converts to {HOME_CURRENCY!r} (app.constants."
-            "HOME_CURRENCY). sql/018 is supposed to make this unreachable; if "
-            "that CHECK was lifted, helpers/home_currency.py must be revisited "
-            "at the same time."
-        )
-
-    if primary_currency == HOME_CURRENCY:
-        primary_exchange_rate = 1.0
-        primary_home = primary_abs
-        sibling_home = primary_home
-        sibling_exchange_rate = sibling_home / sibling_abs
-    elif sibling_currency == HOME_CURRENCY:
-        sibling_exchange_rate = 1.0
-        sibling_home = sibling_abs
-        primary_home = sibling_home
-        primary_exchange_rate = primary_home / primary_abs
-    else:
-        # Neither leg is in the home currency — e.g. USD→USD under a PEN home.
-        # The primary is dominant, valued at the caller's rate if they gave one
-        # and otherwise at the market rate on its date.
-        if primary_exchange_rate is None:
-            primary_exchange_rate = await lookup_exchange_rate(
-                conn, primary_account_id, primary_date, user_id
-            )
-        primary_home = round(primary_abs * primary_exchange_rate)
-        sibling_home = primary_home
-        sibling_exchange_rate = sibling_home / sibling_abs
+    # Two defects became unrepresentable rather than fixed: a USD→USD transfer
+    # under a PEN home used to reach `raise RuntimeError` and return an
+    # uncaught 500 (open bug 1.3), because the rule had no branch for "neither
+    # leg is home currency". There is no rule now, so there is no dead end.
+    # And the user_settings round-trip this block needed is gone with it — the
+    # main_currency == HOME_CURRENCY assertion that guards home_currency.py's
+    # interpolated literal moved to monthly_report.get_user_report_settings,
+    # which is where conversion actually happens.
 
     if primary_id == sibling_id:
         raise validation_error(
@@ -218,10 +164,10 @@ async def create_transfer_pair(
         primary_row = await conn.fetchrow(
             """
             INSERT INTO expense_transactions
-                (id, user_id, title, description, amount_cents, amount_home_cents,
+                (id, user_id, title, description, amount_cents,
                  transaction_type, date, account_id, category_id,
-                 exchange_rate, cleared, inbox_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), now())
+                 cleared, inbox_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
             RETURNING *
             """,
             primary_id,
@@ -229,12 +175,10 @@ async def create_transfer_pair(
             primary_title,
             primary_description,
             primary_abs,
-            primary_home,
             primary_type,
             primary_date,
             primary_account_id,
             primary_category_id,
-            primary_exchange_rate,
             primary_cleared,
             inbox_id,
         )
@@ -248,10 +192,10 @@ async def create_transfer_pair(
         sibling_row = await conn.fetchrow(
             """
             INSERT INTO expense_transactions
-                (id, user_id, title, description, amount_cents, amount_home_cents,
+                (id, user_id, title, description, amount_cents,
                  transaction_type, date, account_id, category_id,
-                 exchange_rate, cleared, transfer_transaction_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), now())
+                 cleared, transfer_transaction_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
             RETURNING *
             """,
             sibling_id,
@@ -259,12 +203,10 @@ async def create_transfer_pair(
             primary_title,
             primary_description,
             sibling_abs,
-            sibling_home,
             sibling_type,
             primary_date,
             transfer_account_id,
             sibling_category_id,
-            sibling_exchange_rate,
             primary_cleared,
             primary_id,
         )

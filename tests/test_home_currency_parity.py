@@ -16,9 +16,9 @@ assertion (the NULL path) is made at a date below the suite-wide seed floor.
 Seeding rules this file obeys, because global rows are shared:
 
   * Seed strictly inside 2001-01-01 .. 2020-12-31. Below it,
-    ``test_phase_fixes`` asserts a 2000-01-01 write gets 422 RATE_UNAVAILABLE and
-    a stray earlier row would make that return 201 on another worker. Above it,
-    ``conftest`` owns CURRENT_DATE.
+    ``test_exchange_rates_history`` owns 1997 and this file's unconvertible
+    assertion needs 1990 to stay bare; above it, ``test_wp2_read_time_currency``
+    owns 2022 and ``conftest`` owns CURRENT_DATE.
   * Delete only our own dates in teardown — never ``DELETE FROM exchange_rates``.
   * Every seeded day gets a *distinct* rate, so "resolved this rate" proves
     "resolved this row".
@@ -167,20 +167,21 @@ async def fx(test_data, db_pool):
 async def _seed_txn(conn, fx: Fixtures, user_id: str, category_id: str,
                     account_id: str, when: datetime,
                     txn_type: int = int(TransactionType.OUTFLOW)) -> str:
-    """Insert one ledger row, leaving ``amount_home_cents`` NULL.
+    """Insert one ledger row. It carries a native amount and nothing else.
 
-    NULL on purpose: the whole point of these fragments is that the home value is
-    computed, so a regression that reads the stored column would surface here
-    instead of quietly agreeing.
+    The row used to be seeded with ``amount_home_cents`` explicitly NULL, so that
+    a regression reading the stored column surfaced here instead of quietly
+    agreeing. sql/021 dropped the column, so the guarantee is now structural: the
+    home value is computed or it does not exist.
     """
     txn_id = str(uuid.uuid4())
     await conn.execute(
         """INSERT INTO expense_transactions
-            (id, user_id, title, amount_cents, amount_home_cents, transaction_type,
-             date, account_id, category_id, exchange_rate,
+            (id, user_id, title, amount_cents, transaction_type,
+             date, account_id, category_id,
              cleared, created_at, updated_at)
-           VALUES ($1, $2, 'parity', $3, NULL, $4,
-             $5, $6, $7, 1.0, false, now(), now())""",
+           VALUES ($1, $2, 'parity', $3, $4,
+             $5, $6, $7, false, now(), now())""",
         txn_id, user_id, AMOUNT_CENTS, txn_type,
         when, account_id, category_id,
     )

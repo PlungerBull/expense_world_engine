@@ -136,8 +136,9 @@ The get_rate duplication
 
 ``helpers/exchange_rate.get_rate`` expresses the same carry-forward rule in
 Python, and it stays: account balances convert at *today's* rate, the account list
-uses ``batch_get_rates`` to avoid an N+1, reconciliations convert at their
-``date_end``, and ``GET /exchange-rates`` serves rates directly. So the rule is
+uses ``batch_get_rates`` to avoid an N+1, and ``GET /exchange-rates`` serves rates
+directly. (Reconciliations used to be on that list; they report native only as of
+docs/rework/WP2.) So the rule is
 implemented twice, in two languages. **That is a real DRY violation, accepted
 deliberately** — aggregates must run in SQL, and pulling every row into Python to
 convert would be worse.
@@ -229,9 +230,8 @@ def signed_expr(magnitude: str) -> str:
     routers/dashboard.py, and this builder, which nothing imported. That is
     audit finding WP9.1, whose stated risk was /dashboard and /reports/monthly
     disagreeing about the same month. Callers pass their own magnitude:
-    ``t.amount_cents`` for the native form, ``HOME_CENTS_EXPR`` for the
-    converted one, and (until docs/rework/WP2 lands) the read paths' remaining
-    ``COALESCE(t.amount_home_cents, t.amount_cents)``.
+    ``HOME_CENTS_EXPR`` for the converted form (what ``helpers/monthly_report``
+    uses), or ``t.amount_cents`` for the native one.
 
     Integers come from app.constants rather than being written as literals, so a
     renumbering cannot silently desync the SQL from the enum (audit WP9.9).

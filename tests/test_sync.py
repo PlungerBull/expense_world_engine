@@ -139,11 +139,11 @@ async def test_transaction_without_hashtags_has_empty_array(client, test_data):
     async with db.pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO expense_transactions
-                (id, user_id, title, amount_cents, amount_home_cents, transaction_type,
-                 date, account_id, category_id, exchange_rate, cleared,
+                (id, user_id, title, amount_cents, transaction_type,
+                 date, account_id, category_id, cleared,
                  created_at, updated_at)
-               VALUES ($1, $2, 'No Hashtags', 1000, 1000, 1,
-                 now(), $3, $4, 1.0, false, now(), now())""",
+               VALUES ($1, $2, 'No Hashtags', 1000, 1,
+                 now(), $3, $4, false, now(), now())""",
             bare_tx_id, test_data.user_id, test_data.account_id, test_data.category_id,
         )
 

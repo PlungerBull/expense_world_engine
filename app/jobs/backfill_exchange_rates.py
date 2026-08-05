@@ -15,8 +15,10 @@ Less than it looks. `app.helpers.exchange_rate.get_rate` resolves a date with
 recent earlier rate forward rather than demanding an exact match. So:
 
   * The HARD requirement is a single row on or before your earliest transaction
-    date. That is the difference between a write succeeding and a write failing
-    with 422 RATE_UNAVAILABLE.
+    date. Below that floor a transaction has no home value at all: the report
+    shows `null` for the figures it touches, plus a non-zero
+    `unconverted_count`. The WRITE always succeeds — since sql/021 nothing on
+    the write path resolves a rate.
   * Everything denser than that buys ACCURACY, not availability. A gap does not
     break anything; it just means the transactions inside it convert at the
     last rate before the gap.
@@ -25,8 +27,9 @@ recent earlier rate forward rather than demanding an exact match. So:
 
 Daily coverage across the range you actually hold data for is the right default:
 one request per date, and it makes every transaction convert at its true
-point-in-time rate, which is the whole reason `amount_home_cents` is cached per
-row at write time (IAS 21.21 — spot rate at transaction date).
+point-in-time rate (IAS 21.21 — spot rate at transaction date). Note that this
+table is now the ONLY source of home-currency values: nothing is cached per row,
+so correcting a rate here corrects every past report that used it.
 
 Provider floor
 --------------

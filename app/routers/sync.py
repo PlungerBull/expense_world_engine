@@ -10,7 +10,6 @@ from app import db
 from app.deps import CurrentUser
 from app.errors import validation_error
 from app.helpers.formatting import apply_debit_as_negative, apply_debit_as_negative_inbox
-from app.helpers.reconciliations import resolve_home_rates
 from app.helpers.sync import (
     WILDCARD_TOKEN,
     fetch_delta,
@@ -68,14 +67,10 @@ async def sync(
                 conn, auth_user.id, x_client_id, snapshot_at
             )
 
-        # Reconciliation home-balances are computed AFTER the REPEATABLE READ
-        # transaction ends — `resolve_home_rates` reads account currencies and
-        # exchange rates via the module-level rate cache, so keeping it outside
-        # the snapshot doesn't risk delta/rate skew for the client (rates are
-        # effectively-dated, not snapshot-tied).
-        rate_by_id = await resolve_home_rates(
-            conn, auth_user.id, list(deltas["reconciliations"])
-        )
+        # Reconciliations carry no home-currency values. They are scoped to one
+        # account and therefore to one currency, so there is nothing to combine
+        # and nothing to convert (docs/rework/WP2). A rate resolution used to
+        # run here, deliberately outside the REPEATABLE READ snapshot.
 
         # Account home balances are intentionally null in sync responses;
         # clients that need them call /dashboard, which is the canonical place
@@ -96,8 +91,7 @@ async def sync(
             "inbox": inbox_rows,
             "transactions": transaction_rows,
             "reconciliations": [
-                reconciliation_from_row(r, rate_by_id.get(str(r["id"])))
-                for r in deltas["reconciliations"]
+                reconciliation_from_row(r) for r in deltas["reconciliations"]
             ],
             "settings": settings_from_row(settings_row) if settings_row else None,
         }

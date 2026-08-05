@@ -91,15 +91,18 @@ Home-currency values appear on **figures the user compares or sums across curren
 
 | Surface | Home-currency field |
 |---|---|
-| Monthly report (single month and multi-month range) | `spent_home_cents` per category and per hashtag |
+| Monthly report and `/dashboard` (they share `compute_month_flow`) | `spent_home_cents` per category and per hashtag combination |
 | Month totals | `inflow_home_cents`, `outflow_home_cents`, `net_home_cents` |
-| Dashboard archived panels | `lifetime_spent_home_cents` |
 | Account balances | `current_balance_home_cents` — the only view showing all your money at once |
-| Individual transactions and inbox items | **none** — native currency only |
+| Individual transactions, inbox items, reconciliations | **none** — native currency only |
 
-Values are **computed at read time**, never stored (see `docs/currency-model-decision.md`). Where no rate exists for a row's date, the affected figure is `null` plus an `unconverted_count` — never a native amount substituted for a home amount.
+Those report figures are the **only** cross-account aggregates, and they have no native counterpart: `GROUP BY category_id` has no currency partition, so a category holding $15 and S/25 would report `4000` — a number in no currency. Never emit a total that sums across currencies without converting.
 
-*Amended 2026-08-02. This convention previously read "every response that contains an amount must include a home-currency version", which was written for the stored-column model and made every transaction carry a PEN value no client rendered.*
+Values are **computed at read time**, never stored (`sql/021`; see `docs/currency-model-decision.md`). Conversion is a lookup of the rate for that row's date in the user's `display_timezone`, carried forward from the most recent rate on or before it. **The write path performs no rate lookup at all** — recording what happened is never blocked by a stale FX table.
+
+⚠️ **A per-row `null` is not enough — every home-currency `SUM` is paired with an `unconverted_count`.** `SUM` skips nulls, and `SUM(CASE WHEN x > 0 THEN x ELSE 0 END)` scores a null row as **zero**, so an unflagged aggregate understates in silence. A non-zero count makes the figure `null` rather than a partial total. `app/helpers/home_currency.py` is the single implementation; `UNCONVERTIBLE_FLAG_EXPR` must be projected inside the CTE and summed by name outside it.
+
+*Amended 2026-08-02, then 2026-08-05 (`docs/rework/WP2`). This convention previously read "every response that contains an amount must include a home-currency version", which was written for the stored-column model and made every transaction carry a PEN value no client rendered.*
 
 **Null over omission**
 Optional fields with no value are always returned as `null`, never omitted. Response shape never changes based on data presence.

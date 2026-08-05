@@ -8,9 +8,9 @@ regress the specific hazard the fix addressed.
     uniqueness is case-insensitive.
   * Phase 3.6 — activity_log rows carry actor_type and the GET /activity
     response exposes it.
-  * Transfer edit guard — PUT on a transfer leg rejects date / exchange_rate
-    in addition to the pre-existing amount_cents / account_id blocks, so
-    the pair can't end up on two different days or with mismatched rates.
+  * Transfer edit guard — PUT on a transfer leg rejects date in addition to
+    the pre-existing amount_cents / account_id blocks, so the pair can't end
+    up on two different days.
 """
 import uuid
 
@@ -137,15 +137,22 @@ async def test_activity_response_includes_actor_type(client, test_data):
 
 
 # ---------------------------------------------------------------------------
-# Transfer edit guard — date / exchange_rate rejected on transfer legs
+# Transfer edit guard — date rejected on transfer legs
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_transfer_edit_guard_rejects_date_and_rate(client, test_data):
-    """PUT on a transfer leg must reject `date` and `exchange_rate` with
-    422. The PUT path mutates only the edited leg, so letting either
-    through would desync the pair: different dates in the ledger, or
-    mismatched historical rates producing a pair that no longer nets
-    to zero in home currency."""
+async def test_transfer_edit_guard_rejects_date(client, test_data):
+    """PUT on a transfer leg must reject `date` with 422.
+
+    The PUT path mutates only the edited leg, so letting a date change through
+    would desync the pair — the two legs are required to share a date, and
+    splitting them across a month boundary would make @Transfer report a spread
+    that was never paid.
+
+    `exchange_rate` used to be asserted here alongside `date`. It is gone: since
+    sql/021 there is no such column and no such request field, and rejecting it
+    is now the request schema's job (`extra="forbid"`), not the transfer guard's.
+    tests/test_wp2_read_time_currency.py covers that on every affected endpoint.
+    """
     second_account_id = str(uuid.uuid4())
     async with db.pool.acquire() as conn:
         await conn.execute(
@@ -187,17 +194,16 @@ async def test_transfer_edit_guard_rejects_date_and_rate(client, test_data):
 
         async with db.pool.acquire() as conn:
             before_primary = await conn.fetchrow(
-                "SELECT date, exchange_rate, amount_home_cents FROM expense_transactions WHERE id = $1",
+                "SELECT date, amount_cents, account_id FROM expense_transactions WHERE id = $1",
                 primary_id,
             )
             before_sibling = await conn.fetchrow(
-                "SELECT date, exchange_rate, amount_home_cents FROM expense_transactions WHERE id = $1",
+                "SELECT date, amount_cents, account_id FROM expense_transactions WHERE id = $1",
                 sibling_id,
             )
 
         for field, payload in (
             ("date", {"date": "2026-04-20T12:00:00Z"}),
-            ("exchange_rate", {"exchange_rate": 1.2345}),
         ):
             r = await client.put(
                 f"/v1/transactions/{primary_id}",
@@ -211,11 +217,11 @@ async def test_transfer_edit_guard_rejects_date_and_rate(client, test_data):
 
         async with db.pool.acquire() as conn:
             after_primary = await conn.fetchrow(
-                "SELECT date, exchange_rate, amount_home_cents FROM expense_transactions WHERE id = $1",
+                "SELECT date, amount_cents, account_id FROM expense_transactions WHERE id = $1",
                 primary_id,
             )
             after_sibling = await conn.fetchrow(
-                "SELECT date, exchange_rate, amount_home_cents FROM expense_transactions WHERE id = $1",
+                "SELECT date, amount_cents, account_id FROM expense_transactions WHERE id = $1",
                 sibling_id,
             )
         assert dict(after_primary) == dict(before_primary), "primary leg was mutated by a rejected PUT"
@@ -239,79 +245,21 @@ async def test_transfer_edit_guard_rejects_date_and_rate(client, test_data):
 
 
 # ---------------------------------------------------------------------------
-# FX loud fallback — no silent 1.0 when a rate is missing
+# `test_create_transaction_rate_unavailable_raises_422` was here.
+#
+# It asserted that a USD transaction dated before any seeded rate returned 422
+# RATE_UNAVAILABLE and wrote no row — correct while the engine had to resolve a
+# rate in order to store `amount_home_cents`. sql/021 removed the stored
+# conversion, so no write resolves a rate and no write can fail this way. The
+# behaviour it pinned is now inverted: that same request must SUCCEED, because
+# recording what happened must never be blocked by a rate lookup.
+#
+# Its replacement is in tests/test_wp2_read_time_currency.py, which asserts the
+# write succeeds and the missing rate surfaces at READ time as a null figure
+# plus a non-zero `unconverted_count`.
+#
+# Its fixture date, 1900-01-01, used to be the suite's floor — it had to be
+# earlier than every other seeded rate. That constraint dies with it. The floor
+# that still matters is 1997-01-14 (test_exchange_rates_history), which is what
+# test_home_currency_parity's 1990 unconvertible assertion sits below.
 # ---------------------------------------------------------------------------
-@pytest.mark.asyncio
-async def test_create_transaction_rate_unavailable_raises_422(client, test_data):
-    """When the account's currency differs from main_currency and no
-    exchange_rates row covers the transaction date, POST /v1/transactions
-    must fail with 422 RATE_UNAVAILABLE — not silently fall back to a
-    1.0 rate that corrupts amount_home_cents. Also asserts no row was
-    written (fail-loud = no partial state)."""
-    from app.helpers.exchange_rate import clear_rate_cache
-
-    # Drop any negative-cache entries seeded by earlier tests.
-    clear_rate_cache()
-
-    usd_account_id = str(uuid.uuid4())
-    async with db.pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO expense_bank_accounts
-                (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order,
-                 created_at, updated_at)
-               VALUES ($1, $2, 'USD-No-Rate', 'USD', false, '#0000FF',
-                       0, false, 99, now(), now())""",
-            usd_account_id, test_data.user_id,
-        )
-
-    txn_id = str(uuid.uuid4())
-    try:
-        # 1900 — earlier than ANY row this suite seeds, so `rate_date <= $2`
-        # returns nothing and the lookup raises.
-        #
-        # ⚠️ This was 2000-01-01 and was flaky: ~3 runs in 5 failed. Under
-        # pytest-xdist the workers share one database, and
-        # `test_exchange_rates_history` seeds rows dated 1997-01-14/15 that are
-        # live for other workers until its teardown. A concurrent run of this
-        # test then found a rate on or before 2000 and got a 200 instead of the
-        # 422. `test_home_currency_parity` already documents the same hazard
-        # (`:204`, `:233`, `:367`) — this test predated the rule.
-        #
-        # Any fixture date must be earlier than every other seeded date. Adding
-        # a test that seeds something before 1900 breaks this one.
-        r = await client.post(
-            "/v1/transactions",
-            json={
-                "id": txn_id,
-                "title": f"rate-unavailable-{uuid.uuid4()}",
-                "amount_cents": -1000,
-                "date": "1900-01-01T12:00:00Z",
-                "account_id": usd_account_id,
-                "category_id": test_data.category_id,
-            },
-            headers={"X-Idempotency-Key": str(uuid.uuid4())},
-        )
-        assert r.status_code == 422, r.text
-        body = r.json()["error"]
-        assert body["code"] == "RATE_UNAVAILABLE", body
-        assert "exchange_rate" in (body.get("fields") or {}), body
-
-        async with db.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT id FROM expense_transactions WHERE id = $1", txn_id,
-            )
-        assert row is None, "No ledger row should be written when rate lookup fails"
-
-    finally:
-        async with db.pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM activity_log WHERE resource_id = $1", txn_id,
-            )
-            await conn.execute(
-                "DELETE FROM expense_transactions WHERE id = $1", txn_id,
-            )
-            await conn.execute(
-                "DELETE FROM expense_bank_accounts WHERE id = $1", usd_account_id,
-            )
-        clear_rate_cache()

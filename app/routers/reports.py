@@ -44,7 +44,9 @@ async def _compute_one(
     resolved_year, resolved_month, start_utc, end_utc = compute_month_bounds(
         display_timezone, year, month
     )
-    flow = await compute_month_flow(conn, user_id, start_utc, end_utc)
+    flow = await compute_month_flow(
+        conn, user_id, start_utc, end_utc, display_timezone
+    )
     return {
         "month": {"year": resolved_year, "month": resolved_month},
         "categories": flow["categories"],
@@ -66,7 +68,7 @@ async def get_monthly_report(
         description=(
             "Accepted for API consistency with other read endpoints. Monthly "
             "report aggregates are already signed by construction (per-category "
-            "spent_cents is positive for income and negative for expense; "
+            "spent_home_cents is positive for income and negative for expense; "
             "totals return split positive inflow/outflow). The flag is a no-op."
         ),
     ),

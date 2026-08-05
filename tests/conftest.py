@@ -119,11 +119,11 @@ async def _ensure_test_data(conn, data: TestData):
         )
         await conn.execute(
             """INSERT INTO expense_transactions
-                (id, user_id, title, amount_cents, amount_home_cents, transaction_type,
-                 date, account_id, category_id, exchange_rate, cleared,
+                (id, user_id, title, amount_cents, transaction_type,
+                 date, account_id, category_id, cleared,
                  created_at, updated_at)
-               VALUES ($1, $2, 'Test Tx', 5000, 5000, 1,
-                 now(), $3, $4, 1.0, false, now(), now())""",
+               VALUES ($1, $2, 'Test Tx', 5000, 1,
+                 now(), $3, $4, false, now(), now())""",
             data.transaction_id, data.user_id, data.account_id, data.category_id,
         )
         await conn.execute(
@@ -134,11 +134,13 @@ async def _ensure_test_data(conn, data: TestData):
         )
         await conn.execute(
             """INSERT INTO expense_transaction_inbox
-                (id, user_id, title, exchange_rate, status, created_at, updated_at)
-               VALUES ($1, $2, 'Test Inbox', 1.0, 1, now(), now())""",
+                (id, user_id, title, status, created_at, updated_at)
+               VALUES ($1, $2, 'Test Inbox', 1, now(), now())""",
             data.inbox_id, data.user_id,
         )
-        # Seed USD→PEN so get_rate works for USD-account conversions.
+        # Seed USD→PEN so USD-account rows convert. Since sql/021 this feeds the
+        # READ path (helpers/home_currency.py's lateral, and get_rate for account
+        # balances) — no write resolves a rate any more.
         await conn.execute(
             """INSERT INTO exchange_rates (base_currency, target_currency, rate, rate_date, created_at)
                VALUES ('USD', 'PEN', 3.4, CURRENT_DATE, now())

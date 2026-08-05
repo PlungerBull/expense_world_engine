@@ -72,7 +72,6 @@ def _body(amount_cents: int = 12500, **overrides) -> dict:
         "transaction_id": str(uuid.uuid4()),
         "amount_cents": amount_cents,
         "date": PAST_DATE,
-        "exchange_rate": 1.0,
     }
     body.update(overrides)
     return body
@@ -248,7 +247,6 @@ async def test_reports_exclude_opening_balance(client, test_data):
                 "date": "2025-11-05T12:00:00Z",
                 "account_id": account_id,
                 "category_id": test_data.category_id,
-                "exchange_rate": 1.0,
             },
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
@@ -261,9 +259,14 @@ async def test_reports_exclude_opening_balance(client, test_data):
         category_ids = {c["id"] for c in report["categories"]}
         assert opening_category_id not in category_ids
 
+        # The account is PEN, which is the home currency, so the home figure is
+        # the native amount unchanged and no rate lookup is involved. Reports
+        # carry home values only — a native cross-account total would be summing
+        # currencies that do not add up.
         totals = report["totals"]
-        assert totals["inflow_cents"] == 7777  # seed's 555500 absent
-        assert totals["net_cents"] == 7777
+        assert totals["inflow_home_cents"] == 7777  # seed's 555500 absent
+        assert totals["net_home_cents"] == 7777
+        assert totals["unconverted_count"] == 0
 
         # Rename tolerance: exclusion keys off system_key, not the name.
         r = await client.put(
@@ -276,7 +279,7 @@ async def test_reports_exclude_opening_balance(client, test_data):
         r = await client.get("/v1/reports/monthly", params={"year": 2025, "month": 11})
         report = r.json()
         assert opening_category_id not in {c["id"] for c in report["categories"]}
-        assert report["totals"]["inflow_cents"] == 7777
+        assert report["totals"]["inflow_home_cents"] == 7777
 
         # The one-per-account guard also survives the rename.
         r = await _post_opening(client, account_id, _body(1000))

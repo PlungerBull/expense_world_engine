@@ -199,11 +199,18 @@ this program removes:
 | Bug | Closed by |
 |---|---|
 | 3.1 — delta sync can permanently drop committed writes | WP4, by deletion |
-| 1.4 — inbox items promote at exchange rate 1.0 | WP2, by deletion |
-| 1.5 — changing `account_id` never re-rates | WP2, by deletion |
-| ~~1.3 — every USD→USD transfer returns 500~~ | ✅ **Closed by WP1**, by repair rather than deletion — owner decision, see below |
+| ~~1.4 — inbox items promote at exchange rate 1.0~~ | ✅ **Closed by WP2**, by deletion |
+| ~~1.5 — changing `account_id` never re-rates~~ | ✅ **Closed by WP2**, by deletion |
+| ~~2.3 — `resolve_home_rates` reads an account with no `user_id` filter~~ | ✅ **Closed by WP2**, by deletion — a live cross-tenant read while it lasted |
+| ~~1.3 — every USD→USD transfer returns 500~~ | ✅ **Closed by WP1**, by repair rather than deletion — owner decision, see below. WP2 then deleted the block it lived in, so it is now unrepresentable as well |
 | ~~1.2 — surviving dominant-side implementation is the buggy one~~ | ✅ **Closed by WP1** with 1.3 |
 | 4.1 — expired idempotency keys duplicate financial writes | **Nothing.** Survives the program. |
+
+**WP2 opened one, too.** Removing `exchange_rate` and `amount_home_cents` from the
+transfer-leg edit guard left `{amount_cents, account_id, date}` — a deny-list, which is
+the shape `CLAUDE.md`'s "fix at the root" corollary warns about, and `category_id` is
+still not in it. Filed as **6.5**; out of WP2's scope, and `CLAUDE.md` currently claims
+this guard was already inverted to an allow-list, which it was not.
 
 > **WP1 deviated from its stated scope here, deliberately.** 1.3 would *not* have fallen out
 > of the transfer collapse — the `raise RuntimeError` is in the dominant-side currency block,
@@ -214,9 +221,13 @@ this program removes:
 > `amount × rate`.
 >
 > **The block still forces the two legs to net to zero, so no FX spread is visible yet.**
-> That was the owner's explicit choice: WP2 should delete the forcing rule *and* introduce
-> `@FX` in one change, so the spread first appears already in its own category rather than
-> spending a package mixed into `@Transfer` alongside loans to people. WP2 inherits an
-> already-correct branch order to delete, not a buggy one.
+> WP2 inherits an already-correct branch order to delete, not a buggy one.
+>
+> ⚠️ **Correction, 2026-08-05.** This note originally said the owner had chosen to have
+> WP2 introduce `@FX` alongside deleting the forcing rule. When the choice was put with
+> real numbers — a $1,000 → S/3,450 exchange at a market rate of 3.58, and where the
+> resulting S/130 should appear — **the owner chose to leave the spread in `@Transfer`**.
+> `@FX` stays deferred exactly as `docs/currency-model-decision.md` has always said. WP2
+> shipped that way.
 
 Delete the row from `open-bugs.md` when it closes — it is a work queue, not a changelog.

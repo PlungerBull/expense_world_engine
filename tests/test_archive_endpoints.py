@@ -372,20 +372,32 @@ async def test_sync_payload_includes_is_archived_field(client, test_data):
 
 
 @pytest.mark.asyncio
-async def test_dashboard_default_omits_archived_panels(client):
-    """Without the flag, the three archived fields are present and null."""
+async def test_dashboard_default_omits_archived_accounts(client):
+    """Without the flag, `archived_accounts` is present and null.
+
+    There is exactly one archived panel now. `archived_categories` and
+    `archived_hashtags` were deleted with the read-time currency work
+    (docs/rework/WP2): archiving a category was never distinct from soft
+    deleting it — `deleted_at` already hides a row from pickers while leaving
+    its past transactions intact — and those two panels were the last readers
+    of `is_archived` on those tables. An archived ACCOUNT still holds real
+    money, which is why this one survives.
+    """
     r = await client.get("/v1/dashboard")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["archived_accounts"] is None
-    assert body["archived_categories"] is None
-    assert body["archived_hashtags"] is None
+    assert "archived_categories" not in body
+    assert "archived_hashtags" not in body
 
 
 @pytest.mark.asyncio
-async def test_dashboard_include_archived_returns_lifetime_totals(client, test_data):
-    """Flag flips the three panels on. Archived category lifetime total
-    matches the signed sum of every transaction ever attributed to it.
+async def test_dashboard_include_archived_returns_accounts_only(client, test_data):
+    """The flag turns on `archived_accounts`, and nothing else.
+
+    An archived category still appears in the monthly report — `compute_month_flow`
+    deliberately has no `is_archived` filter, so the visible rows keep summing to
+    the total — it simply has no lifetime panel of its own any more.
     """
     # Create a category, attach a -300 expense, then archive it.
     cat_id = str(uuid.uuid4())
@@ -424,19 +436,22 @@ async def test_dashboard_include_archived_returns_lifetime_totals(client, test_d
         body = r.json()
         assert body["archived_accounts"] is not None
         assert isinstance(body["archived_accounts"], list)
-        assert body["archived_categories"] is not None
-        assert body["archived_hashtags"] is not None
+        assert "archived_categories" not in body
+        assert "archived_hashtags" not in body
 
+        # The archived category is still reportable — its money did not vanish
+        # with its panel. test_data.account_id is PEN, the home currency, so the
+        # -300 converts to itself.
+        r = await client.get("/v1/reports/monthly", params={"year": 2026, "month": 1})
+        assert r.status_code == 200, r.text
         archived_cat = next(
-            (c for c in body["archived_categories"] if c["id"] == cat_id),
-            None,
+            (c for c in r.json()["categories"] if c["id"] == cat_id), None,
         )
         assert archived_cat is not None, (
-            f"newly-archived category {cat_id} not surfaced in archived_categories"
+            f"archived category {cat_id} disappeared from the monthly report"
         )
-        # Expense of -300 → signed lifetime_spent_cents is -300.
-        assert archived_cat["lifetime_spent_cents"] == -300
-        assert archived_cat["lifetime_spent_home_cents"] == -300
+        assert archived_cat["spent_home_cents"] == -300
+        assert archived_cat["unconverted_count"] == 0
         assert archived_cat["name"] == cat_name
     finally:
         async with db.pool.acquire() as conn:
@@ -641,10 +656,10 @@ async def test_inbox_promote_rejects_archived_category(client, test_data):
             """
             INSERT INTO expense_transaction_inbox
                 (id, user_id, title, amount_cents, transaction_type, date,
-                 account_id, category_id, exchange_rate, status,
+                 account_id, category_id, status,
                  created_at, updated_at)
             VALUES ($1, $2, 'guard-promote', 100, 1, now(),
-                    $3, $4, 1.0, 1, now(), now())
+                    $3, $4, 1, now(), now())
             """,
             inbox_id, test_data.user_id, test_data.account_id, cat_id,
         )
@@ -685,10 +700,10 @@ async def test_inbox_ready_filter_excludes_archived_category(client, test_data):
             """
             INSERT INTO expense_transaction_inbox
                 (id, user_id, title, amount_cents, transaction_type, date,
-                 account_id, category_id, exchange_rate, status,
+                 account_id, category_id, status,
                  created_at, updated_at)
             VALUES ($1, $2, 'guard-ready', 100, 1, now(),
-                    $3, $4, 1.0, 1, now(), now())
+                    $3, $4, 1, now(), now())
             """,
             inbox_id, test_data.user_id, test_data.account_id, cat_id,
         )

@@ -83,8 +83,10 @@ async def test_usd_to_usd_transfer_succeeds(client, test_data):
     """A transfer between two USD accounts under a PEN home currency.
 
     Before WP1 the dominant-side block had no rule for "neither leg matches
-    main_currency" and fell to ``raise RuntimeError``, uncaught, 500. The
-    reordered block values the primary at the real market rate instead.
+    main_currency" and fell to ``raise RuntimeError``, uncaught, 500. WP1
+    reordered the block to value the primary at the market rate; WP2 then
+    deleted the block outright, so there is no branch left to fall off. The bug
+    went from repaired to unrepresentable, and this test still pins it.
     """
     from_id = await _make_account(test_data.user_id, "USD", "wp1-usd-from")
     to_id = await _make_account(test_data.user_id, "USD", "wp1-usd-to")
@@ -117,17 +119,21 @@ async def test_usd_to_usd_transfer_succeeds(client, test_data):
 
 
 @pytest.mark.asyncio
-async def test_home_currency_primary_ignores_a_supplied_rate(client, test_data):
-    """A PEN primary is worth its own amount, whatever rate the caller sends.
+async def test_transfer_rejects_a_supplied_exchange_rate(client, test_data):
+    """A caller cannot supply an exchange rate on a transfer. There is nowhere
+    to put one.
 
-    The other half of open bug 1.3. The dominant-side block used to test the
-    caller's ``exchange_rate`` override *before* the currency-match rule
-    (violating engine-spec §Transfers point 7), so a home-currency primary with
-    a supplied rate computed ``home = amount × rate`` — 5000 × 3.5 = 17500 for
-    an amount that is, definitionally, S/50.00 in soles.
+    This test used to assert the opposite half of open bug 1.3: that a PEN
+    primary was worth its own amount *whatever* rate the caller sent, because
+    the dominant-side block tested the override before the currency-match rule
+    and computed ``home = amount × rate`` — 5000 × 3.5 = 17500 for an amount
+    that is, definitionally, S/50.00 in soles.
+
+    sql/021 deleted the block, the columns and the request field together, so
+    the question stops being "which rate wins" and becomes "why is the client
+    sending a rate at all". Fail closed: 422.
     """
     sibling = await _make_account(test_data.user_id, "PEN", "wp1-pen-sibling")
-    primary_id = sibling_id = None
     try:
         r = await client.post(
             "/v1/transactions",
@@ -146,20 +152,9 @@ async def test_home_currency_primary_ignores_a_supplied_rate(client, test_data):
             },
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
-        assert r.status_code == 201, r.text
-        primary_id = r.json()["id"]
-        sibling_id = r.json()["transfer_transaction_id"]
-
-        async with db.pool.acquire() as conn:
-            primary = await conn.fetchrow(
-                "SELECT amount_cents, amount_home_cents, exchange_rate"
-                " FROM expense_transactions WHERE id = $1",
-                primary_id,
-            )
-        assert primary["amount_home_cents"] == 5000, "a PEN amount is its own home value"
-        assert float(primary["exchange_rate"]) == 1.0
+        assert r.status_code == 422, r.text
+        assert "exchange_rate" in (r.json()["error"].get("fields") or {}), r.text
     finally:
-        await _drop_transactions(primary_id, sibling_id)
         await _drop_accounts(sibling)
 
 
@@ -168,12 +163,13 @@ async def test_home_currency_primary_ignores_a_supplied_rate(client, test_data):
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_transfer_legs_cancel(client, test_data):
-    """One outflow, one inflow, cancelling in native and home currency alike.
+    """One outflow, one inflow, cancelling in the account's own currency.
 
-    Same-currency, so native and home say the same thing. The cross-currency
-    home-value case is forced to zero by the dominant-side rule that WP2
-    deletes — see docs/currency-model-decision.md on what @Transfer ≠ 0 will
-    mean afterwards.
+    Same-currency, so the home figure says the same thing — and after WP2 it
+    says it because both legs converted at the same rate for the same date, not
+    because a write-time rule forced them equal. The cross-currency case no
+    longer cancels: it reports the FX spread, which
+    tests/test_wp2_read_time_currency.py covers.
     """
     sibling = await _make_account(test_data.user_id, "PEN", "wp1-cancel")
     primary_id = sibling_id = None
@@ -201,7 +197,7 @@ async def test_transfer_legs_cancel(client, test_data):
         async with db.pool.acquire() as conn:
             legs = await conn.fetch(
                 """
-                SELECT id, transaction_type, amount_cents, amount_home_cents,
+                SELECT id, transaction_type, amount_cents,
                        transfer_transaction_id
                 FROM expense_transactions
                 WHERE id = ANY($1::uuid[])
@@ -224,9 +220,7 @@ async def test_transfer_legs_cancel(client, test_data):
         assert str(inflow["transfer_transaction_id"]) == str(outflow["id"])
 
         signed_native = -outflow["amount_cents"] + inflow["amount_cents"]
-        signed_home = -outflow["amount_home_cents"] + inflow["amount_home_cents"]
         assert signed_native == 0
-        assert signed_home == 0
     finally:
         await _drop_transactions(primary_id, sibling_id)
         await _drop_accounts(sibling)
@@ -256,9 +250,9 @@ async def test_ledger_rejects_a_transaction_type_outside_the_direction_enum(
                 """
                 INSERT INTO expense_transactions
                     (id, user_id, title, amount_cents, transaction_type,
-                     date, account_id, category_id, exchange_rate,
+                     date, account_id, category_id,
                      created_at, updated_at)
-                VALUES ($1, $2, 'bad-type', 1000, $3, now(), $4, $5, 1.0, now(), now())
+                VALUES ($1, $2, 'bad-type', 1000, $3, now(), $4, $5, now(), now())
                 """,
                 str(uuid.uuid4()), test_data.user_id, bad_type,
                 test_data.account_id, test_data.category_id,
@@ -316,13 +310,13 @@ async def test_transfer_cancels_in_the_monthly_report(client, test_data):
 
         transfer_cat = [c for c in body["categories"] if c["name"] == "@Transfer"]
         assert transfer_cat, "the engine must have created @Transfer"
-        assert transfer_cat[0]["spent_cents"] == 0, "the two legs must cancel"
-        assert transfer_cat[0]["spent_home_cents"] == 0
+        assert transfer_cat[0]["spent_home_cents"] == 0, "the two legs must cancel"
+        assert transfer_cat[0]["unconverted_count"] == 0
 
         # Both legs are counted — gross volume moves, net does not.
-        assert after["outflow_cents"] == before["outflow_cents"] + 7500
-        assert after["inflow_cents"] == before["inflow_cents"] + 7500
-        assert after["net_cents"] == before["net_cents"]
+        assert after["outflow_home_cents"] == before["outflow_home_cents"] + 7500
+        assert after["inflow_home_cents"] == before["inflow_home_cents"] + 7500
+        assert after["net_home_cents"] == before["net_home_cents"]
     finally:
         await _drop_transactions(primary_id, sibling_id)
         await _drop_accounts(sibling)
@@ -342,9 +336,9 @@ async def test_ledger_rejects_a_negative_amount(test_data):
                 """
                 INSERT INTO expense_transactions
                     (id, user_id, title, amount_cents, transaction_type,
-                     date, account_id, category_id, exchange_rate,
+                     date, account_id, category_id,
                      created_at, updated_at)
-                VALUES ($1, $2, 'negative', -1000, 1, now(), $3, $4, 1.0, now(), now())
+                VALUES ($1, $2, 'negative', -1000, 1, now(), $3, $4, now(), now())
                 """,
                 str(uuid.uuid4()), test_data.user_id,
                 test_data.account_id, test_data.category_id,

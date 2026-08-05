@@ -347,9 +347,12 @@ async def test_restore_reconciliation_round_trip(client, test_data):
         assert restore_r.status_code == 200, restore_r.text
         body = restore_r.json()
         assert body["deleted_at"] is None
-        # Home-cents fields populated for active rows.
-        assert "beginning_balance_home_cents" in body
-        assert "ending_balance_home_cents" in body
+        # Native balances only — a reconciliation is scoped to one account and
+        # therefore to one currency, so it has nothing to convert (WP2).
+        assert body["beginning_balance_cents"] is not None
+        assert body["ending_balance_cents"] is not None
+        assert "beginning_balance_home_cents" not in body
+        assert "ending_balance_home_cents" not in body
 
         assert await _activity_actions(recon_id, test_data.user_id) == [1, 3, 4]
 

@@ -7,7 +7,6 @@ This module is the most complex service in the codebase because transactions
 intersect with every other domain:
 
   * account balances (via helpers.balance)
-  * exchange rates (via helpers.exchange_rate)
   * hashtag junction rows (via the private ``_sync_hashtags``)
   * transfer pair atomicity (via helpers.transfers.create_transfer_pair)
   * reconciliation field-locking and cascade unassignment
@@ -44,7 +43,6 @@ from app.constants import ActivityAction, ReconciliationStatus, TransactionType
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance, reverse_balance
-from app.helpers.exchange_rate import lookup_exchange_rate
 from app.helpers.query_builder import dynamic_update
 from app.helpers.validation import validate_active_account, validate_active_category
 from app.schemas.transactions import (
@@ -237,9 +235,14 @@ async def create_transaction(
     update atomically) and then syncs hashtags on the primary leg.
 
     Otherwise validates account/category existence, infers
-    ``transaction_type`` from the sign of ``amount_cents``, looks up the
-    exchange rate if not provided, inserts the row, applies the balance
-    delta, syncs hashtags, and writes an activity log entry.
+    ``transaction_type`` from the sign of ``amount_cents``, inserts the row,
+    applies the balance delta, syncs hashtags, and writes an activity log entry.
+
+    **No currency work happens here.** The row is stored in its account's own
+    currency and converted at read time (helpers/home_currency.py). Recording
+    what happened is never blocked by a rate lookup — so a cross-currency write
+    succeeds while the FX job is stale, and a transaction dated before the
+    provider floor is recordable. sql/021 has the reasoning.
 
     Raises:
         validation_error: any field validation or referential check fails.
@@ -285,7 +288,6 @@ async def create_transaction(
             primary_amount_cents=body.amount_cents,
             primary_account_id=body.account_id,
             primary_date=body.date,
-            primary_exchange_rate=body.exchange_rate,
             primary_cleared=body.cleared if body.cleared is not None else False,
             transfer_account_id=body.transfer.account_id,
             transfer_amount_cents=body.transfer.amount_cents,
@@ -313,21 +315,15 @@ async def create_transaction(
     transaction_type = infer_transaction_type(body.amount_cents)
     amount_cents = abs(body.amount_cents)
 
-    # Exchange rate — use caller override or fetch from rate table
-    exchange_rate = body.exchange_rate
-    if exchange_rate is None:
-        exchange_rate = await lookup_exchange_rate(conn, body.account_id, body.date, user_id)
-    amount_home_cents = round(amount_cents * exchange_rate)
-
     # Insert
     try:
         row = await conn.fetchrow(
             """
             INSERT INTO expense_transactions
-                (id, user_id, title, description, amount_cents, amount_home_cents,
-                 transaction_type, date, account_id, category_id, exchange_rate,
+                (id, user_id, title, description, amount_cents,
+                 transaction_type, date, account_id, category_id,
                  cleared, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
             RETURNING *
             """,
             body.id,
@@ -335,12 +331,10 @@ async def create_transaction(
             body.title.strip(),
             body.description,
             amount_cents,
-            amount_home_cents,
             transaction_type,
             body.date,
             body.account_id,
             body.category_id,
-            exchange_rate,
             body.cleared if body.cleared is not None else False,
         )
     except asyncpg.UniqueViolationError:
@@ -384,9 +378,9 @@ async def update_transaction(
     """Apply a partial update to a transaction.
 
     This is the most intricate service function in the codebase. The
-    ``fields`` dict is mutated in place as derived columns (``transaction_type``,
-    ``amount_home_cents``, re-fetched ``exchange_rate``) are computed from
-    the requested changes. Balance reversal + re-apply happens in the
+    ``fields`` dict is mutated in place as derived columns (``transaction_type``
+    from the sign of ``amount_cents``) are computed from the requested
+    changes. Balance reversal + re-apply happens in the
     middle of the flow so the account balance reflects the new state
     before the final dynamic UPDATE runs.
 
@@ -488,17 +482,22 @@ async def update_transaction(
             )
 
     # Transfer edit guard — reject changes that would desync the pair.
-    # date / exchange_rate / amount_home_cents are blocked because this
-    # PUT path mutates only the edited leg: a date change re-fetches the
-    # rate for this leg but leaves the sibling on its original rate, so
-    # the pair stops netting to zero in home currency (and lands on two
-    # different days in the ledger). Transfers are edited by delete +
-    # recreate.
+    # ``date`` is blocked because this PUT path mutates only the edited leg,
+    # and both legs of a pair are required to share ``primary_date`` — a
+    # one-sided date change lands them in different months, which is what
+    # would let @Transfer report a spread that was never paid. Transfers are
+    # edited by delete + recreate.
+    #
+    # ``exchange_rate`` and ``amount_home_cents`` used to be in this set;
+    # sql/021 deleted both columns, so there is nothing left to block.
+    #
+    # ⚠️ This is a deny-list, which is the shape CLAUDE.md's "fix at the root"
+    # corollary warns about: ``category_id`` is absent, so one leg of a pair
+    # can still be moved out of @Transfer, stranding the other with nothing to
+    # cancel against. Inverting it to an allow-list is the real fix; it is out
+    # of WP2's scope and is filed in docs/open-bugs.md.
     if before_row["transfer_transaction_id"] is not None:
-        blocked = {
-            "amount_cents", "account_id",
-            "date", "exchange_rate", "amount_home_cents",
-        } & fields.keys()
+        blocked = {"amount_cents", "account_id", "date"} & fields.keys()
         if blocked:
             raise validation_error(
                 "Transfer edits not yet supported.",
@@ -519,17 +518,13 @@ async def update_transaction(
         fields["amount_cents"] = abs(fields["amount_cents"])
         needs_balance_update = True
 
-    # Process date change — re-fetch exchange rate (unless user provided one)
-    if "date" in fields and "exchange_rate" not in fields:
-        effective_account_id = fields.get("account_id") or str(before_row["account_id"])
-        new_rate = await lookup_exchange_rate(conn, effective_account_id, fields["date"], user_id)
-        fields["exchange_rate"] = new_rate
-
-    # Recalculate amount_home_cents when amount or exchange_rate changes
-    if "amount_cents" in fields or "exchange_rate" in fields:
-        effective_amount = fields.get("amount_cents", before_row["amount_cents"])
-        effective_rate = fields.get("exchange_rate", float(before_row["exchange_rate"]))
-        fields["amount_home_cents"] = round(effective_amount * effective_rate)
+    # No re-rating happens here, and that is the whole of open bug 1.5.
+    # This is where a `date`-keyed re-rate block used to live: it refreshed
+    # `exchange_rate` and recomputed `amount_home_cents`, but only when the
+    # request changed `date`. The ACCOUNT decides the currency, so an
+    # `account_id`-only PUT moved the balance correctly and left the stored
+    # conversion pointing at the old currency forever. sql/021 deleted the
+    # columns; there is no longer a derived value to keep in sync.
 
     # Validate new account_id if changing
     if "account_id" in fields:
@@ -1205,19 +1200,18 @@ async def create_batch(
         transaction_type = infer_transaction_type(item.amount_cents)
         amount_cents = abs(item.amount_cents)
 
-        exchange_rate = item.exchange_rate
-        if exchange_rate is None:
-            exchange_rate = await lookup_exchange_rate(conn, item.account_id, item.date, user_id)
-        amount_home_cents = round(amount_cents * exchange_rate)
-
+        # No rate lookup per item. This used to fire one `lookup_exchange_rate`
+        # round-trip for every transaction in the batch — an N-query loop inside
+        # the one path built specifically to avoid them (see the balance-delta
+        # accumulation below, which does K UPDATEs for N items).
         try:
             row = await conn.fetchrow(
                 """
                 INSERT INTO expense_transactions
-                    (id, user_id, title, description, amount_cents, amount_home_cents,
-                     transaction_type, date, account_id, category_id, exchange_rate,
+                    (id, user_id, title, description, amount_cents,
+                     transaction_type, date, account_id, category_id,
                      cleared, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
                 RETURNING *
                 """,
                 item.id,
@@ -1225,12 +1219,10 @@ async def create_batch(
                 item.title.strip(),
                 item.description,
                 amount_cents,
-                amount_home_cents,
                 transaction_type,
                 item.date,
                 item.account_id,
                 item.category_id,
-                exchange_rate,
                 item.cleared if item.cleared is not None else False,
             )
         except asyncpg.UniqueViolationError:

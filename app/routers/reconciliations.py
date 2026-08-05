@@ -73,9 +73,6 @@ async def list_reconciliations(
         )
 
         rows_list = list(rows)
-        rate_by_id = await reconciliations_service.resolve_home_rates(
-            conn, auth_user.id, rows_list,
-        )
         # Resolve chained-from neighbor per row for chained sources.
         # Manual rows always emit null. Walking sort_order on the same
         # rows we already fetched would require building a neighbor map
@@ -94,7 +91,6 @@ async def list_reconciliations(
             data.append(
                 reconciliation_from_row(
                     row,
-                    rate_by_id.get(str(row["id"])),
                     chained_from_reconciliation_id=chained_from,
                 )
             )

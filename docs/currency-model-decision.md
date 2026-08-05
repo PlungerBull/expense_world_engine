@@ -1,8 +1,15 @@
 # Currency Model — Decision, 2026-08-01
 
-**Status: decided, not yet implemented.** This document is the design record. The
-code change it describes is scheduled ahead of WP1.3/1.4/1.5, which it deletes
-rather than fixes.
+**Status: shipped 2026-08-05 as `sql/021` (`docs/rework/WP2`).** This document is
+the design record and it survives the rework. It deleted audit findings 1.2, 1.4
+and 1.5 rather than fixing them; 1.3 was repaired by WP1 first and is now
+unrepresentable as well.
+
+Three things this document said that turned out to need correcting, all fixed
+inline below: the migration is `sql/021`, not `sql/019` (019 and 020 were consumed
+by the transfer collapse); account balances keep their home value, which the
+"Where currency appears" table denied; and reconciliations lost theirs, which the
+same table had flagged as a "known inconsistency, deliberately left".
 
 ---
 
@@ -25,22 +32,35 @@ too — the convention inherited from the stored-column model. It doesn't.
 | Level | Native | PEN |
 |---|---|---|
 | Individual records — transactions, inbox items | **only** | none |
-| Per-account figures — balances, reconciliations | **only** | none |
+| Reconciliations — scoped to one account | **only** | none |
+| Account balances | yes | **yes** — `current_balance_home_cents` |
 | Cross-account aggregates — category, hashtag, month totals | none | **only** |
 
 **The reasoning is one sentence: conversion belongs wherever currencies are
 combined, and nowhere else.** A transaction belongs to one account, so it is in one
-currency — a second number on the row is noise. A balance and a reconciliation are
-scoped to one account, so the same holds. Only an aggregate spans accounts, and
-categories and hashtags are **assumed** to span currencies rather than checked.
+currency — a second number on the row is noise. A reconciliation is scoped to one
+account, so the same holds. An aggregate spans accounts, and categories and
+hashtags are **assumed** to span currencies rather than checked.
+
+**Account balances are the one deliberate exception, and they earn it.** A single
+balance is single-currency like a reconciliation — but the account *list* is the
+only surface that shows all your money at once, and reading `S/8,500` beside
+`$1,200` with no common unit is the thing that makes the list unusable. So the
+balance keeps `current_balance_home_cents`, computed at **today's** rate, and the
+Python half of the conversion rule (`helpers/exchange_rate.get_rate`,
+`batch_get_rates`) stays alive to serve it. `CLAUDE.md`'s home-currency table is
+authoritative on this; an earlier revision of this document said per-account
+figures were native-only, and that was never implemented.
 
 Two consequences worth stating outright, because both look like omissions:
 
-- **There is no net-worth total.** Nothing sums balances across accounts. You read
-  S/8,500 and $1,200 side by side.
+- **There is no net-worth total.** Nothing sums balances across accounts, even
+  though each one carries a PEN figure. The conversion is there so the rows are
+  comparable, not so they can be added.
 - **A category whose date has no rate reports nothing at all** —
   `spent_home_cents: null` with no native figure beside it, because the native
-  aggregate was removed as meaningless. Fail-closed, by design.
+  aggregate was removed as meaningless, plus an `unconverted_count` saying how
+  many rows are behind the null. Fail-closed, by design.
 
 ### What re-adding a per-record or per-account PEN value would cost
 
@@ -123,7 +143,8 @@ not either recoverable or a reporting choice.** Dropping it loses nothing.
 
 ## Schema change
 
-Migration `sql/019`.
+Migration **`sql/021`**. (This document originally said `sql/019`; that number and
+`sql/020` went to the transfer collapse in the meantime.)
 
 ### Dropped
 
@@ -169,10 +190,13 @@ key on every transaction forever is dead weight.
 only thing that converts — that part never changes — but the obligation applies to
 cross-currency figures, not to every amount.
 
-**Known inconsistency, deliberately left:** reconciliations still expose
+~~**Known inconsistency, deliberately left:** reconciliations still expose
 `beginning_balance_home_cents` / `ending_balance_home_cents` even though a
-reconciliation belongs to one account and is therefore single-currency. The
-chaining retirement reworks them wholesale; it settles this.
+reconciliation belongs to one account and is therefore single-currency.~~
+**Settled 2026-08-05.** Both fields are gone, and `resolve_home_rates` with them —
+which also closed audit finding 2.3, a live cross-tenant read (it selected accounts
+with no `user_id` predicate, and engine-side scoping is the only tenant guard there
+is while RLS stays inert). It did not wait for the chaining retirement.
 
 ---
 
@@ -310,18 +334,21 @@ COALESCE(t.amount_home_cents, t.amount_cents)
 ```
 
 which falls back to **treating USD cents as PEN cents** — a 3.58× understatement
-rendered without complaint. That fallback is removed. It appears **12 times across
-three sites**: `helpers/monthly_report.py:119-122` and `:198-201`, plus
-`routers/dashboard.py:114-117` (`_SIGNED_HOME_CENTS_SQL`, used by both
-archived-lifetime aggregators).
+rendered without complaint. That fallback is gone, and it was resolved by
+construction rather than by editing four call sites: once the column is dropped,
+the SQL cannot run. It lived in `helpers/monthly_report.py` and
+`routers/dashboard.py`, as the `_SIGNED_HOME_CENTS_SQL` both modules built.
 
 **A per-row `null` is not sufficient on its own.** `SUM` silently skips `NULL`s,
 and `SUM(CASE WHEN x > 0 THEN x ELSE 0 END)` silently scores a `NULL` row as zero,
 so an unflagged aggregate understates exactly like the fallback it replaced. Every
 home-value `SUM` must be paired with a count of unconvertible rows, and a non-zero
 count makes the aggregate `null` rather than a partial total.
-`app/helpers/home_currency.py` exports `UNCONVERTIBLE_FLAG_EXPR` for this;
-`docs/rework/WP2` wires it into the read paths.
+`app/helpers/home_currency.py` exports `UNCONVERTIBLE_FLAG_EXPR` for this, and
+`helpers/monthly_report.compute_month_flow` is the one caller that uses it — on the
+breakdown rows, on the category totals rolled up from them, and on the month
+totals. The flag must be projected inside the CTE and summed by name outside it:
+the `a` and `r` aliases do not exist in the outer `SELECT`.
 
 **Why the write should no longer fail.** Recording what happened must never be
 blocked by a rate lookup. Two consequences worth having:
@@ -352,8 +379,9 @@ Two consequences to know:
 - **This diverges from the write path**, which resolves rates from the *client's*
   offset date (`body.date` is an `AwareDatetime`; Pydantic preserves the offset).
   That offset is not recoverable from a stored `timestamptz`, so read-time SQL
-  cannot reproduce it. The divergence is deliberate, and it disappears once
-  `docs/rework/WP2` removes rate resolution from writes entirely.
+  cannot reproduce it. ~~The divergence is deliberate~~ — **and it is gone as of
+  `sql/021`: no write resolves a rate, so there is only one rate date and it is
+  this one.**
 - **`display_timezone` is unvalidated user input** (`sql/002:22`, settable via
   `PUT /auth/settings`). It must reach SQL as a bind parameter, never interpolated.
   `compute_month_bounds` silently falls back to UTC on an invalid zone name while
@@ -364,7 +392,15 @@ Two consequences to know:
 
 ## Deferred: `@FX`
 
-**Not shipping now. Free to add later.**
+**Not shipping. Reaffirmed by the owner on 2026-08-05, when WP2 made the spread
+visible for the first time and the question became live rather than theoretical.**
+
+> ⚠️ Two forward-looking notes elsewhere promised the opposite — the WP1 postscript
+> in `docs/rework/README.md` and the closing bullet of the 2026-08-05 entry in
+> `docs/client-breaking-changes.md` both said WP2 would introduce `@FX`. Both are
+> superseded. The spread lands in `@Transfer`.
+
+Free to add later.
 
 Splitting the FX spread into its own `@FX` category would let `@Transfer` mean
 only "lending flow" and read 0 for every currency exchange:
@@ -400,7 +436,9 @@ only: no migration, no data change, no write-contract change.
 
 **Revisit when:** `@Transfer` carrying two meanings at once (money moved to a
 person / cost of exchanging currency) becomes annoying in daily use. That is the
-real argument for it, and real usage should decide.
+real argument for it, and real usage should decide. As of 2026-08-05 the ledger
+holds no real transactions, so there is no usage to decide with — which is the
+whole reason the answer stayed "later".
 
 ---
 
@@ -420,7 +458,7 @@ trustworthy FX indicator.
 |---|---|---|
 | 1 | `POST /transactions` accepts a system `category_id` | `validate_active_category` (`helpers/validation.py:94-114`) checks `deleted_at` and `is_archived` but **not `is_system`**; no other guard found |
 | 2 | `PUT /transactions/{id}` can move an ordinary transaction *into* a system category | same missing check |
-| 3 | `PUT /transactions/{id}` can move a transfer leg *out of* `@Transfer` | the transfer edit guard (`helpers/transactions.py:497-506`) blocks `amount_cents`, `account_id`, `date`, `exchange_rate`, `amount_home_cents` — **`category_id` is not in the set** |
+| 3 | `PUT /transactions/{id}` can move a transfer leg *out of* `@Transfer` | the transfer edit guard in `helpers/transactions.update_transaction` blocks `amount_cents`, `account_id`, `date` — **`category_id` is not in the set**, and it is a deny-list, which is the shape that produces exactly this omission. Filed as open bug **6.5** on 2026-08-05. |
 
 Hole 3 is the mirror image of 1 and 2 and breaks the invariant just as
 effectively: re-categorising one leg of a pair leaves the other stranded in
@@ -485,20 +523,32 @@ wanted, the correct model is an amount pair, as a new feature, not a rate column
 
 ## Migration cost
 
-**`expense_transactions` and `expense_reconciliations` both hold 0 rows (verified
-2026-08-01).** There is no data migration. This is the cheapest this change will
-ever be, and it shares that window with the reconciliation-chaining retirement
-([TODO.md](../TODO.md)).
+**`expense_transactions` and `expense_reconciliations` both held 0 rows (verified
+2026-08-01, re-verified before `sql/021` ran).** There was no data migration.
 
-Work: one migration dropping three columns; ~60 lines deleted from
-`helpers/transfers.py` (the whole dominant-side block, `:118-176`); the re-rate
-guards deleted from `helpers/transactions.py:523,529` and `helpers/inbox.py:304`;
-the 8 `COALESCE(t.amount_home_cents, …)` arms in `helpers/monthly_report.py`
-replaced with a lateral join to `exchange_rates`; `routers/dashboard.py` likewise;
-CLI changes above.
+What it actually cost, for the record: one migration dropping three columns; the
+whole dominant-side block deleted from `helpers/transfers.py`, taking its
+`user_settings` round-trip with it; the re-rate blocks deleted from
+`helpers/transactions.py` and `helpers/inbox.py`; `lookup_exchange_rate` and
+`errors.rate_unavailable` deleted as unreachable; `resolve_home_rates` deleted
+with the reconciliation home fields; `helpers/monthly_report.py` rebuilt around
+`helpers/home_currency.py`'s lateral join; the dashboard's two archived-lifetime
+aggregators deleted outright.
 
 The lateral join is simple because only two currencies exist: PEN resolves to
 1.0, USD to one row per date.
+
+Two things the estimate missed, both worth knowing before a similar change:
+
+- **The write path stops being able to fail.** Deleting the rate lookup deleted a
+  whole error code, and with it a test that asserted the write must 422. That test
+  had to be deleted deliberately, not adapted — its replacement asserts the
+  opposite outcome for the same request.
+- **`SUM` does not propagate the null.** Making the per-row value nullable is the
+  easy half. `SUM(CASE WHEN x > 0 THEN x ELSE 0 END)` scores a null as **zero**, so
+  every aggregate needed a paired `unconverted_count` and a Python-side null-out.
+  See "Missing-rate policy" above — it is the part most likely to be quietly
+  dropped by a future edit.
 
 ---
 
