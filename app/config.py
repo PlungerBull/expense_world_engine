@@ -11,9 +11,12 @@ _REMOTE_DB_OPT_IN = "EXPENSE_ALLOW_REMOTE_DB"
 
 
 class Settings(BaseSettings):
-    supabase_url: str
     supabase_db_url: str
-    supabase_jwt_secret: str
+
+    # `supabase_url` and `supabase_jwt_secret` were removed 2026-08-03 with the
+    # JWT auth branch (audit 2.1). They had no consumer outside it, and the
+    # secret's committed placeholder was itself the vulnerability — a required
+    # setting nobody sets meaningfully becomes a published constant.
 
     # Connection pool — defaults are sized for the ACTIVE (local) profile:
     # a direct connection to Homebrew Postgres, where every pool slot pins a

@@ -305,14 +305,23 @@ async def test_middleware_rejects_unknown_pat(client):
 
 
 @pytest.mark.asyncio
-async def test_middleware_still_accepts_jwt(client, test_data):
-    """Regression guard: adding the PAT branch must not break JWTs."""
-    payload = {"sub": test_data.user_id, "email": "jwt-regression@test.dev"}
-    token = jwt.encode(payload, settings.supabase_jwt_secret, algorithm="HS256")
+async def test_middleware_rejects_forged_hs256_jwt(client, test_data):
+    """A forged JWT is rejected. This test used to assert the opposite.
 
-    auth_user = await get_current_user(authorization=f"Bearer {token}")
-    assert auth_user.id == test_data.user_id
-    assert auth_user.email == "jwt-regression@test.dev"
+    It was `test_middleware_still_accepts_jwt`, and it passed by signing a
+    token with `settings.supabase_jwt_secret` — whose value was `local-unused`,
+    committed in `.env.example`. It was a green test demonstrating a total auth
+    bypass: any `sub` you liked, full read/write, no expiry (audit 2.1).
+
+    The JWT branch was deleted 2026-08-03 rather than gated. This asserts the
+    hole stays shut even if someone reintroduces a signing path.
+    """
+    payload = {"sub": test_data.user_id, "email": "forged@test.dev"}
+    token = jwt.encode(payload, "local-unused", algorithm="HS256")
+
+    with pytest.raises(AppError) as exc_info:
+        await get_current_user(authorization=f"Bearer {token}")
+    assert exc_info.value.status_code == 401
 
 
 # ---------------------------------------------------------------------------
