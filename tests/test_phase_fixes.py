@@ -267,15 +267,26 @@ async def test_create_transaction_rate_unavailable_raises_422(client, test_data)
 
     txn_id = str(uuid.uuid4())
     try:
-        # Date in 2000 — well before any seeded exchange_rates row, so the
-        # `rate_date <= $2` query returns nothing and lookup raises.
+        # 1900 — earlier than ANY row this suite seeds, so `rate_date <= $2`
+        # returns nothing and the lookup raises.
+        #
+        # ⚠️ This was 2000-01-01 and was flaky: ~3 runs in 5 failed. Under
+        # pytest-xdist the workers share one database, and
+        # `test_exchange_rates_history` seeds rows dated 1997-01-14/15 that are
+        # live for other workers until its teardown. A concurrent run of this
+        # test then found a rate on or before 2000 and got a 200 instead of the
+        # 422. `test_home_currency_parity` already documents the same hazard
+        # (`:204`, `:233`, `:367`) — this test predated the rule.
+        #
+        # Any fixture date must be earlier than every other seeded date. Adding
+        # a test that seeds something before 1900 breaks this one.
         r = await client.post(
             "/v1/transactions",
             json={
                 "id": txn_id,
                 "title": f"rate-unavailable-{uuid.uuid4()}",
                 "amount_cents": -1000,
-                "date": "2000-01-01T12:00:00Z",
+                "date": "1900-01-01T12:00:00Z",
                 "account_id": usd_account_id,
                 "category_id": test_data.category_id,
             },
