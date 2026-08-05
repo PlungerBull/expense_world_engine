@@ -83,13 +83,18 @@ Every agent should check these universal rules first, then the domain-specific r
 
 **Inbox domain:**
 - `POST /inbox` and `PUT /inbox/{id}`: auto-populate `exchange_rate` when both `date` and `account_id` are present; fall back to most recent available rate if no exact date match
-- `POST /inbox/{id}/promote`: enforces all six promotion conditions before proceeding:
+- **The inbox is a draft ledger row.** Its looseness is confined to *which fields may be null*; the *encoding* of every field matches `expense_transactions` exactly. `amount_cents` and `transfer_amount_cents` are stored positive, `transaction_type` and `transfer_direction` carry direction. A diff that reintroduces a signed stored amount, or a second way of expressing direction, is wrong — that was audit finding WP7.2, fixed in `sql/019`.
+- `POST /inbox` / `PUT /inbox/{id}` with a `transfer` object: takes `account_id` + `amount_cents` and **no `id`** (unlike `POST /transactions`). `transfer.amount_cents` must be signed opposite to the item's own `amount_cents` — same sign is `422`. `transaction_type` must be assigned exactly once per request; if an `amount_cents` in the same body can overwrite `TRANSFER`, that is the WP7.2 ordering bug regressing. `"transfer": null` clears the transfer and is the only explicit null the inbox accepts.
+- `POST /inbox/{id}/promote`: enforces all seven promotion conditions before proceeding, accumulating **all** failures into one response:
   1. `title` is present and not `'UNTITLED'`
   2. `amount_cents` is present and not zero
   3. `date` is present and `≤ now()`
   4. `account_id` references an active, non-archived account
-  5. `category_id` references an active category
-  6. Returns `422` with the specific failing fields if any condition fails
+  5. `category_id` references an active category — **non-transfer items only**; transfers auto-assign the system category
+  6. `transfer_account_id` references an active, non-archived account — transfer items only
+  7. `transfer_id` is present for a transfer item and absent for a non-transfer one
+  - Returns `422` with the specific failing fields if any condition fails
+- `GET /inbox?ready=true` must be the exact complement of that list — every row it returns promotes, every row that promotes appears in it. The two are written separately (SQL in the router, Python in the helper), which is how they drifted into WP7.3; check them against each other, not just against the spec.
 - Promotion is atomic — all six steps happen in one DB transaction:
   1. Creates `expense_transactions` row with `inbox_id` pointing back
   2. Sets `status = 2` (promoted) on the inbox row

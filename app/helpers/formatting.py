@@ -2,9 +2,31 @@
 
 Consolidates ``apply_debit_as_negative`` which was duplicated in
 transactions.py and reconciliations.py routers.
+
+``debit_as_negative`` is a caller-side display preference, never a schema
+property — these functions work on a shallow copy and the stored row is
+untouched. Both variants read direction from the same two channels the ledger
+and the inbox now share: ``transaction_type``, plus ``transfer_direction`` for
+transfers.
 """
 
+from typing import Optional
+
 from app.constants import TransactionType, TransferDirection
+
+
+def _is_debit(transaction_type: Optional[int], transfer_direction: Optional[int]) -> bool:
+    """Does this row's primary side reduce its account's balance?
+
+    ``None`` type means an inbox row with no amount yet — not a debit, not a
+    credit, nothing to flip.
+    """
+    if transaction_type == TransactionType.EXPENSE:
+        return True
+    return (
+        transaction_type == TransactionType.TRANSFER
+        and transfer_direction == TransferDirection.DEBIT
+    )
 
 
 def apply_debit_as_negative(data: dict) -> dict:
@@ -13,46 +35,49 @@ def apply_debit_as_negative(data: dict) -> dict:
     Returns a shallow copy with ``amount_cents`` and ``amount_home_cents``
     negated when the transaction is an expense or a transfer-debit.
     """
-    t = data["transaction_type"]
-    d = data.get("transfer_direction")
-    if t == TransactionType.EXPENSE or (t == TransactionType.TRANSFER and d == TransferDirection.DEBIT):
-        data = {**data}
-        data["amount_cents"] = -data["amount_cents"]
-        if data["amount_home_cents"] is not None:
-            data["amount_home_cents"] = -data["amount_home_cents"]
+    if not _is_debit(data["transaction_type"], data.get("transfer_direction")):
+        return data
+
+    data = {**data}
+    data["amount_cents"] = -data["amount_cents"]
+    if data["amount_home_cents"] is not None:
+        data["amount_home_cents"] = -data["amount_home_cents"]
     return data
 
 
 def apply_debit_as_negative_inbox(data: dict) -> dict:
-    """Post-process an inbox dict to negate amounts for expenses/transfer-outflows.
+    """Post-process an inbox dict to negate amounts for expenses/transfer-debits.
 
-    Inbox rows store ``amount_cents`` positive and carry direction on two
-    channels: ``transaction_type`` for regular rows (EXPENSE vs INCOME), and
-    the sign of ``transfer_amount_cents`` for transfer rows (positive means
-    the sibling is receiving, so the primary is the outflow leg).
+    Same direction rule as the ledger variant — an inbox row stores its amounts
+    positive and carries ``transaction_type`` + ``transfer_direction`` exactly
+    as ``expense_transactions`` does.
 
-    Returns a shallow copy with ``amount_cents`` and ``amount_home_cents``
-    negated when the primary side is a debit. Untyped inbox rows (amount
-    and type both ``None``) pass through unchanged.
+    The one addition is ``transfer_amount_cents``: an inbox row holds both legs
+    of a transfer, so the sibling is negated in the *opposite* direction to the
+    primary. It used to be emitted as-stored beside a flipped primary, which
+    rendered a transfer as two amounts pointing the same way
+    (WP10.2, docs/audit-2026-08-01-remediation-plan.md:297).
+
+    Rows with no amount yet (``transaction_type`` still ``None``) pass through
+    unchanged.
     """
-    t = data.get("transaction_type")
-    if t is None:
+    transaction_type = data.get("transaction_type")
+    if transaction_type is None:
         return data
 
-    should_negate = False
-    if t == TransactionType.EXPENSE:
-        should_negate = True
-    elif t == TransactionType.TRANSFER:
-        transfer_amount_cents = data.get("transfer_amount_cents")
-        if transfer_amount_cents is not None and transfer_amount_cents > 0:
-            should_negate = True
-
-    if not should_negate:
-        return data
-
+    primary_is_debit = _is_debit(transaction_type, data.get("transfer_direction"))
     data = {**data}
-    if data.get("amount_cents") is not None:
-        data["amount_cents"] = -data["amount_cents"]
-    if data.get("amount_home_cents") is not None:
-        data["amount_home_cents"] = -data["amount_home_cents"]
+
+    if primary_is_debit:
+        for key in ("amount_cents", "amount_home_cents"):
+            if data.get(key) is not None:
+                data[key] = -data[key]
+
+    if transaction_type == TransactionType.TRANSFER:
+        # The sibling always moves the other way.
+        if not primary_is_debit:
+            for key in ("transfer_amount_cents", "transfer_amount_home_cents"):
+                if data.get(key) is not None:
+                    data[key] = -data[key]
+
     return data

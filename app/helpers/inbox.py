@@ -31,7 +31,7 @@ from uuid import UUID
 
 import asyncpg
 
-from app.constants import ActivityAction, InboxStatus, TransactionType
+from app.constants import ActivityAction, InboxStatus, TransactionType, TransferDirection
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
@@ -40,7 +40,44 @@ from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.validation import extract_update_fields
 from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
-from app.schemas.transactions import infer_transaction_type, transaction_from_row
+from app.schemas.transactions import (
+    infer_transaction_type,
+    infer_transfer_direction,
+    transaction_from_row,
+)
+
+
+def _resolve_transfer_direction(
+    primary_signed: Optional[int],
+    sibling_signed: int,
+) -> int:
+    """Derive the PRIMARY leg's ``transfer_direction`` from the signed inputs.
+
+    The inbox row is the primary leg, so its direction is the same field the
+    ledger carries. The sibling's direction is the inverse and is never stored.
+
+    Rules, in order:
+
+    1. Both amounts known and pointing the same way → ``422``. This is the check
+       the old encoding could not make: the primary's sign was thrown away by
+       ``abs()`` on write and re-derived at promote time as the negation of the
+       sibling, so two outflows became a valid-looking transfer with one leg
+       silently flipped (WP7.2, spec §546).
+    2. The primary's own sign wins whenever it is known.
+    3. Otherwise the primary's sign is the opposite of the sibling's — which is
+       what keeps a sparse draft (a transfer whose primary amount has not been
+       filled in yet) directional.
+
+    Callers must reject zero amounts first.
+    """
+    if primary_signed is not None and (primary_signed > 0) == (sibling_signed > 0):
+        raise validation_error(
+            "Transfer validation failed.",
+            {"transfer.amount_cents": "Must have opposite sign to amount_cents."},
+        )
+    if primary_signed is not None:
+        return infer_transfer_direction(primary_signed)
+    return infer_transfer_direction(-sibling_signed)
 
 
 # ---------------------------------------------------------------------------
@@ -59,34 +96,45 @@ async def create_inbox_item(
     transaction_type, abs the amount) and auto-populates the exchange
     rate if both account and date are known.
 
-    Transfer fields (if provided) override ``transaction_type`` to
-    ``TRANSFER`` and stash the sibling account + signed amount for later
-    use when the item is promoted.
+    Transfer fields (if provided) set ``transaction_type`` to ``TRANSFER``
+    and stash the sibling account, its absolute amount, and the primary
+    leg's ``transfer_direction`` for later use when the item is promoted.
     """
-    # Infer transaction_type and normalize amount
-    amount_cents = body.amount_cents
-    transaction_type: Optional[int] = None
-    if amount_cents is not None:
-        if amount_cents == 0:
-            raise validation_error(
-                "amount_cents must not be zero.",
-                {"amount_cents": "Must not be zero."},
-            )
-        transaction_type = infer_transaction_type(amount_cents)
-        amount_cents = abs(amount_cents)
+    # Signs are consumed in this block and nowhere else. Everything below sees
+    # only absolute amounts plus the encoded direction — the same contract the
+    # ledger has. transaction_type is assigned exactly once, at the end, so a
+    # transfer can never be overwritten by the primary amount's sign.
+    primary_signed = body.amount_cents
+    if primary_signed is not None and primary_signed == 0:
+        raise validation_error(
+            "amount_cents must not be zero.",
+            {"amount_cents": "Must not be zero."},
+        )
 
-    # Transfer fields
+    sibling_signed: Optional[int] = None
     transfer_account_id: Optional[str] = None
-    transfer_amount_cents: Optional[int] = None
     if body.transfer is not None:
         if body.transfer.amount_cents == 0:
             raise validation_error(
                 "transfer.amount_cents must not be zero.",
                 {"transfer.amount_cents": "Must not be zero."},
             )
+        sibling_signed = body.transfer.amount_cents
         transfer_account_id = body.transfer.account_id
-        transfer_amount_cents = body.transfer.amount_cents  # stored signed
-        transaction_type = TransactionType.TRANSFER  # override to transfer
+
+    amount_cents = abs(primary_signed) if primary_signed is not None else None
+    transfer_amount_cents = abs(sibling_signed) if sibling_signed is not None else None
+    transfer_direction = (
+        _resolve_transfer_direction(primary_signed, sibling_signed)
+        if sibling_signed is not None
+        else None
+    )
+
+    transaction_type: Optional[int] = None
+    if sibling_signed is not None:
+        transaction_type = TransactionType.TRANSFER
+    elif primary_signed is not None:
+        transaction_type = infer_transaction_type(primary_signed)
 
     # Auto-populate exchange_rate if both account_id and date are present
     exchange_rate = body.exchange_rate
@@ -99,9 +147,9 @@ async def create_inbox_item(
             INSERT INTO expense_transaction_inbox
                 (id, user_id, title, description, amount_cents, transaction_type,
                  date, account_id, category_id, exchange_rate,
-                 transfer_account_id, transfer_amount_cents,
+                 transfer_account_id, transfer_amount_cents, transfer_direction,
                  created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 1.0), $11, $12, now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, 1.0), $11, $12, $13, now(), now())
             RETURNING *
             """,
             body.id,
@@ -116,6 +164,7 @@ async def create_inbox_item(
             exchange_rate,
             transfer_account_id,
             transfer_amount_cents,
+            transfer_direction,
         )
     except asyncpg.UniqueViolationError:
         raise conflict(f"An inbox item with id '{body.id}' already exists.")
@@ -145,27 +194,27 @@ async def update_inbox_item(
     as ``create_inbox_item``, plus auto-relookup of the exchange rate
     when ``date`` changes.
 
+    ``transfer`` is the one field that accepts an explicit null: sending
+    ``{"transfer": null}`` clears the sibling account, its amount and the
+    direction, and the draft reverts to a plain expense/income. Without it a
+    draft marked as a transfer could never be un-marked — the only escape was
+    deleting the row and retyping it. Every other field still rejects null with
+    422 (spec: PUT fields must not be explicit-null).
+
     Empty updates short-circuit to a fetch-and-return — matches the prior
     router behaviour and the pattern established by other domain helpers.
-    Null values on any field are rejected with 422 (spec: PUT fields must
-    not be explicit-null).
     """
-    fields = extract_update_fields(body)
+    fields = extract_update_fields(body, nullable={"transfer"})
 
-    # Extract transfer before passing to dynamic UPDATE builder
+    # `transfer` is not a column — pop it before the dynamic UPDATE builder sees
+    # it. `transfer_given` separates "transfer: null" (clear it) from "transfer
+    # omitted" (leave it alone); extract_update_fields returns only keys the
+    # caller actually set, so presence in `fields` is the signal.
+    transfer_given = "transfer" in fields
     transfer = fields.pop("transfer", None)
-    if transfer is not None:
-        if transfer["amount_cents"] == 0:
-            raise validation_error(
-                "transfer.amount_cents must not be zero.",
-                {"transfer.amount_cents": "Must not be zero."},
-            )
-        fields["transfer_account_id"] = transfer["account_id"]
-        fields["transfer_amount_cents"] = transfer["amount_cents"]  # stored signed
-        fields["transaction_type"] = TransactionType.TRANSFER
 
     # Empty update — return current
-    if not fields:
+    if not fields and not transfer_given:
         row = await conn.fetchrow(
             "SELECT * FROM expense_transaction_inbox WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
             inbox_id,
@@ -175,15 +224,25 @@ async def update_inbox_item(
             raise not_found("inbox item")
         return inbox_from_row(row)
 
-    # Process amount_cents: infer transaction_type, normalize to abs
+    # Collect the signed inputs. As on create, signs live only in this block.
+    primary_signed: Optional[int] = None
     if "amount_cents" in fields:
         if fields["amount_cents"] == 0:
             raise validation_error(
                 "amount_cents must not be zero.",
                 {"amount_cents": "Must not be zero."},
             )
-        fields["transaction_type"] = infer_transaction_type(fields["amount_cents"])
-        fields["amount_cents"] = abs(fields["amount_cents"])
+        primary_signed = fields["amount_cents"]
+        fields["amount_cents"] = abs(primary_signed)
+
+    sibling_signed: Optional[int] = None
+    if transfer is not None:
+        if transfer["amount_cents"] == 0:
+            raise validation_error(
+                "transfer.amount_cents must not be zero.",
+                {"transfer.amount_cents": "Must not be zero."},
+            )
+        sibling_signed = transfer["amount_cents"]
 
     before_row = await conn.fetchrow(
         "SELECT * FROM expense_transaction_inbox WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
@@ -194,6 +253,46 @@ async def update_inbox_item(
         raise not_found("inbox item")
 
     before = inbox_from_row(before_row)
+
+    # Resolve direction and type against the MERGED state (stored row + this
+    # patch), assigning transaction_type exactly once. Deriving it in one place
+    # is what stops an `amount_cents` in the same request from downgrading a
+    # transfer to an expense — previously the amount block ran last and won,
+    # leaving transfer columns set on a row typed 1 or 2.
+    was_transfer = before_row["transfer_account_id"] is not None
+
+    if transfer_given and transfer is None:
+        # Explicit null — the draft stops being a transfer.
+        fields["transfer_account_id"] = None
+        fields["transfer_amount_cents"] = None
+        fields["transfer_direction"] = None
+        if primary_signed is not None:
+            fields["transaction_type"] = infer_transaction_type(primary_signed)
+        elif before_row["amount_cents"] is None:
+            fields["transaction_type"] = None
+        elif was_transfer:
+            # No new amount, and the stored one is absolute — the stored
+            # direction is the only surviving record of which way it pointed.
+            fields["transaction_type"] = (
+                TransactionType.EXPENSE
+                if before_row["transfer_direction"] == TransferDirection.DEBIT
+                else TransactionType.INCOME
+            )
+    elif transfer is not None:
+        fields["transfer_account_id"] = transfer["account_id"]
+        fields["transfer_amount_cents"] = abs(sibling_signed)
+        fields["transfer_direction"] = _resolve_transfer_direction(
+            primary_signed, sibling_signed
+        )
+        fields["transaction_type"] = TransactionType.TRANSFER
+    elif was_transfer:
+        if primary_signed is not None:
+            # Restating the primary's sign flips both legs; the sibling's amount
+            # is absolute and its direction is implied, so nothing else moves.
+            fields["transfer_direction"] = infer_transfer_direction(primary_signed)
+            fields["transaction_type"] = TransactionType.TRANSFER
+    elif primary_signed is not None:
+        fields["transaction_type"] = infer_transaction_type(primary_signed)
 
     # Auto-populate exchange_rate if date changes and account_id is set
     # (unless user explicitly supplied exchange_rate in this request)
@@ -372,6 +471,11 @@ async def promote_inbox_item(
     )
 
     # 3. Validate shared required fields — collect all failures
+    #
+    # Keep in step with the `?ready=true` predicate in routers/inbox.py: a row
+    # that predicate returns must promote, and a row that promotes must appear
+    # in it. They are two separate implementations of one definition, which is
+    # how they drifted apart (WP7.2/7.3); tests/test_inbox_transfers.py pins them.
     errors: dict = {}
 
     if not inbox_row["title"] or inbox_row["title"] == "UNTITLED":
@@ -415,24 +519,51 @@ async def promote_inbox_item(
             if category is None:
                 errors["category_id"] = "Must reference an active, non-archived category."
 
+    # Transfers: the sibling account gets the same check the primary does.
+    # create_transfer_pair validates it too, but only after this function has
+    # committed to the transfer branch — checking here keeps the failure inside
+    # the accumulate-all-errors response and matches what ?ready=true reports.
+    if is_transfer:
+        transfer_account = await conn.fetchrow(
+            """
+            SELECT id FROM expense_bank_accounts
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
+            """,
+            inbox_row["transfer_account_id"],
+            user_id,
+        )
+        if transfer_account is None:
+            errors["transfer.account_id"] = (
+                "Must reference an active, non-archived account."
+            )
+
+    # transfer_id must be present for a transfer and absent otherwise (spec §383).
+    # The mismatch case used to be silently discarded.
+    if is_transfer and target_transfer_id is None:
+        errors["transfer_id"] = "Must be present for transfer promotions."
+    elif not is_transfer and target_transfer_id is not None:
+        errors["transfer_id"] = "Must be null for non-transfer promotions."
+
     if errors:
         raise validation_error("Inbox item is not ready to promote.", errors)
 
     # 4a. Transfer promotion branch
     if is_transfer:
-        if target_transfer_id is None:
-            raise validation_error(
-                "transfer_id is required when promoting a transfer inbox item.",
-                {"transfer_id": "Must be present for transfer promotions."},
-            )
-
         # Imported lazily to avoid circular-import complications
         from app.helpers.transfers import create_transfer_pair
 
-        # Reconstruct signed primary amount from transfer_amount_cents sign:
-        # if transfer side is positive, primary must be negative, and vice versa.
-        transfer_amt = inbox_row["transfer_amount_cents"]
-        primary_signed = -inbox_row["amount_cents"] if transfer_amt > 0 else inbox_row["amount_cents"]
+        # Re-sign both legs from the stored direction, which describes the
+        # primary. create_transfer_pair takes signed amounts because that is the
+        # shape POST /transactions hands it; here the signs are reconstructed
+        # from an explicit column rather than inferred from the sibling, so its
+        # opposite-sign guard passes because the stored row is well-formed —
+        # not because promote forced the primary to agree.
+        primary_abs = inbox_row["amount_cents"]
+        sibling_abs = inbox_row["transfer_amount_cents"]
+        if inbox_row["transfer_direction"] == TransferDirection.DEBIT:
+            primary_signed, sibling_signed = -primary_abs, sibling_abs
+        else:
+            primary_signed, sibling_signed = primary_abs, -sibling_abs
 
         txn_response, _sibling = await create_transfer_pair(
             conn=conn,
@@ -447,7 +578,7 @@ async def promote_inbox_item(
             primary_exchange_rate=float(inbox_row["exchange_rate"]),
             primary_cleared=False,
             transfer_account_id=str(inbox_row["transfer_account_id"]),
-            transfer_amount_cents=transfer_amt,
+            transfer_amount_cents=sibling_signed,
             inbox_id=str(inbox_row["id"]),
         )
 

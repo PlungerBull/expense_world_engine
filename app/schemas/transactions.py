@@ -125,3 +125,17 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
 def infer_transaction_type(amount_cents: int) -> int:
     """Infer transaction_type from signed amount. Negative=expense(1), positive=income(2)."""
     return 1 if amount_cents < 0 else 2
+
+
+def infer_transfer_direction(amount_cents: int) -> int:
+    """Infer transfer_direction for the leg holding this signed amount.
+
+    Negative=debit(1) (money leaves the account), positive=credit(2).
+
+    This is the engine's single signed-amount-to-direction rule — both the
+    ledger (``helpers/transfers.py``) and the inbox write path use it, so
+    there is one place to read when asking what a sign means. Callers must
+    reject zero first; ``0`` maps to CREDIT here the same way
+    ``infer_transaction_type`` maps it to INCOME.
+    """
+    return 1 if amount_cents < 0 else 2

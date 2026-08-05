@@ -8,13 +8,12 @@ from app.constants import (
     ActivityAction,
     SystemCategoryKey,
     TransactionType,
-    TransferDirection,
 )
 from app.errors import conflict, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.balance import apply_balance
 from app.helpers.categories import ensure_system_category
-from app.schemas.transactions import transaction_from_row
+from app.schemas.transactions import infer_transfer_direction, transaction_from_row
 
 
 async def create_transfer_pair(
@@ -111,10 +110,10 @@ async def create_transfer_pair(
     # 5. Normalize amounts and determine transfer_direction
     # ------------------------------------------------------------------
     primary_abs = abs(primary_amount_cents)
-    primary_direction = TransferDirection.DEBIT if primary_amount_cents < 0 else TransferDirection.CREDIT
+    primary_direction = infer_transfer_direction(primary_amount_cents)
 
     sibling_abs = abs(transfer_amount_cents)
-    sibling_direction = TransferDirection.DEBIT if transfer_amount_cents < 0 else TransferDirection.CREDIT
+    sibling_direction = infer_transfer_direction(transfer_amount_cents)
 
     # ------------------------------------------------------------------
     # 6. Exchange rates and amount_home_cents (dominant-side rule)

@@ -4,7 +4,21 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel
 
-from app.schemas.transactions import TransferField
+
+class InboxTransferField(BaseModel):
+    """The sibling leg of a transfer draft.
+
+    Deliberately NOT ``TransferField`` (``schemas/transactions.py``). That model
+    requires an ``id`` — the sibling ledger row's client-supplied UUID — which is
+    meaningless on an inbox row: no ledger rows exist yet, and the sibling's id
+    arrives later as ``InboxPromoteRequest.transfer_id``. The inbox required it
+    at the schema layer and then discarded it, so the documented request shape
+    422'd and a supplied value was silently dropped
+    (WP7.2, docs/audit-2026-08-01-remediation-plan.md:221).
+    """
+
+    account_id: str
+    amount_cents: int  # signed: negative=outflow from the sibling, positive=inflow
 
 
 class InboxCreateRequest(BaseModel):
@@ -16,7 +30,7 @@ class InboxCreateRequest(BaseModel):
     account_id: Optional[str] = None
     category_id: Optional[str] = None
     exchange_rate: Optional[float] = None
-    transfer: Optional[TransferField] = None
+    transfer: Optional[InboxTransferField] = None
 
 
 class InboxUpdateRequest(BaseModel):
@@ -27,7 +41,8 @@ class InboxUpdateRequest(BaseModel):
     account_id: Optional[str] = None
     category_id: Optional[str] = None
     exchange_rate: Optional[float] = None
-    transfer: Optional[TransferField] = None
+    # Explicit null clears the transfer — see update_inbox_item.
+    transfer: Optional[InboxTransferField] = None
 
 
 class InboxPromoteRequest(BaseModel):
@@ -49,7 +64,8 @@ class InboxResponse(BaseModel):
     exchange_rate: float
     status: int
     transfer_account_id: Optional[str] = None
-    transfer_amount_cents: Optional[int] = None
+    transfer_amount_cents: Optional[int] = None  # always positive
+    transfer_direction: Optional[int] = None  # of the PRIMARY leg: 1=debit, 2=credit
     transfer_amount_home_cents: Optional[int] = None
     created_at: datetime
     updated_at: datetime
@@ -76,6 +92,7 @@ def inbox_from_row(row) -> dict:
         status=row["status"],
         transfer_account_id=str(row["transfer_account_id"]) if row["transfer_account_id"] else None,
         transfer_amount_cents=transfer_amount_cents,
+        transfer_direction=row["transfer_direction"],
         transfer_amount_home_cents=(
             round(transfer_amount_cents * rate) if transfer_amount_cents is not None else None
         ),

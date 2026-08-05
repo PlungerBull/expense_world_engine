@@ -46,6 +46,12 @@ async def list_inbox(
             conditions.append("i.deleted_at IS NULL")
 
         if ready:
+            # This predicate must agree with promote_inbox_item's validation
+            # block (helpers/inbox.py) in both directions: everything listed
+            # here must promote, and everything that promotes must be listed.
+            # The two are written separately — SQL here, Python there — which is
+            # exactly how they drifted (WP7.2/7.3), so
+            # tests/test_inbox_transfers.py promotes every row this returns.
             conditions.append("i.title IS NOT NULL")
             conditions.append("i.title != 'UNTITLED'")
             conditions.append("i.amount_cents IS NOT NULL")
@@ -53,7 +59,6 @@ async def list_inbox(
             conditions.append("i.date IS NOT NULL")
             conditions.append("i.date <= now()")
             conditions.append("i.account_id IS NOT NULL")
-            conditions.append("i.category_id IS NOT NULL")
             # Account must be active and non-archived
             conditions.append(
                 "EXISTS (SELECT 1 FROM expense_bank_accounts a "
@@ -63,10 +68,24 @@ async def list_inbox(
             # at an archived category isn't promotable — promote would 422 on
             # the same guard, so excluding it from `?ready=true` keeps the
             # client-facing list honest).
+            #
+            # Transfers are exempt: promote auto-assigns @Transfer/@Debt and
+            # never looks at category_id, so requiring one here hid every
+            # promotable transfer item from the list.
             conditions.append(
-                "EXISTS (SELECT 1 FROM expense_categories c "
+                "(i.transfer_account_id IS NOT NULL OR ("
+                "i.category_id IS NOT NULL AND EXISTS ("
+                "SELECT 1 FROM expense_categories c "
                 "WHERE c.id = i.category_id AND c.deleted_at IS NULL "
-                "AND c.is_archived = false)"
+                "AND c.is_archived = false)))"
+            )
+            # ...and the sibling account gets the same check the primary does,
+            # for the same reason: promote 422s on an archived one.
+            conditions.append(
+                "(i.transfer_account_id IS NULL OR EXISTS ("
+                "SELECT 1 FROM expense_bank_accounts ta "
+                "WHERE ta.id = i.transfer_account_id AND ta.deleted_at IS NULL "
+                "AND ta.is_archived = false))"
             )
 
         if overdue:
