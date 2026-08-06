@@ -198,18 +198,25 @@ ALTER TABLE expense_bank_accounts
 --                   (actual time=0.094..0.094 rows=6000)
 --     Execution Time: 1.029 ms
 --
---   Balance sum, ALL accounts (the /accounts and /dashboard read path):
+--   Balance sum with NO account filter, for contrast (not a path the engine
+--   takes -- recorded because it is the shape to avoid):
 --     HashAggregate (actual time=6.196..6.198 rows=8)
 --       ->  Seq Scan on expense_transactions t (rows=48000)
 --     Execution Time: 6.209 ms
 --
---     A sequential scan here is CORRECT, not a missing index, and the point is
---     worth stating plainly because it looks like a failure. Summing every
---     account means reading every one of the user's transactions; there is no
---     selective predicate to exploit, and with one user the user_id filter
---     narrows nothing. Postgres correctly declines the index. 6 ms for a
---     lifetime of rows, once per dashboard load, is the whole cost of deleting
---     the cache.
+--     Postgres correctly declines the index: with no account predicate and one
+--     user, there is nothing selective to exploit, so summing every account
+--     means reading every row. Every read path in the engine scopes to the
+--     accounts it is actually rendering -- the account list to its page, each
+--     dashboard panel to its slice, /sync to its delta -- so all of them take
+--     the 1 ms bitmap-index path above instead. app/helpers/account_balance.py
+--     deliberately exposes no ledger-wide variant.
+--
+--   Note what these sums are NOT: a total across accounts. Every query is
+--   GROUP BY account_id and an account holds one immutable currency, so each
+--   sum stays inside one currency. Adding a PEN balance to a USD one would be a
+--   number in no currency; the only cross-currency figure is
+--   current_balance_home_cents, converted per account before combining.
 --
 --   Paginated transaction list (ORDER BY date DESC, created_at DESC LIMIT 50):
 --     Limit (actual time=0.006..0.013 rows=50)

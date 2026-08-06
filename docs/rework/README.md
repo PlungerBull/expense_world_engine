@@ -270,11 +270,19 @@ testable — *the query count does not grow with the number of accounts* — is 
 test, and it was mutation-checked: injecting an N+1 into `GET /accounts` moves it
 from 6 statements to 9 and the assertion fires.
 
-Worth knowing before WP4 tunes anything: **the all-accounts balance sum is a
-sequential scan and that is correct.** Summing every account means reading every
-row; there is no selective predicate, and with one user the `user_id` filter
-narrows nothing. 6 ms for 50k rows. The index earns its keep on the per-account
-path (1 ms) and on the three existence guards.
+Worth knowing before WP4 tunes anything: **every balance read is scoped to the
+accounts the caller is actually rendering**, so all of them take the bitmap-index
+path (1 ms at 50k rows). An unscoped sum would be a sequential scan — correctly,
+since with one user there is no selective predicate — which is why
+`account_balance.py` exposes no ledger-wide variant at all. Each caller already
+knows its ids: the account list has its page, each dashboard panel its slice,
+`/sync` its delta.
+
+And to head off a reasonable misreading: these sums are **per account**, never a
+total across accounts. Every query is `GROUP BY account_id`, and an account holds
+one immutable currency, so each sum stays inside one currency by construction. A
+PEN balance is never added to a USD one — the only cross-currency figure is
+`current_balance_home_cents`, which converts each account before combining.
 
 **3. The activity-log exception WP3 asks you to remove does not exist.** Its
 checklist says to "remove the activity-log exception for balance writes if it is

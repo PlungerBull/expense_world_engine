@@ -385,7 +385,12 @@ async def test_the_query_count_does_not_grow_with_the_number_of_accounts(
         statements.clear()
         r = await client.get("/v1/accounts?limit=200")
         assert r.status_code == 200, r.text
-        with_two = len(statements)
+        accounts_with_two = len(statements)
+
+        statements.clear()
+        r = await client.get("/v1/dashboard?include_archived=true")
+        assert r.status_code == 200, r.text
+        dashboard_with_two = len(statements)
 
         # Add three more accounts, each with a transaction, then measure again.
         extra_ids = [str(uuid.uuid4()) for _ in range(3)]
@@ -414,11 +419,23 @@ async def test_the_query_count_does_not_grow_with_the_number_of_accounts(
             statements.clear()
             r = await client.get("/v1/accounts?limit=200")
             assert r.status_code == 200, r.text
-            with_five = len(statements)
+            accounts_with_five = len(statements)
 
-            assert with_five == with_two, (
-                f"Query count grew with account count: {with_two} → {with_five}. "
-                f"Statements: {statements}"
+            statements.clear()
+            r = await client.get("/v1/dashboard?include_archived=true")
+            assert r.status_code == 200, r.text
+            dashboard_with_five = len(statements)
+
+            assert accounts_with_five == accounts_with_two, (
+                f"GET /accounts query count grew with account count: "
+                f"{accounts_with_two} → {accounts_with_five}. Statements: {statements}"
+            )
+            # The dashboard renders three account panels, each of which reads its
+            # own slice's balances in one query. Three panels is a constant; the
+            # number of accounts in them is not.
+            assert dashboard_with_five == dashboard_with_two, (
+                f"GET /dashboard query count grew with account count: "
+                f"{dashboard_with_two} → {dashboard_with_five}. Statements: {statements}"
             )
         finally:
             async with db.pool.acquire() as conn:

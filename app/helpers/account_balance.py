@@ -3,6 +3,15 @@
 An account's balance is the signed sum of its non-deleted transactions, in the
 account's own currency. Nothing stores it, so nothing can forget to update it.
 
+**Balances are per account and are never added together here.** Every query below
+is ``GROUP BY account_id``, and an account holds exactly one currency, immutable
+after creation — so each sum stays inside one currency by construction. Adding a
+PEN balance to a USD one would produce a number in no currency at all, which is
+the mistake ``CLAUDE.md``'s home-currency rule exists to prevent. The only figure
+that spans currencies is ``current_balance_home_cents``, which converts each
+account separately before anything is combined, and which is the caller's job
+(``helpers/accounts.get_home_balance``), not this module's.
+
 This module replaces ``app/helpers/balance.py``, which owned the write side of a
 stored ``expense_bank_accounts.current_balance_cents`` column (dropped by
 sql/022) and its eleven mutation sites. That column was a derived value with a
@@ -27,8 +36,13 @@ the expression that emits a confident, wrong zero for an account somebody forgot
 to ask about, and a wrong zero on a balance is indistinguishable from an empty
 account. A forgotten id raises ``KeyError`` instead.
 
-"Every account" is a separately named function rather than a ``None`` sentinel,
-so scanning the whole ledger is always a decision somebody wrote down.
+There is deliberately **no "all accounts" variant**. Every caller already knows
+which accounts it is rendering — the account list has its page, each dashboard
+panel has its slice, ``/sync`` has its delta — so a ledger-wide scan would be
+doing more work to produce a less safe result. It would also have to hand back a
+mapping with accounts missing (those with no rows), which forces a
+``.get(id, 0)`` at the call site: the fail-open shape this module exists to
+avoid.
 
 
 @Opening is included. The report's exclusion must not be copied here.
@@ -130,37 +144,6 @@ async def fetch_balances(
     return balances
 
 
-async def fetch_all_balances(
-    conn: asyncpg.Connection,
-    user_id: str,
-) -> dict[str, int]:
-    """Return ``{account_id: balance_cents}`` for every account with activity.
-
-    Accounts with no transactions are absent from this mapping, because the
-    ledger is the only thing read -- callers that hold an account list must
-    default those to 0. ``fetch_balances`` is the safer shape and should be
-    preferred wherever the ids are already known; this exists for the read paths
-    that page or panel over accounts and want one scan for all of them rather
-    than one per panel.
-
-    This deliberately scans the user's whole ledger. There is no selective
-    predicate to exploit -- summing every account means reading every row -- and
-    Postgres correctly picks a sequential scan. Measured at 6 ms for 50,000
-    transactions in sql/022's header.
-    """
-    rows = await conn.fetch(
-        f"""
-        SELECT t.account_id, {_BALANCE_SUM_SQL} AS balance_cents
-        FROM expense_transactions t
-        WHERE t.user_id = $1
-          AND t.deleted_at IS NULL
-        GROUP BY t.account_id
-        """,
-        user_id,
-    )
-    return {str(row["account_id"]): int(row["balance_cents"]) for row in rows}
-
-
 async def fetch_balance(
     conn: asyncpg.Connection,
     user_id: str,
@@ -175,20 +158,7 @@ async def fetch_balance(
     return balances[str(account_id)]
 
 
-def balance_for(balances: dict[str, int], account_id: str) -> int:
-    """Look up one account in a mapping from ``fetch_all_balances``.
-
-    Only for the ``fetch_all_balances`` shape, where an account with no
-    transactions is legitimately absent. Do not use it on a ``fetch_balances``
-    result -- there a missing key means the caller forgot to ask, which must
-    raise rather than resolve to a plausible zero.
-    """
-    return balances.get(str(account_id), 0)
-
-
 __all__ = [
     "fetch_balance",
     "fetch_balances",
-    "fetch_all_balances",
-    "balance_for",
 ]
