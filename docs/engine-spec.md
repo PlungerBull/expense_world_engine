@@ -931,7 +931,7 @@ Returns the activity log for the user. Supports filtering by `resource_type` (st
 
 **Validation:** `resource_id` is typed as UUID — non-UUID values return `422 VALIDATION_ERROR` before the query runs.
 
-**Response fields:** each activity row includes `id`, `user_id`, `resource_type`, `resource_id`, `action`, `before_snapshot`, `after_snapshot`, `changed_by` (the user-id anchor), `actor_type`, and `created_at`. `actor_type` separates the performer of the mutation from the resource owner — values are `"user"` (default), `"system"` (cron-driven writes such as scheduled rate refreshes), and `"admin"` (reserved for future back-office flows). Pair `changed_by` with `actor_type` to resolve attribution.
+**Response fields:** each activity row includes `id`, `user_id`, `resource_type`, `resource_id`, `action`, `before_snapshot`, `after_snapshot`, `changed_by` (the user-id anchor), and `created_at`. (`actor_type` was dropped in `sql/024` — every writer only ever passed `"user"`; the multi-actor future it encoded does not exist at one user with no worker.)
 
 ### Action codes
 | Value | Name | Emitted when |

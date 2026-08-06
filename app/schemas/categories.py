@@ -24,7 +24,6 @@ class CategoryResponse(BaseModel):
     name: str
     color: str
     is_system: bool
-    is_archived: bool
     sort_order: int
     created_at: datetime
     updated_at: datetime
@@ -39,7 +38,6 @@ def category_from_row(row) -> dict:
         name=row["name"],
         color=row["color"],
         is_system=row["is_system"],
-        is_archived=row["is_archived"],
         sort_order=row["sort_order"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],

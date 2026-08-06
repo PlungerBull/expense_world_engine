@@ -188,7 +188,7 @@ boundaries, not defects.
 | [WP2](WP2-read-time-currency.md) | Delete stored home values and rates; convert at read time | Needs WP1 |
 | [WP3](WP3-computed-balances-and-indexes.md) | Delete `current_balance_cents`; compute it; **add the missing indexes** | ✅ **Landed 2026-08-06** (`sql/022`). Unblocks WP4 |
 | [WP4](WP4-delete-sync.md) | Delete `/sync`, `sync_checkpoints`, and the `updated_at` indexes | ✅ **Landed 2026-08-06** (`sql/023`) — see deviation note below |
-| [WP5](WP5-schema-slimming.md) | 15 columns and 4 routes with no readers | Independent |
+| [WP5](WP5-schema-slimming.md) | 15 columns and 4 routes with no readers | ✅ **Landed 2026-08-06** (`sql/024`) — see deviation note below |
 | [WP6](WP6-reconciliation-simplification.md) | Delete the chaining cascade; shrink the largest helper | Independent |
 | [WP7](WP7-documentation.md) | Reconcile spec, schema reference and conventions; delete this directory | Last |
 
@@ -343,3 +343,56 @@ was; `version` is a server-incremented counter clients read but never send.
 **For WP7:** `engine-spec.md` still documents `GET /sync`, `sync_checkpoints`,
 and `X-Client-Id`; `schema-reference.md` still lists the table and the seven
 indexes. Route count is now 60.
+
+---
+
+## WP5 landed, 2026-08-06 — four corrections to the package's own facts
+
+`sql/024` drops the columns, deletes the four archive routes, replaces the
+`sql/006` trigger function (it INSERTed `users.email`), and validates
+`display_timezone` on write. Suite green at 210 (was 215; 13 deleted —
+12 category/hashtag archive tests plus the `actor_type` wire test — 8 new in
+`tests/test_wp5_schema_slimming.py`). Route count 56. The auth request schemas
+are now `extra="forbid"` (advances bug 6.1); bug 6.4 closed; decision D8
+superseded. **Engine-only by owner decision** — the CLI companion work is
+recorded as a checklist in `docs/client-breaking-changes.md`, not done, so
+`expense auth settings --theme` and the category/hashtag archive commands are
+broken until the CLI absorbs it.
+
+**1. It is 16 columns, not 15.** The package's headline number forgot to count
+`user_settings.deleted_at`, which its own Group 3 table lists. All 16 dropped.
+`CLAUDE.md`'s "Soft delete everywhere" was amended in the same change —
+`user_settings` is now the named exception.
+
+**2. `fetch_hashtag_ids_map` is NOT an orphan and was NOT deleted.** The audit
+line the package inherited ("zero references") was false at HEAD:
+`attach_hashtag_ids` calls it (`app/helpers/transactions.py:125`) and it feeds
+`hashtag_ids` on every transaction response.
+
+**3. `is_archived` had nine live guard readers, not zero.** The package said
+nothing branches on it and the dashboard panels were its last reader. Wrong on
+both counts post-WP2: list filters, the inbox `?ready` subquery, and the
+attach/promote/restore/batch validation guards all read it to 422 archived
+references. All died with the column — deliberately, since the archived state
+they guarded against no longer exists — but each was an enumerated edit, not a
+`DROP COLUMN` fallout. The soft-delete guards beside them are untouched.
+
+**4. `actor_type` was on the wire.** "No caller has ever passed a non-default
+value" is a statement about writers; `GET /activity` returned the column and a
+test asserted it. Dropping it is a recorded breaking change in
+`client-breaking-changes.md`, not a silent removal.
+
+**One thing the package missed, now covered:** `POST /auth/bootstrap`'s
+`timezone` field was a second unvalidated write path into `display_timezone`.
+Both paths now share `helpers/validation.validate_timezone` (422 on a non-IANA
+zone). The silent-UTC read fallback in `compute_month_bounds` stays — with
+writes validated it covers only out-of-band DB writes, and a UTC-rendered
+report beats a 500.
+
+**For WP7:** `engine-spec.md` still documents the six settings fields, the four
+archive routes, `?include_archived` on categories/hashtags, `users.email`, and
+`parent_transaction_id`; `schema-reference.md` still lists all 16 columns
+(including `global_currencies.name`/`symbol` and the junction `version`) and
+claims `expires_at` is "processed_at + 24 hours" (it never was — it is
+`now() + 24 hours`). The `actor_type` paragraph in the spec was corrected in
+this change because it was load-bearing for audit-query guidance.

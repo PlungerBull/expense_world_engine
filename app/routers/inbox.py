@@ -64,9 +64,9 @@ async def list_inbox(
                 "EXISTS (SELECT 1 FROM expense_bank_accounts a "
                 "WHERE a.id = i.account_id AND a.deleted_at IS NULL AND a.is_archived = false)"
             )
-            # Category must be active and non-archived (an inbox row pointing
-            # at an archived category isn't promotable — promote would 422 on
-            # the same guard, so excluding it from `?ready=true` keeps the
+            # Category must be active (an inbox row pointing at a deleted
+            # category isn't promotable — promote would 422 on the same
+            # guard, so excluding it from `?ready=true` keeps the
             # client-facing list honest).
             #
             # Transfers are exempt: promote auto-assigns @Transfer/@Debt and
@@ -76,8 +76,7 @@ async def list_inbox(
                 "(i.transfer_account_id IS NOT NULL OR ("
                 "i.category_id IS NOT NULL AND EXISTS ("
                 "SELECT 1 FROM expense_categories c "
-                "WHERE c.id = i.category_id AND c.deleted_at IS NULL "
-                "AND c.is_archived = false)))"
+                "WHERE c.id = i.category_id AND c.deleted_at IS NULL)))"
             )
             # ...and the sibling account gets the same check the primary does,
             # for the same reason: promote 422s on an archived one.

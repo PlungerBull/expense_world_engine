@@ -260,7 +260,6 @@ async def test_middleware_resolves_valid_pat(client, test_data):
     try:
         auth_user = await get_current_user(authorization=f"Bearer {plaintext}")
         assert auth_user.id == test_data.user_id
-        assert auth_user.email is None
     finally:
         async with db.pool.acquire() as conn:
             await conn.execute(

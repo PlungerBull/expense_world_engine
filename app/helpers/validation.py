@@ -14,11 +14,35 @@ inline fetches that set ``errors[field]`` without raising.
 """
 
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from pydantic import BaseModel
 
 from app.errors import validation_error
+
+
+def validate_timezone(value: str, field: str) -> None:
+    """Reject a value that is not a valid IANA timezone name with a 422.
+
+    Written for ``display_timezone``, which reaches SQL as a bind parameter
+    inside ``AT TIME ZONE`` on every report read — Postgres 500s on an
+    unknown zone, so a bad value must never be stored. ``field`` names the
+    request field ("display_timezone" on PUT /auth/settings, "timezone" on
+    POST /auth/bootstrap) so the error lands on what the caller sent.
+    """
+    if value is None or not value.strip():
+        raise validation_error(
+            "Invalid timezone.",
+            {field: "Must not be empty."},
+        )
+    try:
+        ZoneInfo(value)
+    except Exception:
+        raise validation_error(
+            "Invalid timezone.",
+            {field: "Must be a valid IANA timezone name (e.g. America/Lima)."},
+        )
 
 
 def extract_update_fields(
@@ -96,20 +120,14 @@ async def validate_active_category(
     category_id: str,
     user_id: str,
 ) -> asyncpg.Record:
-    """Fetch an active, non-archived category or raise 422.
-
-    Mirrors ``validate_active_account``: archive is a "retired, do not
-    use" signal at the engine layer, not just a UI hide. Letting clients
-    attach transactions to archived categories would split the meaning
-    of ``is_archived`` between accounts and categories — and it would
-    leak through any non-iOS caller (CLI, CSV import, third-party).
+    """Fetch an active category or raise 422.
 
     Returns the category row on success.
     """
     category = await conn.fetchrow(
         """
         SELECT * FROM expense_categories
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
         """,
         category_id,
         user_id,
@@ -117,6 +135,6 @@ async def validate_active_category(
     if category is None:
         raise validation_error(
             "Category validation failed.",
-            {"category_id": "Must reference an active, non-archived category."},
+            {"category_id": "Must reference an active category."},
         )
     return category

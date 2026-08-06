@@ -99,8 +99,8 @@ async def _store(
     await conn.execute(
         """
         INSERT INTO idempotency_keys
-            (id, key, user_id, processed_at, response_snapshot, response_status, expires_at, created_at)
-        VALUES ($1, $2, $3, now(), $4::jsonb, $5, now() + interval '24 hours', now())
+            (id, key, user_id, response_snapshot, response_status, expires_at, created_at)
+        VALUES ($1, $2, $3, $4::jsonb, $5, now() + interval '24 hours', now())
         ON CONFLICT (user_id, key) DO NOTHING
         """,
         str(uuid.uuid4()),

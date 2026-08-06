@@ -62,11 +62,12 @@ if _TARGET_DB not in _TEST_DB_ALLOWLIST:
 
 
 TEST_USER_ID = str(uuid.uuid4())
-# Worker-unique email: the orphan sweep in db_pool deletes every user with
-# this email except its own, so sharing one email across xdist workers would
-# let each worker delete the others' live test users.
+# Worker-unique display_name: the orphan sweep in db_pool deletes every user
+# with this display_name except its own, so sharing one across xdist workers
+# would let each worker delete the others' live test users. (This discriminator
+# was users.email until sql/024 dropped the column.)
 _XDIST_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "main")
-TEST_EMAIL = f"test-sync-{_XDIST_WORKER}@expense-world.dev"
+TEST_DISPLAY_NAME = f"test-sync-{_XDIST_WORKER}"
 
 
 @dataclass
@@ -84,8 +85,8 @@ async def _ensure_test_data(conn, data: TestData):
     """Create the session's seed resources."""
     async with conn.transaction():
         await conn.execute(
-            "INSERT INTO users (id, email, created_at, updated_at) VALUES ($1, $2, now(), now())",
-            data.user_id, TEST_EMAIL,
+            "INSERT INTO users (id, display_name, created_at, updated_at) VALUES ($1, $2, now(), now())",
+            data.user_id, TEST_DISPLAY_NAME,
         )
         await conn.execute(
             "INSERT INTO user_settings (user_id, created_at, updated_at) VALUES ($1, now(), now())",
@@ -204,8 +205,8 @@ async def db_pool(test_data):
         await _ensure_test_data(conn, test_data)
         # Sweep orphans from previous runs that were killed before teardown.
         orphans = await conn.fetch(
-            "SELECT id FROM users WHERE email = $1 AND id != $2",
-            TEST_EMAIL, test_data.user_id,
+            "SELECT id FROM users WHERE display_name = $1 AND id != $2",
+            TEST_DISPLAY_NAME, test_data.user_id,
         )
         for row in orphans:
             await _cleanup_test_data(conn, str(row["id"]))
@@ -229,7 +230,7 @@ async def client(test_data, db_pool):
     """Async HTTP client with auth bypassed to the test user."""
 
     async def mock_user():
-        return AuthUser(id=test_data.user_id, email=TEST_EMAIL)
+        return AuthUser(id=test_data.user_id)
 
     app.dependency_overrides[get_current_user] = mock_user
 

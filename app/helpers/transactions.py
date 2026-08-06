@@ -173,16 +173,12 @@ async def _sync_hashtags(
     api-design-principles.md §6 exception #1.
     """
     if hashtag_ids:
-        # Archived hashtags are filtered here too — same parity rule that
-        # applies to accounts and categories. An archived row is "retired,
-        # do not attach", not "hidden in pickers but still wireable".
         valid = await conn.fetch(
             """
             SELECT id FROM expense_hashtags
             WHERE id = ANY($1::uuid[])
               AND user_id = $2
               AND deleted_at IS NULL
-              AND is_archived = false
             """,
             hashtag_ids,
             user_id,
@@ -197,13 +193,13 @@ async def _sync_hashtags(
 
     # Step 1: soft-delete the junctions *leaving* the active set.
     # ``hashtag_id <> ALL($3)`` skips rows that should stay attached,
-    # so they don't get a version/updated_at bump for nothing. An empty
+    # so they don't get an updated_at bump for nothing. An empty
     # array makes ``<> ALL`` vacuously TRUE for every row — clearing all
     # hashtags still works (the original "soft-delete everything" case).
     await conn.execute(
         """
         UPDATE expense_transaction_hashtags
-        SET deleted_at = now(), updated_at = now(), version = version + 1
+        SET deleted_at = now(), updated_at = now()
         WHERE transaction_id = $1
           AND transaction_source = 1
           AND user_id = $2
@@ -228,8 +224,7 @@ async def _sync_hashtags(
             FROM unnest($3::uuid[]) AS hashtag_id
             ON CONFLICT (transaction_id, hashtag_id) DO UPDATE
             SET deleted_at = NULL,
-                updated_at = now(),
-                version = expense_transaction_hashtags.version + 1
+                updated_at = now()
             WHERE expense_transaction_hashtags.deleted_at IS NOT NULL
             """,
             transaction_id,
@@ -684,7 +679,7 @@ async def delete_transaction(
     await conn.execute(
         """
         UPDATE expense_transaction_hashtags
-        SET deleted_at = now(), updated_at = now(), version = version + 1
+        SET deleted_at = now(), updated_at = now()
         WHERE transaction_id = $1 AND transaction_source = 1 AND user_id = $2 AND deleted_at IS NULL
         """,
         transaction_id,
@@ -719,7 +714,7 @@ async def delete_transaction(
             await conn.execute(
                 """
                 UPDATE expense_transaction_hashtags
-                SET deleted_at = now(), updated_at = now(), version = version + 1
+                SET deleted_at = now(), updated_at = now()
                 WHERE transaction_id = $1 AND transaction_source = 1 AND user_id = $2 AND deleted_at IS NULL
                 """,
                 sibling_id,
@@ -822,8 +817,8 @@ async def restore_transaction(
             missing or no longer soft-deleted (integrity break — refuse
             to restore an asymmetric pair).
         validation_error: account/category (or sibling's) is no longer
-            active or non-archived. All field-level errors collected
-            into one ``fields`` dict before raising.
+            active (or the account is archived). All field-level errors
+            collected into one ``fields`` dict before raising.
     """
     # 1. Lock the soft-deleted primary row.
     row = await conn.fetchrow(
@@ -877,13 +872,13 @@ async def restore_transaction(
     primary_category = await conn.fetchrow(
         """
         SELECT id FROM expense_categories
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
+        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
         """,
         row["category_id"],
         user_id,
     )
     if primary_category is None:
-        errors["category_id"] = "Must reference an active, non-archived category."
+        errors["category_id"] = "Must reference an active category."
 
     if is_transfer and sibling_row is not None:
         sibling_account = await conn.fetchrow(
@@ -900,13 +895,13 @@ async def restore_transaction(
         sibling_category = await conn.fetchrow(
             """
             SELECT id FROM expense_categories
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
             """,
             sibling_row["category_id"],
             user_id,
         )
         if sibling_category is None:
-            errors["transfer.category_id"] = "Must reference an active, non-archived category."
+            errors["transfer.category_id"] = "Must reference an active category."
 
     if errors:
         raise validation_error(
@@ -978,7 +973,7 @@ async def restore_transaction(
     await conn.execute(
         """
         UPDATE expense_transaction_hashtags
-        SET deleted_at = NULL, updated_at = now(), version = version + 1
+        SET deleted_at = NULL, updated_at = now()
         WHERE transaction_id = $1 AND transaction_source = 1
           AND user_id = $2 AND deleted_at = $3
         """,
@@ -1022,7 +1017,7 @@ async def restore_transaction(
         await conn.execute(
             """
             UPDATE expense_transaction_hashtags
-            SET deleted_at = NULL, updated_at = now(), version = version + 1
+            SET deleted_at = NULL, updated_at = now()
             WHERE transaction_id = $1 AND transaction_source = 1
               AND user_id = $2 AND deleted_at = $3
             """,
@@ -1134,7 +1129,6 @@ async def create_batch(
         WHERE id = ANY($1::uuid[])
           AND user_id = $2
           AND deleted_at IS NULL
-          AND is_archived = false
         """,
         list(requested_category_ids),
         user_id,
@@ -1162,7 +1156,7 @@ async def create_batch(
         if not item.category_id:
             item_errors["category_id"] = "Required for non-transfer transactions."
         elif item.category_id not in valid_category_ids:
-            item_errors["category_id"] = "Must reference an active, non-archived category."
+            item_errors["category_id"] = "Must reference an active category."
 
         item_id_str = str(item.id)
         if item_id_str in seen_ids:

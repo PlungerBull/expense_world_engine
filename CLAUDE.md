@@ -108,7 +108,7 @@ Values are **computed at read time**, never stored (`sql/021`; see `docs/currenc
 Optional fields with no value are always returned as `null`, never omitted. Response shape never changes based on data presence.
 
 **Soft delete everywhere**
-All mutable tables carry `deleted_at` (nullable timestamptz). Hard deletion is never performed on financial records. Deleted records are excluded from active queries but remain in the DB.
+All mutable *domain* tables carry `deleted_at` (nullable timestamptz). Hard deletion is never performed on financial records. Deleted records are excluded from active queries but remain in the DB. `user_settings` is the deliberate exception — a settings row lives and dies with its user and is never soft-deleted; its `deleted_at` sat permanently null on the wire until `sql/024` dropped it (WP5).
 
 **Activity log on every mutation**
 Every write to any mutable table produces an immutable `activity_log` row: resource type, resource ID, action (created/updated/deleted/restored), full before/after JSON snapshots, timestamp, actor. No exceptions. This is how "why does my balance look wrong?" gets answered.

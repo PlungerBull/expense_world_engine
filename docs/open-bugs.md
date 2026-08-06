@@ -27,10 +27,10 @@ Add a purge job — the table grows unbounded today.
 
 ## 🟠 High
 
-- **6.1 `extra="forbid"` sweep** — request schemas silently drop unknown fields. Fail closed: unknown input must `422`. *Partially shipped:* the four schemas that lost `exchange_rate` in `sql/021` carry it (`TransactionCreateRequest`, `TransactionUpdateRequest`, `InboxCreateRequest`, `InboxUpdateRequest`), as does `OpeningBalanceRequest`. Every other request schema is still open.
+- **6.1 `extra="forbid"` sweep** — request schemas silently drop unknown fields. Fail closed: unknown input must `422`. *Partially shipped:* the four schemas that lost `exchange_rate` in `sql/021` carry it (`TransactionCreateRequest`, `TransactionUpdateRequest`, `InboxCreateRequest`, `InboxUpdateRequest`), as does `OpeningBalanceRequest`; WP5 added the three auth schemas (`BootstrapRequest`, `SettingsUpdateRequest`, `ProfileUpdateRequest`). Every other request schema is still open.
 - **6.5 The transfer-leg edit guard is a deny-list, and it forgets `category_id`** — `helpers/transactions.update_transaction` blocks `{amount_cents, account_id, date}` on a row with a `transfer_transaction_id`, so a `PUT` can still move ONE leg out of `@Transfer`, stranding the other with nothing to cancel against — indistinguishable from a loan to a person, which is the other thing a non-zero `@Transfer` means. `CLAUDE.md`'s "fix at the root" corollary already describes this guard as having been inverted to an allow-list; it has not been. Invert it: enumerate what a transfer leg may change.
 - **6.2 UUID path/query params typed `str`** — malformed input reaches SQL and 500s instead of `422`.
-- **6.3 CHECK constraints for closed enums** — *partially shipped:* `sql/019` covers `expense_transaction_inbox`, `sql/020` covers `expense_transactions` (`transaction_type IN (1,2)` plus `amount_cents > 0`). Still open for `transaction_source`, reconciliation `status`, `activity_log.actor_type`, `exchange_rates.rate > 0`, `user_settings` enums. ⚠️ Write these as `col IS NOT NULL AND col IN (…)` on any nullable column — a `CHECK` passes on `NULL`, so the bare `IN` admits exactly the row it was added to forbid (found while writing `sql/020`).
+- **6.3 CHECK constraints for closed enums** — *partially shipped:* `sql/019` covers `expense_transaction_inbox`, `sql/020` covers `expense_transactions` (`transaction_type IN (1,2)` plus `amount_cents > 0`). Still open for `transaction_source`, reconciliation `status`, `exchange_rates.rate > 0` (`actor_type` and the `user_settings` enums left the list with their columns, `sql/024`). ⚠️ Write these as `col IS NOT NULL AND col IN (…)` on any nullable column — a `CHECK` passes on `NULL`, so the bare `IN` admits exactly the row it was added to forbid (found while writing `sql/020`).
 - **7.4 Reserved system-category names can permanently 500 transfers** — nothing stops a user claiming `@Debt`/`@Transfer`/`@Opening`; `ensure_system_category`'s `ON CONFLICT (user_id, system_key)` arbiter does not cover the `(user_id, LOWER(name))` index, so the `UniqueViolationError` escapes uncaught. Reject reserved names at the boundary *and* wrap the seeding INSERT.
 
 ---
@@ -41,7 +41,6 @@ Add a purge job — the table grows unbounded today.
 - **2.4** PAT plaintext sits 24 h in `idempotency_keys.response_snapshot`, cancelling "only the hash is stored". Exempt `POST /auth/pat` from snapshot storage; return `409` on replay.
 - **5.3** `sort_order` in a `PUT` body: dead guard, silent `200`.
 - **5.5** Reconciliation state-machine gaps.
-- **6.4** Settings validation.
 - **7.1** `POST`/`PUT /inbox` do no referential or ownership validation — a bad FK 500s, and another user's `account_id` is stored and only rejected at promote. Use the existing `validate_active_account` / `validate_active_category`.
 - **8.2** CREATE snapshots record `hashtag_ids: []` on the batch and transfer paths.
 - **10.1** 57 of 61 routes declare no `response_model`, so `openapi.json` documents no response shapes.
@@ -68,7 +67,7 @@ missing `transaction_source = 1`.
 | **D5** | Add `PROMOTED` action code (5) — promotion is a distinct user action, not an inbox edit. |
 | **D6** | Exempt `POST /auth/pat` from idempotency snapshot storage. |
 | **D7** | Person accounts uncreatable = parked feature gap, not a defect. Correct the spec's People API claims. |
-| **D8** | `parent_transaction_id` stays reserved and `null`. The docs are already truthful. |
+| **D8** | ~~`parent_transaction_id` stays reserved and `null`.~~ **Superseded by the 2026-08-04 audit:** the column was a placeholder, not a foundation — dropped in `sql/024` (WP5). Splits get designed fresh if they ever ship; the parent-exclusion predicate they will need is preserved in `sql/022`'s header. |
 
 ---
 
@@ -84,6 +83,8 @@ repair: with no stored conversion there is no rate to default to `1.0`, nothing 
 stale when an account changes, and no `resolve_home_rates` to read an account without
 a `user_id` filter · **`3.1` delta sync dropping committed writes — `/sync` deleted,
 `sql/023` (docs/rework/WP4)**, along with the ⚪ `X-Client-Id` case-normalisation nit,
-both by deletion.
+both by deletion · **`6.4` settings validation — `sql/024` (docs/rework/WP5)**:
+`display_timezone` validated on both write paths, the six echo-only preference
+fields deleted, auth schemas `extra="forbid"`.
 
 Details are in git history — `git log -- docs/open-bugs.md`.

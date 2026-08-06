@@ -6,8 +6,6 @@ regress the specific hazard the fix addressed.
   * Phase 1.7 — /activity?resource_id=<non-uuid> returns 422, not 500.
   * Phase 2.4 — category/hashtag names are trimmed, empties rejected,
     uniqueness is case-insensitive.
-  * Phase 3.6 — activity_log rows carry actor_type and the GET /activity
-    response exposes it.
   * Transfer edit guard — PUT on a transfer leg rejects date in addition to
     the pre-existing amount_cents / account_id blocks, so the pair can't end
     up on two different days.
@@ -107,33 +105,6 @@ async def test_hashtag_name_case_insensitive_uniqueness(client, test_data):
         async with db.pool.acquire() as conn:
             await conn.execute("DELETE FROM activity_log WHERE resource_id = $1", first_id)
             await conn.execute("DELETE FROM expense_hashtags WHERE id = $1", first_id)
-
-
-# ---------------------------------------------------------------------------
-# Phase 3.6 — activity_log actor_type surfaces in response
-# ---------------------------------------------------------------------------
-@pytest.mark.asyncio
-async def test_activity_response_includes_actor_type(client, test_data):
-    """Any mutation should produce an activity_log row whose actor_type
-    is 'user' and reaches the caller through the response."""
-    cat_id = str(uuid.uuid4())
-    r = await client.post(
-        "/v1/categories",
-        json={"id": cat_id, "name": f"actor-{uuid.uuid4()}", "color": "#aabbcc"},
-        headers={"X-Idempotency-Key": str(uuid.uuid4())},
-    )
-    assert r.status_code == 201
-    try:
-        activity = await client.get(f"/v1/activity?resource_id={cat_id}")
-        assert activity.status_code == 200, activity.text
-        items = activity.json()["items"]
-        assert items, "expected at least one activity row for the new category"
-        assert all("actor_type" in row for row in items)
-        assert items[0]["actor_type"] == "user"
-    finally:
-        async with db.pool.acquire() as conn:
-            await conn.execute("DELETE FROM activity_log WHERE resource_id = $1", cat_id)
-            await conn.execute("DELETE FROM expense_categories WHERE id = $1", cat_id)
 
 
 # ---------------------------------------------------------------------------

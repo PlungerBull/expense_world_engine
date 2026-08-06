@@ -47,15 +47,18 @@ async def test_setting_main_currency_to_current_value_also_rejected(client):
 @pytest.mark.asyncio
 async def test_other_settings_still_updatable(client):
     """The lock is scoped to main_currency; the rest of the PUT still works
-    and the response no longer carries a `recalculation` field."""
+    and the response no longer carries a `recalculation` field.
+
+    display_timezone is the one remaining mutable field since sql/024
+    dropped the six echo-only preference columns (docs/rework/WP5)."""
     r = await client.put(
         "/v1/auth/settings",
-        json={"theme": 2},
+        json={"display_timezone": "America/Lima"},
         headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["theme"] == 2
+    assert body["display_timezone"] == "America/Lima"
     assert body["main_currency"] == "PEN"
     assert "recalculation" not in body
 

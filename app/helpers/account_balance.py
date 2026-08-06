@@ -67,20 +67,15 @@ honest -- but it is why tests/test_wp3_computed_balances.py pins it.
 An obligation for whoever ships split transactions
 --------------------------------------------------
 
-``parent_transaction_id`` is reserved and always null, so this sum is correct
-today. The documented split rule is that a parent row is a display container that
-does not move the balance and only its children do. Under the stored column that
-was enforced by not calling ``apply_balance`` for a parent; a SUM has no such
-escape hatch, so the day splits ship, parent and children double-count. The
-predicate needed then::
-
-    AND NOT EXISTS (SELECT 1 FROM expense_transactions c
-                    WHERE c.parent_transaction_id = t.id
-                      AND c.deleted_at IS NULL)
-
-It is NOT ``parent_transaction_id IS NULL``, which excludes the children and
-keeps the parents -- precisely backwards. Not added today: no row can have a
-parent and the predicate would be unindexed. Also recorded in sql/022.
+The ``parent_transaction_id`` placeholder column was dropped by ``sql/024`` --
+it was never written, so this sum is correct today. The documented split rule
+is that a parent row is a display container that does not move the balance and
+only its children do -- which a naive SUM has no way to honour, so the day
+splits ship (with whatever column that fresh design uses), the sum needs a
+parent-excluding predicate. The shape that was worked out for the old column
+is preserved in ``sql/022``'s header: exclude rows that HAVE children (NOT
+EXISTS over the child FK), not rows with a parent -- the inverse keeps parents
+and drops children, precisely backwards.
 
 
 Transaction boundaries

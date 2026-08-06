@@ -73,7 +73,6 @@ class TransactionResponse(BaseModel):
     category_id: str
     cleared: bool
     transfer_transaction_id: Optional[str] = None
-    parent_transaction_id: Optional[str] = None
     inbox_id: Optional[str] = None
     reconciliation_id: Optional[str] = None
     created_at: datetime
@@ -121,7 +120,6 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
         category_id=str(row["category_id"]),
         cleared=row["cleared"],
         transfer_transaction_id=str(row["transfer_transaction_id"]) if row["transfer_transaction_id"] else None,
-        parent_transaction_id=str(row["parent_transaction_id"]) if row["parent_transaction_id"] else None,
         inbox_id=str(row["inbox_id"]) if row["inbox_id"] else None,
         reconciliation_id=str(row["reconciliation_id"]) if row["reconciliation_id"] else None,
         created_at=row["created_at"],

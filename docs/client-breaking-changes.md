@@ -11,6 +11,56 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-06 — schema slimming: 16 dead columns and the 4 category/hashtag archive routes deleted
+
+**Engine change.** `docs/rework/WP5`, `sql/024`. Everything the 2026-08-04 audit
+traced to zero readers is gone. **Engine-only by owner decision** — the CLI work
+below is recorded, not yet done, so the affected CLI commands break until it lands.
+
+**1. Six settings fields deleted, and `PUT /auth/settings` now fails closed.**
+`theme`, `start_of_week`, `transaction_sort_preference`, `sidebar_show_bank_accounts`,
+`sidebar_show_people`, `sidebar_show_categories` are gone from `user_settings`, from
+`UserSettingsResponse`, and from `SettingsUpdateRequest`. The auth request schemas
+are now `extra="forbid"`, so a caller still sending any of them — previously a
+silent drop — gets a `422`. `display_timezone` is the one mutable settings field
+left, and it is now **validated on write**: a value that is not an IANA zone name
+`422`s on both `PUT /auth/settings` and `POST /auth/bootstrap` (it feeds
+`AT TIME ZONE` on every report read, where a bad value would 500).
+`deleted_at` is also gone from settings responses — a settings row is never
+soft-deleted, so the field was permanently `null`.
+
+**2. The four archive routes are gone and `is_archived` is dropped from categories
+and hashtags.** `POST /categories/{id}/archive`, `/unarchive`, and the hashtag pair
+now `404`. `is_archived` is absent from category and hashtag responses.
+`?include_archived=` on `GET /categories` / `GET /hashtags` is no longer a declared
+parameter — FastAPI ignores unknown query params, so old callers get a **silent
+`200` with the full active list**, not an error. Archiving those two resources was
+redundant with soft delete, which already hides a row from pickers while keeping
+history intact. **Accounts keep their archive** — an archived account still holds
+real money; nothing changes there.
+
+**3. Dead wire fields removed.** `email` is gone from user responses (its populator
+was the JWT claim deleted 2026-08-03; PAT auth has no email source, so the field
+was permanently `null` — a field that lied). `actor_type` is gone from
+`GET /activity` (every writer ever passed `"user"`). `parent_transaction_id` is
+gone from transaction responses (never written; a placeholder for unbuilt splits).
+None of these have a replacement; clients delete their references.
+
+### What the CLI must do (not yet done — engine-only scope)
+
+| Location | Required change |
+|---|---|
+| `expense/commands/auth_cmd.py:207-248` | Delete the six `--theme` / `--start-of-week` / `--transaction-sort-preference` / `--sidebar-show-*` options, their payload entries, and the docstring example. **Until then, `expense auth settings` with any of them returns 422.** |
+| `expense/commands/categories_cmd.py:261-300`, `hashtags_cmd.py:237-275` | Delete the `archive` / `unarchive` commands (keep `run_toggle` and the accounts pair). They now 404. |
+| `expense/tui/screens/_base.py:402,430-433,495-513` | Gate the `a` archive binding to the Accounts screen; the categories/hashtags screens lose it (and the system-category `check_action` branch). |
+| `categories_cmd.py:52,62`, `hashtags_cmd.py:46,54`, `tui/screens/categories.py:14,20-28,38,48`, `tui/screens/hashtags.py:13,20-23,42` | Drop the `Archived`/`Status` columns and archived-dim styling; the field no longer arrives. |
+| `_resource.py:262,272`, `quick_log.py:213-222`, `import_/apply.py:56-63` | Drop `include_archived` for categories/hashtags (keep for accounts); drop the `not c.get("is_archived")` suggestion filters. |
+| `tui/screens/system.py:165` | Drop the `email` row (it already disappears via the `None` filter; this is tidying). |
+| Tests | `test_cmd_auth`, `test_cmd_categories`, `test_cmd_hashtags`, `test_tui_categories_hashtags`, `test_tui_manage_actions`, `test_resource`, `test_tui_quick_log`, `test_tui_paging`, contract `test_resources_lifecycle`, and the `command_surface` docstring-example validator. |
+| Docs | `cli-spec.md` (flags, archive verbs, `--include-archived`), `roadmap.md`, superseding notes on `decisions.md` "Archive is a prompt-free toggle" and the system-category `a`-key entry. |
+
+---
+
 ## 2026-08-06 — `GET /v1/sync` deleted; `sync_checkpoints` dropped; `X-Client-Id` no longer read
 
 **Engine change.** `docs/rework/WP4`. The delta-sync endpoint is gone: `app/routers/sync.py`,

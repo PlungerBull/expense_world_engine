@@ -34,7 +34,6 @@ from app.helpers.auth_token import PAT_PREFIX, hash_pat
 @dataclass
 class AuthUser:
     id: str
-    email: Optional[str]
 
 
 async def get_current_user(
@@ -62,7 +61,7 @@ async def get_current_user(
     if row is None:
         raise unauthorized("Invalid or revoked token.")
 
-    return AuthUser(id=str(row["user_id"]), email=None)
+    return AuthUser(id=str(row["user_id"]))
 
 
 CurrentUser = Annotated[AuthUser, Depends(get_current_user)]

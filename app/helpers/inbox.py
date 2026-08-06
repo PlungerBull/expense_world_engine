@@ -495,18 +495,18 @@ async def promote_inbox_item(
     # Category validation only for non-transfers (transfers auto-assign)
     if not is_transfer:
         if inbox_row["category_id"] is None:
-            errors["category_id"] = "Must reference an active, non-archived category."
+            errors["category_id"] = "Must reference an active category."
         else:
             category = await conn.fetchrow(
                 """
                 SELECT id FROM expense_categories
-                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
+                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
                 """,
                 inbox_row["category_id"],
                 user_id,
             )
             if category is None:
-                errors["category_id"] = "Must reference an active, non-archived category."
+                errors["category_id"] = "Must reference an active category."
 
     # Transfers: the sibling account gets the same check the primary does.
     # create_transfer_pair validates it too, but only after this function has

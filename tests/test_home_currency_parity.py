@@ -101,13 +101,13 @@ def _midday(day: str) -> datetime:
 class Fixtures:
     def __init__(self):
         self.usd_account_id = str(uuid.uuid4())
-        self.archived_category_id = str(uuid.uuid4())
+        self.empty_category_id = str(uuid.uuid4())
         self.txn_ids: list[str] = []
 
 
 @pytest.fixture
 async def fx(test_data, db_pool):
-    """Seed rates, a USD account, an empty archived category. Clean up all three."""
+    """Seed rates, a USD account, an empty category. Clean up all three."""
     data = Fixtures()
 
     async with db.pool.acquire() as conn:
@@ -129,11 +129,11 @@ async def fx(test_data, db_pool):
         )
         await conn.execute(
             """INSERT INTO expense_categories
-                (id, user_id, name, color, is_system, is_archived, sort_order,
+                (id, user_id, name, color, is_system, sort_order,
                  created_at, updated_at)
-               VALUES ($1, $2, 'Parity Archived', '#00FF00', false, true, 98,
+               VALUES ($1, $2, 'Parity Empty', '#00FF00', false, 98,
                        now(), now())""",
-            data.archived_category_id, test_data.user_id,
+            data.empty_category_id, test_data.user_id,
         )
 
     # get_rate caches negative results for an hour, so a date probed before its
@@ -152,7 +152,7 @@ async def fx(test_data, db_pool):
             "DELETE FROM expense_bank_accounts WHERE id = $1", data.usd_account_id
         )
         await conn.execute(
-            "DELETE FROM expense_categories WHERE id = $1", data.archived_category_id
+            "DELETE FROM expense_categories WHERE id = $1", data.empty_category_id
         )
         # Only our own dates. Other workers share this table.
         await conn.execute(
@@ -392,12 +392,12 @@ async def test_unconvertible_row_is_null_and_flagged(fx, test_data):
 async def test_empty_category_is_not_flagged_as_unconvertible(fx, test_data):
     """The ``t.id IS NOT NULL`` guard, in the shape that needs it.
 
-    ``routers/dashboard.py``'s archived aggregators LEFT JOIN transactions so that
-    categories with none survive with zero totals. On those rows t.* and a.* are
-    all NULL and HOME_CENTS_EXPR falls to its ELSE NULL arm — indistinguishable
-    from a genuinely unconvertible row. Without the guard every empty archived
-    category would report ``spent_home_cents: null`` instead of 0, contradicting
-    the invariant the LEFT JOIN exists to preserve.
+    Aggregators that LEFT JOIN transactions keep categories with none, with
+    zero totals. On those rows t.* and a.* are all NULL and HOME_CENTS_EXPR
+    falls to its ELSE NULL arm — indistinguishable from a genuinely
+    unconvertible row. Without the guard every empty category would report
+    ``spent_home_cents: null`` instead of 0, contradicting the invariant the
+    LEFT JOIN exists to preserve.
     """
     query = f"""
         SELECT
@@ -415,7 +415,7 @@ async def test_empty_category_is_not_flagged_as_unconvertible(fx, test_data):
         GROUP BY c.id
     """
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow(query, fx.archived_category_id, "UTC")
+        row = await conn.fetchrow(query, fx.empty_category_id, "UTC")
 
     assert row is not None, "the LEFT JOIN must preserve the empty category"
     assert row["unconvertible"] == 0, "an empty category is not an unconvertible one"

@@ -8,20 +8,18 @@ See ``app/helpers/categories.py`` for the convention: these functions do NOT
 open their own ``conn.transaction()`` — callers own transaction boundaries.
 """
 
-from typing import Optional
-
 import asyncpg
 
 from app.constants import ActivityAction
 from app.errors import not_found, validation_error
 from app.helpers.activity_log import write_activity_log
+from app.helpers.validation import validate_timezone
 from app.schemas.auth import settings_from_row, user_from_row
 
 
 async def bootstrap(
     conn: asyncpg.Connection,
     user_id: str,
-    email: Optional[str],
     display_name: str,
     timezone: str,
 ) -> dict:
@@ -34,6 +32,10 @@ async def bootstrap(
 
     Returns the canonical ``{"user": ..., "settings": ...}`` shape.
     """
+    # Validated unconditionally, not just on the insert branch: a returning
+    # user sending a garbage zone should be told, not silently ignored.
+    validate_timezone(timezone, "timezone")
+
     # Check if user exists
     existing = await conn.fetchrow(
         "SELECT id FROM users WHERE id = $1", user_id
@@ -43,12 +45,11 @@ async def bootstrap(
         # New user — insert
         user_row = await conn.fetchrow(
             """
-            INSERT INTO users (id, email, display_name, last_login_at, created_at, updated_at)
-            VALUES ($1, $2, $3, now(), now(), now())
+            INSERT INTO users (id, display_name, last_login_at, created_at, updated_at)
+            VALUES ($1, $2, now(), now(), now())
             RETURNING *
             """,
             user_id,
-            email,
             display_name,
         )
         await write_activity_log(
@@ -139,6 +140,11 @@ async def update_settings(
             "Home currency cannot be changed.",
             {"main_currency": "The home currency is locked to PEN and is not updatable."},
         )
+
+    # display_timezone reaches AT TIME ZONE on every report read; a bad value
+    # stored here would 500 those reads, so it is rejected at the boundary.
+    if "display_timezone" in fields:
+        validate_timezone(fields["display_timezone"], "display_timezone")
 
     # Before snapshot
     before_row = await conn.fetchrow(

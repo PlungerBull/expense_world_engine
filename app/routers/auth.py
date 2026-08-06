@@ -41,7 +41,6 @@ async def bootstrap(
         work=lambda conn: auth_service.bootstrap(
             conn,
             auth_user.id,
-            auth_user.email,
             body.display_name,
             body.timezone,
         ),
