@@ -6,43 +6,62 @@ Routers stay thin (HTTP glue + idempotency) and delegate business logic here.
 This module is the most complex service in the codebase because transactions
 intersect with every other domain:
 
-  * account balances (via helpers.balance)
   * hashtag junction rows (via the private ``_sync_hashtags``)
   * transfer pair atomicity (via helpers.transfers.create_transfer_pair)
   * reconciliation field-locking and cascade unassignment
 
+## Account balances are not written here
+
+Nothing in this module touches ``expense_bank_accounts``. An account's balance
+is the signed sum of its non-deleted transactions (sql/022,
+``helpers/account_balance``), so inserting, editing, soft-deleting or restoring
+a row below IS the balance change — atomically, with no second write to keep in
+step and no path that can forget one.
+
 ## Transaction boundaries and locks
 
 Like every other helper, these functions do NOT open their own
-``conn.transaction()`` — callers own transaction boundaries. The
-``FOR UPDATE`` locks in ``update_transaction`` and ``delete_transaction``
-acquire row-level locks on the transaction row so that a concurrent
-modification can't change ``amount_cents`` between our read and our
-balance reversal. Those locks release when the caller's transaction
-commits — which is why the lock acquisition MUST stay inside this
-service call (not split across service and caller).
+``conn.transaction()`` — callers own transaction boundaries
+(``helpers/idempotency.run_idempotent``).
+
+The ``FOR UPDATE`` locks in ``update_transaction``, ``delete_transaction`` and
+``restore_transaction`` are still load-bearing, but **not for the reason they
+were added.** They were introduced to stop a concurrent write changing
+``amount_cents`` between our read and our balance reversal — a lost update on a
+stored balance, which is now unrepresentable. What they still protect:
+
+  * **The activity-log pair.** Every one of these flows reads a ``before_row``,
+    mutates, then writes both snapshots. Without the lock the two halves can
+    describe two different states and the audit trail records a change that
+    never happened.
+  * **Transfer-pair invariants.** ``restore_transaction`` refuses to restore one
+    leg of an asymmetric pair; that check is only sound if the sibling is pinned
+    while it runs.
+
+Stated explicitly because the stale rationale would otherwise invite the next
+reader to delete the locks as vestigial. They are not.
 
 ## "No-split zones"
 
-Several flows are flagged as tight atomic units that must not be
-decomposed further:
+Two flows are tight atomic units that must not be decomposed further:
 
-  * ``create_transfer_pair`` (12-step transfer orchestration — stays
-    intact in ``app.helpers.transfers``)
-  * The balance-delta accumulation loop in ``create_batch`` — extracting
-    per-item balance writes would break the "K UPDATEs for N items" optimisation
+  * ``create_transfer_pair`` (transfer orchestration — stays intact in
+    ``app.helpers.transfers``)
   * The dynamic field-mutation chain in ``update_transaction`` — each
     conditional depends on whether specific keys are present in ``fields``
+
+``create_batch``'s balance-delta accumulation loop used to be a third. It is
+gone: it existed only to turn N per-item balance writes into K UPDATEs, and it
+carried its own hand-rolled copy of the sign matrix to do so.
 """
 
 from typing import Optional
 
 import asyncpg
 
-from app.constants import ActivityAction, ReconciliationStatus, TransactionType
+from app.constants import ActivityAction, ReconciliationStatus
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
-from app.helpers.balance import apply_balance, reverse_balance
 from app.helpers.query_builder import dynamic_update
 from app.helpers.validation import validate_active_account, validate_active_category
 from app.schemas.transactions import (
@@ -342,9 +361,6 @@ async def create_transaction(
 
     response = transaction_from_row(row)
 
-    # Update account balance
-    await apply_balance(conn, body.account_id, user_id, amount_cents, transaction_type)
-
     # Hashtags
     if body.hashtag_ids:
         await _sync_hashtags(conn, str(row["id"]), user_id, body.hashtag_ids)
@@ -504,9 +520,6 @@ async def update_transaction(
                 {f: "Cannot modify on a transfer transaction." for f in blocked},
             )
 
-    # Track whether balance needs updating
-    needs_balance_update = False
-
     # Process amount_cents change
     if "amount_cents" in fields:
         if fields["amount_cents"] == 0:
@@ -516,7 +529,6 @@ async def update_transaction(
             )
         fields["transaction_type"] = infer_transaction_type(fields["amount_cents"])
         fields["amount_cents"] = abs(fields["amount_cents"])
-        needs_balance_update = True
 
     # No re-rating happens here, and that is the whole of open bug 1.5.
     # This is where a `date`-keyed re-rate block used to live: it refreshed
@@ -529,7 +541,6 @@ async def update_transaction(
     # Validate new account_id if changing
     if "account_id" in fields:
         await validate_active_account(conn, fields["account_id"], user_id)
-        needs_balance_update = True
 
     # Validate new category_id if changing
     if "category_id" in fields:
@@ -553,19 +564,11 @@ async def update_transaction(
                 {"date": "Must not be in the future."},
             )
 
-    # Balance update: reverse old, apply new
-    if needs_balance_update:
-        await reverse_balance(
-            conn, str(before_row["account_id"]), user_id,
-            before_row["amount_cents"], before_row["transaction_type"],
-        )
-        effective_account_id = fields.get("account_id") or str(before_row["account_id"])
-        effective_amount = fields.get("amount_cents", before_row["amount_cents"])
-        effective_type = fields.get("transaction_type", before_row["transaction_type"])
-        await apply_balance(
-            conn, effective_account_id, user_id,
-            effective_amount, effective_type,
-        )
+    # No balance step. A reverse-then-apply pair used to run here, guarded by a
+    # `needs_balance_update` flag set wherever amount_cents or account_id
+    # changed — a flag that had to be kept in step with every future field that
+    # might affect a balance. Moving the row IS moving both balances now: the
+    # old account stops counting it and the new one starts, in the same UPDATE.
 
     if fields:
         after_row = await dynamic_update(conn, "expense_transactions", fields, transaction_id, user_id)
@@ -674,11 +677,8 @@ async def delete_transaction(
     )
     after = transaction_from_row(after_row)
 
-    # Reverse balance
-    await reverse_balance(
-        conn, str(row["account_id"]), user_id,
-        row["amount_cents"], row["transaction_type"],
-    )
+    # No balance reversal: the sum that defines the balance already excludes
+    # soft-deleted rows, so setting deleted_at IS the reversal.
 
     # Soft-delete junction rows
     await conn.execute(
@@ -691,8 +691,8 @@ async def delete_transaction(
         user_id,
     )
 
-    # Handle transfer sibling — also lock the sibling row so its
-    # amount_cents can't change between our read and the reversal.
+    # Handle transfer sibling — locked so its state can't change between the
+    # before-snapshot and the after-snapshot written below.
     if row["transfer_transaction_id"] is not None:
         sibling_id = str(row["transfer_transaction_id"])
         sibling_row = await conn.fetchrow(
@@ -715,11 +715,6 @@ async def delete_transaction(
                 user_id,
             )
             sibling_after = transaction_from_row(sibling_after_row)
-
-            await reverse_balance(
-                conn, str(sibling_row["account_id"]), user_id,
-                sibling_row["amount_cents"], sibling_row["transaction_type"],
-            )
 
             await conn.execute(
                 """
@@ -977,13 +972,9 @@ async def restore_transaction(
         )
     after = transaction_from_row(after_row)
 
-    # 6. Re-apply primary balance.
-    await apply_balance(
-        conn, str(row["account_id"]), user_id,
-        row["amount_cents"], row["transaction_type"],
-    )
-
-    # 7. Re-activate cascaded junction rows on the primary.
+    # 6. Re-activate cascaded junction rows on the primary.
+    # (There is no balance step to mirror the delete's reversal: clearing
+    # deleted_at above puts the row back into the sum that defines the balance.)
     await conn.execute(
         """
         UPDATE expense_transaction_hashtags
@@ -996,7 +987,7 @@ async def restore_transaction(
         primary_deleted_at,
     )
 
-    # 8. Sibling cascade (mirror steps 5-7).
+    # 7. Sibling cascade (mirror steps 5-6).
     if is_transfer and sibling_row is not None and sibling_id is not None:
         sibling_before = transaction_from_row(sibling_row)
         # Soft-deleted state → []; attach for §6 audit consistency.
@@ -1028,11 +1019,6 @@ async def restore_transaction(
             )
         sibling_after = transaction_from_row(sibling_after_row)
 
-        await apply_balance(
-            conn, str(sibling_row["account_id"]), user_id,
-            sibling_row["amount_cents"], sibling_row["transaction_type"],
-        )
-
         await conn.execute(
             """
             UPDATE expense_transaction_hashtags
@@ -1057,14 +1043,14 @@ async def restore_transaction(
     # Primary post-restore: junctions are active again → restored set.
     await attach_hashtag_ids(conn, after)
 
-    # 9. Primary activity log.
+    # 8. Primary activity log.
     await write_activity_log(
         conn, user_id, "transaction", transaction_id, ActivityAction.RESTORED,
         before_snapshot=before,
         after_snapshot=after,
     )
 
-    # 10. Build warnings list (always present; empty when restore is clean).
+    # 9. Build warnings list (always present; empty when restore is clean).
     warnings: list[str] = []
     if primary_warning is not None:
         warnings.append(primary_warning)
@@ -1192,9 +1178,8 @@ async def create_batch(
             {"items": all_errors},
         )
 
-    # Process all items — accumulate balance deltas
+    # Process all items
     created = []
-    balance_deltas: dict[str, int] = {}
 
     for item in body.transactions:
         transaction_type = infer_transaction_type(item.amount_cents)
@@ -1231,17 +1216,6 @@ async def create_batch(
         response = transaction_from_row(row)
         created.append(response)
 
-        # Accumulate balance delta. Batch rejects transfers above, so
-        # we only need the expense/income branch of the sign matrix;
-        # this is a deliberate simplification vs ``apply_balance`` which
-        # handles the full matrix but would require K individual
-        # UPDATEs instead of the optimised accumulate-then-apply.
-        if transaction_type == TransactionType.OUTFLOW:
-            delta = -amount_cents
-        else:
-            delta = amount_cents
-        balance_deltas[item.account_id] = balance_deltas.get(item.account_id, 0) + delta
-
         # Hashtags
         if item.hashtag_ids:
             await _sync_hashtags(conn, str(row["id"]), user_id, item.hashtag_ids)
@@ -1252,19 +1226,13 @@ async def create_batch(
             after_snapshot=response,
         )
 
-    # Apply accumulated balance deltas — one UPDATE per distinct account
-    for acct_id, delta in balance_deltas.items():
-        await conn.execute(
-            """
-            UPDATE expense_bank_accounts
-            SET current_balance_cents = current_balance_cents + $1,
-                updated_at = now(), version = version + 1
-            WHERE id = $2 AND user_id = $3
-            """,
-            delta,
-            acct_id,
-            user_id,
-        )
+    # The accumulate-then-apply balance loop that used to close this function is
+    # gone. It existed to collapse N per-item balance writes into K UPDATEs, and
+    # to do that it carried its OWN copy of the sign matrix, inline — a third
+    # rendering that the `apply_balance` grep never surfaced and that no test
+    # covered. Exactly the drift CLAUDE.md's "one rendering of the sign matrix"
+    # rule is about. Nothing replaces it: the K UPDATEs were the optimisation,
+    # and there is no longer anything to optimise.
 
     # Single round-trip resolves hashtag_ids for the whole batch.
     await attach_hashtag_ids(conn, created)

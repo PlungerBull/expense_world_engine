@@ -122,9 +122,9 @@ async def fx(test_data, db_pool):
         await conn.execute(
             """INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order, created_at, updated_at)
+                 is_archived, sort_order, created_at, updated_at)
                VALUES ($1, $2, 'USD-Parity', 'USD', false, '#00FF00',
-                       0, false, 98, now(), now())""",
+                       false, 98, now(), now())""",
             data.usd_account_id, test_data.user_id,
         )
         await conn.execute(

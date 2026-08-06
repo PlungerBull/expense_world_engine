@@ -5,8 +5,9 @@ routers/reconciliations.py and routers/accounts.py (reorder endpoint).
 Routers stay thin (HTTP glue + idempotency) and delegate business logic
 here.
 
-See ``app/helpers/balance.py`` for the convention: these functions do NOT
-open their own ``conn.transaction()`` — callers own transaction boundaries.
+See ``app/helpers/idempotency.run_idempotent`` for the convention: these
+functions do NOT open their own ``conn.transaction()`` — callers own
+transaction boundaries.
 """
 
 from datetime import datetime

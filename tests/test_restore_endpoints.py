@@ -303,11 +303,6 @@ async def test_restore_hashtag_round_trip_does_not_relink_junctions(
                 "DELETE FROM expense_transactions WHERE id = $1 AND user_id = $2",
                 txn_id, test_data.user_id,
             )
-            # Restore the test_data account balance (we created a -100 expense).
-            await conn.execute(
-                "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + 100 WHERE id = $1",
-                test_data.account_id,
-            )
         await _cleanup_hashtag(hashtag_id, test_data.user_id)
 
 
@@ -471,9 +466,4 @@ async def test_restore_promoted_inbox_item_returns_409(client, test_data):
             await conn.execute(
                 "DELETE FROM expense_transaction_inbox WHERE id = $1 AND user_id = $2",
                 inbox_id, test_data.user_id,
-            )
-            # Restore test_data account balance (the promote applied -250).
-            await conn.execute(
-                "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + 250 WHERE id = $1",
-                test_data.account_id,
             )

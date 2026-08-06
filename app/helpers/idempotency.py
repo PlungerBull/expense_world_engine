@@ -125,6 +125,33 @@ async def run_idempotent(
     Cached hits skip ``work`` entirely and return the stored envelope
     verbatim.
 
+    ## Transaction boundaries and locks — the convention for every service helper
+
+    **This is the only transaction boundary in the engine's write path.** Every
+    mutating route passes a ``work=lambda conn: <service>(conn, ...)`` closure
+    into this function, so a service helper's row write, its junction writes and
+    its ``activity_log`` entry are always in one transaction with the
+    idempotency-key claim. That is where "all or nothing" actually comes from —
+    it is structural, not something each call site upholds.
+
+    Consequently, service helpers in ``app/helpers/`` do **NOT** open their own
+    ``conn.transaction()``. They assume they are already inside one and that the
+    caller has acquired any ``FOR UPDATE`` locks it needs. Opening a nested
+    transaction there would create a savepoint whose rollback semantics nobody
+    designed for.
+
+    Locks are taken on the row being *modified* — ``expense_transactions`` in the
+    update/delete/restore paths, the inbox row on promote — never on the account.
+    Their purpose is to keep a read-modify-write sequence coherent: the
+    before/after pair written to ``activity_log`` must describe one state of the
+    row, and the transfer-pair invariants must see a stable sibling.
+
+    (Until sql/022 this convention was documented in ``app/helpers/balance.py``
+    and cross-referenced from five other modules. It lived there because the
+    stored-balance UPDATE was the thing most obviously depending on it. The
+    balance is computed now, so the contract moved to the function that actually
+    owns the boundary.)
+
     Args:
         user_id: Authenticated user id from the JWT.
         key: ``X-Idempotency-Key`` header value, or None when absent.

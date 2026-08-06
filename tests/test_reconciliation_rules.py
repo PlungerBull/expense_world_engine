@@ -145,20 +145,6 @@ async def test_completed_reconciliation_locks_transaction_fields(client, test_da
         )
         await _cleanup_reconciliation(recon_id, test_data.user_id)
         await _cleanup_transactions([txn_id], test_data.user_id)
-        # Restore account balance.
-        async with db.pool.acquire() as conn:
-            # The test created one expense of -500 which was reversed
-            # during deletion by the regular delete path... except we
-            # used raw DELETE for cleanup, not the soft-delete endpoint.
-            # So we must manually credit the 500 back.
-            await conn.execute(
-                """
-                UPDATE expense_bank_accounts
-                SET current_balance_cents = current_balance_cents + 500
-                WHERE id = $1 AND user_id = $2
-                """,
-                test_data.account_id, test_data.user_id,
-            )
 
 
 @pytest.mark.asyncio
@@ -233,11 +219,6 @@ async def test_completed_reconciliation_rejects_balance_edits(client, test_data)
         )
         await _cleanup_reconciliation(recon_id, test_data.user_id)
         await _cleanup_transactions([txn_id], test_data.user_id)
-        async with db.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + 250 WHERE id = $1 AND user_id = $2",
-                test_data.account_id, test_data.user_id,
-            )
 
 
 @pytest.mark.asyncio
@@ -303,11 +284,6 @@ async def test_recon_complete_and_revert_bump_assigned_txn_version(client, test_
     finally:
         await _cleanup_reconciliation(recon_id, test_data.user_id)
         await _cleanup_transactions([txn_id], test_data.user_id)
-        async with db.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + 100 WHERE id = $1 AND user_id = $2",
-                test_data.account_id, test_data.user_id,
-            )
 
 
 @pytest.mark.asyncio
@@ -390,13 +366,3 @@ async def test_reconciliation_transactions_paginate_and_flag_truncation(
     finally:
         await _cleanup_reconciliation(recon_id, test_data.user_id)
         await _cleanup_transactions(created_txn_ids, test_data.user_id)
-        # Restore balance: 4 expenses of -100 each = -400 total.
-        async with db.pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE expense_bank_accounts
-                SET current_balance_cents = current_balance_cents + 400
-                WHERE id = $1 AND user_id = $2
-                """,
-                test_data.account_id, test_data.user_id,
-            )

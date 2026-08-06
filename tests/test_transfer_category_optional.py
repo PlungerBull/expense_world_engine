@@ -28,10 +28,9 @@ async def _make_second_account(user_id: str) -> str:
             """
             INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order,
-                 created_at, updated_at)
+                 is_archived, sort_order, created_at, updated_at)
             VALUES ($1, $2, 'Cat-Optional Target', 'PEN', false, '#00FF00',
-                    50000, false, 2, now(), now())
+                    false, 2, now(), now())
             """,
             account_id, user_id,
         )

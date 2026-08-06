@@ -10,7 +10,6 @@ from app.constants import (
 )
 from app.errors import conflict, validation_error
 from app.helpers.activity_log import write_activity_log
-from app.helpers.balance import apply_balance
 from app.helpers.categories import ensure_system_category
 from app.schemas.transactions import infer_transaction_type, transaction_from_row
 
@@ -232,24 +231,17 @@ async def create_transfer_pair(
     )
 
     # ------------------------------------------------------------------
-    # 10. Update balances on both accounts via the shared helper so the
-    #     sign matrix lives in one place (helpers/balance.py).
+    # 10. Build response dicts
     # ------------------------------------------------------------------
-    await apply_balance(
-        conn, primary_account_id, user_id, primary_abs, primary_type,
-    )
-    await apply_balance(
-        conn, transfer_account_id, user_id, sibling_abs, sibling_type,
-    )
-
-    # ------------------------------------------------------------------
-    # 11. Build response dicts
-    # ------------------------------------------------------------------
+    # There is no balance step here any more. Both accounts' balances are the
+    # signed sum of their rows (sql/022), and the two rows above are already
+    # written — so both balances have already moved, atomically, by
+    # construction. The step this replaced could be forgotten; a sum cannot.
     primary_response = transaction_from_row(primary_row)
     sibling_response = transaction_from_row(sibling_row)
 
     # ------------------------------------------------------------------
-    # 12. Activity logs — one per transaction
+    # 11. Activity logs — one per transaction
     # ------------------------------------------------------------------
     await write_activity_log(
         conn, user_id, "transaction", primary_id_str, ActivityAction.CREATED,

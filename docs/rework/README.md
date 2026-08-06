@@ -105,15 +105,16 @@ defects this program removes are exactly this rule being broken.
 is a bug waiting to happen.
 
 **Tests are the arbiter.** `pytest`, no flags, no env — it runs against a dedicated
-`expense_world_test` database. **213 passing as of 2026-08-04.** Your package must leave
+`expense_world_test` database. **238 passing as of 2026-08-06.** Your package must leave
 the suite green. Deleting a feature means deleting its tests; changing behaviour means
 changing the tests that assert the old behaviour, deliberately and visibly, not by
 loosening assertions until they pass.
 
 **Update the convention you invalidate, immediately.** `CLAUDE.md` is loaded into context
-at the start of every session. Two of its "non-negotiable conventions" are marked ⏳ and
-are scheduled to change (the sign convention → WP1, balance atomicity → WP3). **The
-package that invalidates a convention rewrites it in the same change.** Do not defer that
+at the start of every session. **The package that invalidates a convention rewrites it in
+the same change.** Both conventions that carried a ⏳ marker have now been rewritten by the
+package that invalidated them — the sign convention by WP1, and "Balance updates are
+atomic" by WP3, which replaced it with "Balances are computed at read time, never stored". Do not defer that
 to WP7 — an agent starting the next package would read a rule that no longer holds. WP7
 handles the larger `engine-spec.md` / `schema-reference.md` sweep, not this.
 
@@ -185,7 +186,7 @@ boundaries, not defects.
 |---|---|---|
 | [WP1](WP1-transfer-collapse.md) | `transaction_type` becomes direction on every row; `transfer_direction` deleted | Blocks WP2. **Has a deadline.** |
 | [WP2](WP2-read-time-currency.md) | Delete stored home values and rates; convert at read time | Needs WP1 |
-| [WP3](WP3-computed-balances-and-indexes.md) | Delete `current_balance_cents`; compute it; **add the missing indexes** | Blocks WP4 |
+| [WP3](WP3-computed-balances-and-indexes.md) | Delete `current_balance_cents`; compute it; **add the missing indexes** | ✅ **Landed 2026-08-06** (`sql/022`). Unblocks WP4 |
 | [WP4](WP4-delete-sync.md) | Delete `/sync`, `sync_checkpoints`, and the `updated_at` indexes | Needs WP3 |
 | [WP5](WP5-schema-slimming.md) | 15 columns and 4 routes with no readers | Independent |
 | [WP6](WP6-reconciliation-simplification.md) | Delete the chaining cascade; shrink the largest helper | Independent |
@@ -231,3 +232,69 @@ this guard was already inverted to an allow-list, which it was not.
 > shipped that way.
 
 Delete the row from `open-bugs.md` when it closes — it is a work queue, not a changelog.
+
+
+---
+
+## WP3 landed, 2026-08-06 — three deviations from its own spec, all deliberate
+
+`sql/022` drops `current_balance_cents`, adds the indexes, and deletes
+`app/helpers/balance.py`. Suite green at 238 (was 228; the ten new ones are
+`tests/test_wp3_computed_balances.py`). Recorded here because WP4 reads this file
+and three of WP3's stated decisions did not survive contact with the code.
+
+**1. Three of the six recommended indexes were not created.** The package's own
+table says it is a recommendation, not a prescription, and says to confirm each
+one against the queries that exist. Two did not survive that check:
+
+- `(transfer_transaction_id)` — **no query filters on it, anywhere.** Every use
+  reads the value off a row in Python and looks the sibling up by primary key.
+  "After WP1 this column is the discriminator" is true about semantics and says
+  nothing about a query plan.
+- `expense_transaction_hashtags (hashtag_id)` — the report joins the *other*
+  direction (`monthly_report.py:194-198` correlates on `th.transaction_id`),
+  which is already indexed twice.
+- `INCLUDE (amount_cents, transaction_type)` — included columns defeat HOT
+  updates, so every amount edit would bloat every index on the row.
+
+`sql/022`'s header records each omission and why. **WP4: the four indexes that
+DO exist are `idx_expense_transactions_user_{account,date,category,reconciliation}`.
+Confirm those before dropping the seven `idx_*_user_updated` sync indexes.**
+
+**2. The `EXPLAIN` definition-of-done was split in two.** The test database holds
+a handful of rows, so the planner picks a sequential scan whichever indexes exist
+— an `EXPLAIN`-asserting test would be theatre. The measured plans were captured
+by hand against 50,000 seeded rows and live in `sql/022`'s header, following the
+`sql/012:13-24` convention of shipping verification as a record. The half that IS
+testable — *the query count does not grow with the number of accounts* — is a real
+test, and it was mutation-checked: injecting an N+1 into `GET /accounts` moves it
+from 6 statements to 9 and the assertion fires.
+
+Worth knowing before WP4 tunes anything: **the all-accounts balance sum is a
+sequential scan and that is correct.** Summing every account means reading every
+row; there is no selective predicate, and with one user the `user_id` filter
+narrows nothing. 6 ms for 50k rows. The index earns its keep on the per-account
+path (1 ms) and on the three existence guards.
+
+**3. The activity-log exception WP3 asks you to remove does not exist.** Its
+checklist says to "remove the activity-log exception for balance writes if it is
+now vacuous". `engine-spec.md` lists three exceptions — hashtag junction rows, a
+retired currency one, and `users.last_login_at` — and none concerns balances.
+Nothing was removed. The *de facto* exception was real, though: balance UPDATEs
+mutated an account row and wrote no `activity_log` entry, silently contradicting
+`CLAUDE.md`'s "No exceptions". Deleting the writes resolves it.
+
+**One thing WP3 did not anticipate, now written down.** The balance `UPDATE` also
+bumped `updated_at`/`version` on the account row, which is what re-entered an
+account into the next `/sync` delta after a ledger write. Nothing writes the
+account row on a transaction now, so a balance can change without the account
+being re-delivered. Filed in `docs/client-breaking-changes.md`; **WP4 retires it
+by deleting `/sync`.**
+
+**Scope beyond the package, by owner decision (2026-08-06):** the sentences in
+`engine-spec.md` and `schema-reference.md` that WP3 made *false* were corrected in
+the same change rather than left for WP7 — chiefly `schema-reference.md`'s
+"Reading an account's balance is a single row lookup, never an aggregation". The
+broader rewrite of those two documents is still WP7's. Untouched WP2-era drift
+remains in both (`schema-reference.md:424` and `:633` still describe stored
+`exchange_rate` / `amount_home_cents`).

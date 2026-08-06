@@ -37,9 +37,8 @@ async def _make_account(user_id: str, currency: str, name: str) -> str:
             """
             INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order,
-                 created_at, updated_at)
-            VALUES ($1, $2, $3, $4, false, '#123456', 0, false, 9, now(), now())
+                 is_archived, sort_order, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, false, '#123456', false, 9, now(), now())
             """,
             account_id, user_id, f"{name}-{account_id[:8]}", currency,
         )

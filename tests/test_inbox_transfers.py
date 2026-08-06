@@ -33,6 +33,7 @@ import asyncpg
 import pytest
 
 from app import db
+from app.helpers.account_balance import fetch_balance
 
 PAST_DATE = "2026-04-12T12:00:00Z"
 
@@ -42,18 +43,17 @@ PAST_DATE = "2026-04-12T12:00:00Z"
 # race the rest of the suite under xdist.
 # ---------------------------------------------------------------------------
 
-async def _make_account(user_id: str, name: str, balance_cents: int = 100000) -> str:
+async def _make_account(user_id: str, name: str) -> str:
     account_id = str(uuid.uuid4())
     async with db.pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order,
-                 created_at, updated_at)
-            VALUES ($1, $2, $3, 'PEN', false, '#00FF00', $4, false, 2, now(), now())
+                 is_archived, sort_order, created_at, updated_at)
+            VALUES ($1, $2, $3, 'PEN', false, '#00FF00', false, 2, now(), now())
             """,
-            account_id, user_id, f"{name}-{uuid.uuid4().hex[:8]}", balance_cents,
+            account_id, user_id, f"{name}-{uuid.uuid4().hex[:8]}",
         )
     return account_id
 
@@ -75,11 +75,16 @@ async def _archive_account(account_id: str) -> None:
 
 
 async def _balance(account_id: str) -> int:
+    """Computed balance — the signed sum of the account's live rows (sql/022).
+
+    Reads through the same helper the engine's read paths use, so a test can
+    never disagree with production about what a balance is.
+    """
     async with db.pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT current_balance_cents FROM expense_bank_accounts WHERE id = $1",
-            account_id,
+        row = await conn.fetchrow(
+            "SELECT user_id FROM expense_bank_accounts WHERE id = $1", account_id
         )
+        return await fetch_balance(conn, str(row["user_id"]), account_id)
 
 
 async def _inbox_row(inbox_id: str) -> asyncpg.Record:

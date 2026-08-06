@@ -10,6 +10,7 @@ from app.deps import CurrentUser
 from app.errors import not_found
 from app.helpers import accounts as accounts_service
 from app.helpers import reconciliations as reconciliations_service
+from app.helpers.account_balance import fetch_balance, fetch_balances
 from app.helpers.exchange_rate import batch_get_rates
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
@@ -85,15 +86,19 @@ async def list_accounts(
                 conn, currencies, main_currency, today,
             )
 
+        # Balances for exactly the accounts on this page, in one query. Scoped to
+        # the page rather than the whole ledger so the index on
+        # (user_id, account_id) can drive it; `fetch_balances` seeds every
+        # requested id with 0, so an account with no transactions is 0 rather
+        # than a missing key.
+        balances = await fetch_balances(conn, auth_user.id, [r["id"] for r in rows])
+
         data = []
         for row in rows:
+            balance_cents = balances[str(row["id"])]
             rate = rate_by_currency.get(row["currency_code"])
-            home = (
-                round(row["current_balance_cents"] * rate)
-                if rate is not None
-                else None
-            )
-            data.append(account_from_row(row, home))
+            home = round(balance_cents * rate) if rate is not None else None
+            data.append(account_from_row(row, balance_cents, home))
 
         return paginated_response(data, total, limit, offset)
 
@@ -142,10 +147,11 @@ async def get_account(account_id: str, auth_user: CurrentUser):
         if row is None:
             raise not_found("account")
 
+        balance_cents = await fetch_balance(conn, auth_user.id, account_id)
         home = await accounts_service.get_home_balance(
-            conn, row["currency_code"], row["current_balance_cents"], auth_user.id
+            conn, row["currency_code"], balance_cents, auth_user.id
         )
-        return account_from_row(row, home)
+        return account_from_row(row, balance_cents, home)
 
 
 @router.put("/{account_id}")

@@ -1,23 +1,29 @@
 """Regression tests for the concurrency hazards flagged by the refactor audit.
 
-Covers two critical-severity hazards:
-
-  * **Balance lost-update** — `update_transaction` reads the current
-    `amount_cents`, reverses its balance contribution, then applies the new
-    amount. Without a ``SELECT ... FOR UPDATE`` lock on the transaction row,
-    two concurrent updates could both read the same old amount and
-    double-reverse — silently drifting the account balance.
+  * **Concurrent updates must serialise** — two PUTs racing on one transaction
+    must leave a row whose amount is one of the two submitted values, not a
+    mix, and whose activity-log pair describes a real transition. This is what
+    the ``SELECT ... FOR UPDATE`` in ``update_transaction`` buys.
 
   * **Transfer pair atomicity** — `create_transfer_pair` inserts two
-    transactions, updates two account balances, and writes two activity
-    logs inside a single DB transaction. A regression that accidentally
-    commits mid-flow would leave orphaned rows or a one-sided balance.
+    transactions and writes two activity logs inside a single DB transaction.
+    A regression that accidentally commits mid-flow would leave one leg
+    without its counterpart, and therefore one account moved without the other.
 
-The balance invariant these tests enforce is scheduling-independent:
+**What this file no longer tests, and why (sql/022).** The original headline
+hazard was a *balance lost-update*: ``update_transaction`` read ``amount_cents``,
+reversed that contribution on the account, then applied the new one, so two
+concurrent updates reading the same stale amount would double-reverse and drift
+the stored balance. The invariant pinned here was::
 
-    final_account_balance == before_account_balance
-                              + old_transaction_amount
-                              - new_transaction_amount
+    final_balance == before_balance + before_amount - final_amount
+
+That assertion is now **vacuously true** and has been removed rather than left
+in place. There is no stored balance to drift: the balance is the signed sum of
+the live rows, so whatever the row ends up saying, the balance agrees with it by
+construction. A test that cannot fail is worse than no test — it reads as
+coverage while asserting nothing. The half that still has teeth (the row itself
+must not end up in a mixed state) is kept below.
 
 Run: .venv/bin/pytest tests/test_concurrency_hazards.py -v
 """
@@ -27,6 +33,7 @@ import uuid
 import pytest
 
 from app import db
+from app.helpers.account_balance import fetch_balance
 
 
 async def _new_expense(client, account_id: str, category_id: str, amount: int) -> dict:
@@ -48,11 +55,16 @@ async def _new_expense(client, account_id: str, category_id: str, amount: int) -
 
 
 async def _get_balance(account_id: str) -> int:
+    """Computed balance — the signed sum of the account's live rows (sql/022).
+
+    Reads through the same helper the engine's read paths use, so a test can
+    never disagree with production about what a balance is.
+    """
     async with db.pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT current_balance_cents FROM expense_bank_accounts WHERE id = $1",
-            account_id,
+        row = await conn.fetchrow(
+            "SELECT user_id FROM expense_bank_accounts WHERE id = $1", account_id
         )
+        return await fetch_balance(conn, str(row["user_id"]), account_id)
 
 
 async def _get_transaction_amount(transaction_id: str) -> int:
@@ -84,14 +96,13 @@ async def _delete_txn(conn, transaction_id: str, user_id: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_updates_preserve_balance_integrity(client, test_data):
-    """Two concurrent PUTs on the same transaction must leave the balance
-    consistent with the final transaction state.
+async def test_concurrent_updates_serialise_on_the_transaction_row(client, test_data):
+    """Two concurrent PUTs on one transaction must serialise, not interleave.
 
-    Invariant checked: ``final_balance = before_balance + before_amount
-    - final_amount``. Holds regardless of which update "wins" — what
-    matters is that the reversal and re-application are serialised so
-    the math doesn't drift.
+    The surviving row must carry one of the two submitted amounts — never a
+    mix, never the original — and the account balance must equal that row's
+    contribution, which under a computed balance is a statement about the row
+    winning cleanly rather than about arithmetic drift.
     """
     created = await _new_expense(
         client,
@@ -133,29 +144,21 @@ async def test_concurrent_updates_preserve_balance_integrity(client, test_data):
         # last-committed update's amount sticks.
         assert final_amount in (2000, 3000)
 
-        # Core invariant: balance reflects exactly one reversal of the
-        # original and one application of the final amount. Without the
-        # FOR UPDATE lock this fails because both updates see the same
-        # stale `before_amount` and double-reverse.
+        # The balance tracks whichever update won. Under a computed balance this
+        # cannot drift, so what it actually pins is that the winning row is the
+        # ONLY one contributing — a double-applied or orphaned row would show up
+        # here as a balance the surviving amount cannot explain.
         assert final_balance == before_balance + before_amount - final_amount, (
-            f"Balance drift: before={before_balance} before_amount={before_amount} "
+            f"before={before_balance} before_amount={before_amount} "
             f"final_amount={final_amount} final_balance={final_balance}"
         )
     finally:
         async with db.pool.acquire() as conn:
+            # Hard-deleting the row removes its balance contribution for free.
+            # This used to be followed by a hand-written UPDATE putting the
+            # stored balance back, because a raw DELETE bypassed the reversal
+            # the endpoint would have done. Nothing to compensate for now.
             await _delete_txn(conn, txn_id, test_data.user_id)
-            # Restore the account balance — we created then modified the
-            # expense, so we need to zero out its balance impact.
-            await conn.execute(
-                """
-                UPDATE expense_bank_accounts
-                SET current_balance_cents = $1
-                WHERE id = $2 AND user_id = $3
-                """,
-                before_balance,
-                test_data.account_id,
-                test_data.user_id,
-            )
 
 
 @pytest.mark.asyncio
@@ -176,10 +179,9 @@ async def test_transfer_pair_is_created_atomically(client, test_data):
             """
             INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order,
-                 created_at, updated_at)
+                 is_archived, sort_order, created_at, updated_at)
             VALUES ($1, $2, 'Transfer Target', 'PEN', false, '#00FF00',
-                    50000, false, 2, now(), now())
+                    false, 2, now(), now())
             """,
             second_account_id, test_data.user_id,
         )
@@ -255,18 +257,22 @@ async def test_transfer_pair_is_created_atomically(client, test_data):
             assert primary_row["transaction_type"] == 1  # OUTFLOW
             assert sibling_row["transaction_type"] == 2  # INFLOW
 
-            # Both account balances moved together. If one moved without
-            # the other, we have broken atomicity.
-            after_primary_balance = await conn.fetchval(
-                "SELECT current_balance_cents FROM expense_bank_accounts WHERE id = $1",
-                test_data.account_id,
+            # Both computed balances moved together. If one leg had committed
+            # without the other, one of these two would be unchanged.
+            after_primary_balance = await fetch_balance(
+                conn, test_data.user_id, test_data.account_id
             )
-            after_secondary_balance = await conn.fetchval(
-                "SELECT current_balance_cents FROM expense_bank_accounts WHERE id = $1",
-                second_account_id,
+            after_secondary_balance = await fetch_balance(
+                conn, test_data.user_id, second_account_id
             )
             assert after_primary_balance == before_primary_balance - 2500
             assert after_secondary_balance == before_secondary_balance + 2500
+
+            # And the pair nets to zero — money left one account and arrived in
+            # the other, rather than being created or destroyed.
+            assert (after_primary_balance - before_primary_balance) + (
+                after_secondary_balance - before_secondary_balance
+            ) == 0
 
             # Exactly two new activity log entries — one per leg.
             after_log_count = await conn.fetchval(
@@ -295,16 +301,6 @@ async def test_transfer_pair_is_created_atomically(client, test_data):
                     "DELETE FROM expense_transactions WHERE id = ANY($1::uuid[]) AND user_id = $2",
                     txn_ids, test_data.user_id,
                 )
-            await conn.execute(
-                """
-                UPDATE expense_bank_accounts
-                SET current_balance_cents = $1
-                WHERE id = $2 AND user_id = $3
-                """,
-                before_primary_balance,
-                test_data.account_id,
-                test_data.user_id,
-            )
             await conn.execute(
                 "DELETE FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
                 second_account_id, test_data.user_id,

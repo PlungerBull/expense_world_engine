@@ -9,11 +9,12 @@ delegate business logic here.
 ``promote_inbox_item`` branches on whether the inbox row has transfer
 fields set:
 
-  * Transfer branch: delegates to ``create_transfer_pair`` which handles
-    all 12 steps of the transfer orchestration (zero-sum validation,
-    dominant-side FX rule, dual-insert, dual-balance update).
-  * Non-transfer branch: inserts a single expense_transactions row and
-    applies a single balance delta via ``helpers.balance.apply_balance``.
+  * Transfer branch: delegates to ``create_transfer_pair``, which handles the
+    zero-sum validation, the category assignment and the dual insert.
+  * Non-transfer branch: inserts a single expense_transactions row.
+
+Neither branch touches an account balance. Balances are the signed sum of the
+ledger (sql/022), so writing the row IS the balance change.
 
 Both branches converge on shared cleanup: the inbox row is soft-deleted
 with ``status = 2`` (PROMOTED) and an activity log entry is written.
@@ -34,7 +35,6 @@ import asyncpg
 from app.constants import ActivityAction, InboxStatus, TransactionType
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
-from app.helpers.balance import apply_balance
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.validation import extract_update_fields
@@ -615,15 +615,7 @@ async def promote_inbox_item(
 
         txn_response = transaction_from_row(txn_row)
 
-        # Update account balance via the shared helper so the
-        # expense/income sign matrix stays in one place.
-        await apply_balance(
-            conn,
-            str(inbox_row["account_id"]),
-            user_id,
-            inbox_row["amount_cents"],
-            transaction_type,
-        )
+        # No balance step: the INSERT above IS the balance change (sql/022).
 
         # Activity log: transaction created
         await write_activity_log(

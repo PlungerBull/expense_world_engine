@@ -53,7 +53,24 @@ class AccountResponse(BaseModel):
     deleted_at: Optional[datetime] = None
 
 
-def account_from_row(row, balance_home_cents: Optional[int] = None) -> dict:
+def account_from_row(
+    row,
+    balance_cents: int,
+    balance_home_cents: Optional[int] = None,
+) -> dict:
+    """Serialize an account row. The balance is supplied, never read off the row.
+
+    ``balance_cents`` is a required positional because sql/022 dropped the stored
+    column: the balance is now computed from the ledger
+    (``helpers/account_balance``) and there is nothing on ``row`` to fall back
+    to. Making it required means a caller that forgets it raises ``TypeError``
+    rather than emitting a confident zero, which on a balance is
+    indistinguishable from an empty account.
+
+    ``balance_home_cents`` stays optional and defaults to ``None`` because
+    ``null`` is its real meaning: no rate was available for the account's
+    currency today. ``/sync`` passes nothing deliberately.
+    """
     return AccountResponse(
         id=str(row["id"]),
         user_id=str(row["user_id"]),
@@ -61,7 +78,7 @@ def account_from_row(row, balance_home_cents: Optional[int] = None) -> dict:
         currency_code=row["currency_code"],
         is_person=row["is_person"],
         color=row["color"],
-        current_balance_cents=row["current_balance_cents"],
+        current_balance_cents=balance_cents,
         current_balance_home_cents=balance_home_cents,
         is_archived=row["is_archived"],
         sort_order=row["sort_order"],

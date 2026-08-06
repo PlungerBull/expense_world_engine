@@ -11,6 +11,40 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-06 — account balances are computed, not stored (wire shape unchanged; one `/sync` behaviour change)
+
+**Engine change.** `expense_bank_accounts.current_balance_cents` was a stored running
+total, updated by hand at eleven write sites. `sql/022` drops the column. An account's
+balance is now the signed sum of its non-deleted transactions, computed at read time
+(`app/helpers/account_balance.py`). This is `docs/rework/WP3`.
+
+**Nothing breaks on the wire, and that is deliberate.** `current_balance_cents` appears
+on exactly the same responses, in the same place, with the same type and the same
+values: `GET /accounts`, `GET /accounts/{id}`, every account mutation response,
+`/dashboard`'s three account panels, and `/sync`. Only its source changed. The CLI needs
+no work — it reads the field off responses and never computed it. This entry exists
+because the change is large internally, not because it costs a client anything.
+
+**The one behaviour change, and it affects `/sync` only.** Until now, writing a
+transaction bumped `updated_at` on the affected account row — a side effect of the
+balance `UPDATE`. That is what re-entered the account into the next `/sync` delta
+carrying its new balance. Nothing writes the account row on a transaction now, so:
+
+> **An account's balance can change without the account appearing in the next
+> `/sync` delta.** The value is never wrong when it *is* delivered; it just stops
+> being pushed on every ledger write.
+
+A client caching balances from `/sync` alone would show a stale figure until some
+unrelated account edit. No client is affected today — `sync_checkpoints` holds zero
+rows, no client has ever completed a sync, and the CLI reads balances from `/accounts`
+and `/dashboard`, which are always live. `docs/rework/WP4` deletes `/sync` outright and
+retires this gap; it is written down rather than left to be rediscovered.
+
+If you do need balances from a delta in the meantime, derive them client-side — `/sync`
+ships every transaction, which is the same input the engine sums.
+
+---
+
 ## 2026-08-05 — currency converts at read time; `exchange_rate` and every `amount_home_cents` deleted; report aggregates are home-only and nullable
 
 **Engine change.** Three columns stored a currency conversion frozen at write time:

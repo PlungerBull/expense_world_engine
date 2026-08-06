@@ -71,7 +71,7 @@ Every agent should check these universal rules first, then the domain-specific r
 - `PUT /accounts/{id}`: returns `422` if `currency_code` is included (it's immutable after creation)
 - `DELETE /accounts/{id}`: returns `409` if any non-deleted transactions exist — must archive instead
 - `POST /accounts/{id}/archive`: sets `is_archived = true`, does not delete
-- Balance updates (`current_balance_cents`) happen atomically with every transaction create/update/delete
+- Balances are **computed, never written** (`sql/022`). `current_balance_cents` is not a column — it is the signed sum of the account's non-deleted transactions, produced by `app/helpers/account_balance.py`. ⚠️ **Flag any code that writes a balance, not code that fails to.** An account with no transactions must report `0`, and the `@Opening` seed must be INCLUDED (it is excluded from flow reports only).
 
 **Categories domain:**
 - System categories (`is_system = true`) cannot be renamed or deleted — returns `403`
@@ -95,20 +95,21 @@ Every agent should check these universal rules first, then the domain-specific r
   7. `transfer_id` is present for a transfer item and absent for a non-transfer one
   - Returns `422` with the specific failing fields if any condition fails
 - `GET /inbox?ready=true` must be the exact complement of that list — every row it returns promotes, every row that promotes appears in it. The two are written separately (SQL in the router, Python in the helper), which is how they drifted into WP7.3; check them against each other, not just against the spec.
-- Promotion is atomic — all six steps happen in one DB transaction:
+- Promotion is atomic — all five steps happen in one DB transaction:
   1. Creates `expense_transactions` row with `inbox_id` pointing back
   2. Sets `status = 2` (promoted) on the inbox row
   3. Sets `deleted_at` on the inbox row
-  4. Updates `current_balance_cents` on the account
-  5. Writes `activity_log` entry for the new transaction (action=1 created)
-  6. Writes `activity_log` entry for the inbox item (action=3 deleted)
+  4. Writes `activity_log` entry for the new transaction (action=1 created)
+  5. Writes `activity_log` entry for the inbox item (action=3 deleted)
+
+  There is no balance step — writing the ledger row in step 1 is the balance change.
 - `status = 2` (promoted) vs `status = 3` (dismissed) must be distinguishable
 
 **Transactions domain:**
 - `PUT /transactions/{id}` field locking: if `reconciliation_id` is set and reconciliation `status = 2`, these four fields are read-only: `amount_cents`, `account_id`, `title`, `date`. Attempts to update them return `422`.
-- `PUT /transactions/{id}` date change: re-fetches historical exchange rate for the new date and recalculates `amount_home_cents`; replaces any previously set exchange rate
-- `PUT /transactions/{id}` amount/account change: updates `current_balance_cents` atomically on affected accounts
-- `DELETE /transactions/{id}`: updates `current_balance_cents` atomically; if `transfer_transaction_id` is set, soft-deletes both the transaction and its paired sibling atomically
+- `PUT /transactions/{id}` date change: no re-rating. `amount_home_cents` and `exchange_rate` were deleted by `sql/021`; conversion is a read-time lookup.
+- `PUT /transactions/{id}` amount/account change: no balance write. Changing the row changes what it contributes; changing `account_id` moves that contribution between accounts, in the same `UPDATE`.
+- `DELETE /transactions/{id}`: no balance write — the sum excludes soft-deleted rows. If `transfer_transaction_id` is set, soft-deletes both the transaction and its paired sibling atomically
 - `DELETE /transactions/{id}` on completed reconciliation: allows deletion but includes a warning in response body (reconciliation totals become stale — engine does not auto-adjust)
 - `POST /transactions/batch`: all operations wrapped in a single DB transaction — all succeed or all fail
 
@@ -118,7 +119,7 @@ Every agent should check these universal rules first, then the domain-specific r
 - Auto-assigns categories correctly: person account side gets `@Debt`, real account transfer side gets `@Transfer`. These override any `category_id` passed in the request.
 - Auto-creates `@Debt` or `@Transfer` system categories if they don't exist yet
 - Zero-sum validation: enforces that the two transactions are directionally opposite (one negative, one positive). Returns `422` if both are the same sign. Does NOT enforce equal raw amounts (different currencies allowed).
-- Updates `current_balance_cents` on both accounts
+- Both account balances move by construction — each leg is an ordinary row on its own account and the balance is a sum over rows. There is no balance step to check for.
 - Writes `activity_log` entries for both transactions
 
 **Reconciliations domain:**

@@ -28,6 +28,7 @@ import uuid
 import pytest
 
 from app import db
+from app.helpers.account_balance import fetch_balance
 
 
 # ---------------------------------------------------------------------------
@@ -53,11 +54,16 @@ async def _new_expense(client, account_id: str, category_id: str, amount: int) -
 
 
 async def _get_balance(account_id: str) -> int:
+    """Computed balance — the signed sum of the account's live rows (sql/022).
+
+    Reads through the same helper the engine's read paths use, so a test can
+    never disagree with production about what a balance is.
+    """
     async with db.pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT current_balance_cents FROM expense_bank_accounts WHERE id = $1",
-            account_id,
+        row = await conn.fetchrow(
+            "SELECT user_id FROM expense_bank_accounts WHERE id = $1", account_id
         )
+        return await fetch_balance(conn, str(row["user_id"]), account_id)
 
 
 async def _get_row(transaction_id: str) -> dict:
@@ -84,14 +90,6 @@ async def _hard_delete_txns(txn_ids: list[str], user_id: str) -> None:
         await conn.execute(
             "DELETE FROM expense_transactions WHERE id = ANY($1::uuid[]) AND user_id = $2",
             txn_ids, user_id,
-        )
-
-
-async def _restore_balance(account_id: str, user_id: str, target: int) -> None:
-    async with db.pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE expense_bank_accounts SET current_balance_cents = $1 WHERE id = $2 AND user_id = $3",
-            target, account_id, user_id,
         )
 
 
@@ -160,7 +158,6 @@ async def test_restore_simple_expense_round_trips_balance(client, test_data):
 
     finally:
         await _hard_delete_txns([txn_id], test_data.user_id)
-        await _restore_balance(test_data.account_id, test_data.user_id, balance_after_create - 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +179,9 @@ async def test_restore_transfer_pair_restores_both_legs_atomically(client, test_
             """
             INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order,
-                 created_at, updated_at)
+                 is_archived, sort_order, created_at, updated_at)
             VALUES ($1, $2, 'Restore-Transfer-Target', 'PEN', false, '#00FF00',
-                    50000, false, 2, now(), now())
+                    false, 2, now(), now())
             """,
             second_account_id, test_data.user_id,
         )
@@ -278,10 +274,6 @@ async def test_restore_transfer_pair_restores_both_legs_atomically(client, test_
                     ids, test_data.user_id,
                 )
             await conn.execute(
-                "UPDATE expense_bank_accounts SET current_balance_cents = $1 WHERE id = $2",
-                before_primary_balance, test_data.account_id,
-            )
-            await conn.execute(
                 "DELETE FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
                 second_account_id, test_data.user_id,
             )
@@ -315,7 +307,6 @@ async def test_restore_re_attaches_cascaded_hashtags(client, test_data):
         headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
     assert create_r.status_code == 201, create_r.text
-    balance_after_create = await _get_balance(test_data.account_id)
 
     try:
         # Verify both junctions active before delete.
@@ -365,7 +356,6 @@ async def test_restore_re_attaches_cascaded_hashtags(client, test_data):
 
     finally:
         await _hard_delete_txns([txn_id], test_data.user_id)
-        await _restore_balance(test_data.account_id, test_data.user_id, balance_after_create - 100)
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +387,6 @@ async def test_restore_unlinks_completed_reconciliation(client, test_data):
         headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
     assert create_r.status_code == 201, create_r.text
-    balance_after_create = await _get_balance(test_data.account_id)
 
     recon_create = await client.post(
         "/v1/reconciliations",
@@ -464,7 +453,6 @@ async def test_restore_unlinks_completed_reconciliation(client, test_data):
                 recon_id, test_data.user_id,
             )
         await _hard_delete_txns([txn_id], test_data.user_id)
-        await _restore_balance(test_data.account_id, test_data.user_id, balance_after_create - 300)
 
 
 # ---------------------------------------------------------------------------

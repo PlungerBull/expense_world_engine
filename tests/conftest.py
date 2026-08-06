@@ -91,11 +91,18 @@ async def _ensure_test_data(conn, data: TestData):
             "INSERT INTO user_settings (user_id, created_at, updated_at) VALUES ($1, now(), now())",
             data.user_id,
         )
+        # No balance is seeded. Before sql/022 this INSERT set
+        # current_balance_cents = 100000 while the account's only transaction was
+        # a 5000 outflow — a fixture asserting a number its own rows contradicted.
+        # The balance is computed now, so the seed account is worth exactly what
+        # is seeded below it: -5000. Nothing asserts the old figure; every balance
+        # assertion in the suite is either relative (before/after a mutation) or
+        # on an account the test creates itself.
         await conn.execute(
             """INSERT INTO expense_bank_accounts
-                (id, user_id, name, currency_code, is_person, color, current_balance_cents,
+                (id, user_id, name, currency_code, is_person, color,
                  is_archived, sort_order, created_at, updated_at)
-               VALUES ($1, $2, 'Test Account', 'PEN', false, '#000000', 100000,
+               VALUES ($1, $2, 'Test Account', 'PEN', false, '#000000',
                  false, 1, now(), now())""",
             data.account_id, data.user_id,
         )

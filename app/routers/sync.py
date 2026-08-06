@@ -9,6 +9,7 @@ from fastapi import APIRouter, Header, Query
 from app import db
 from app.deps import CurrentUser
 from app.errors import validation_error
+from app.helpers.account_balance import fetch_balances
 from app.helpers.formatting import apply_debit_as_negative, apply_debit_as_negative_inbox
 from app.helpers.sync import (
     WILDCARD_TOKEN,
@@ -63,6 +64,15 @@ async def sync(
             snapshot_at, deltas, settings_row = await fetch_delta(
                 conn, auth_user.id, since
             )
+            # Balances are computed from the ledger (sql/022), so this read must
+            # happen INSIDE the snapshot — outside it, the account rows and the
+            # transactions they summarise would come from two different points in
+            # time and a delta could ship a balance that never existed. Scoped to
+            # the accounts actually in the delta, but each still reports its FULL
+            # balance: a delta of changed rows is not a delta of money.
+            account_balances = await fetch_balances(
+                conn, auth_user.id, [r["id"] for r in deltas["accounts"]]
+            )
             new_token = await rotate_checkpoint(
                 conn, auth_user.id, x_client_id, snapshot_at
             )
@@ -74,7 +84,17 @@ async def sync(
 
         # Account home balances are intentionally null in sync responses;
         # clients that need them call /dashboard, which is the canonical place
-        # for derived account-level values.
+        # for derived account-level values. The NATIVE balance is populated, from
+        # the snapshot-consistent read above.
+        #
+        # ⚠️ Known gap, retired by docs/rework/WP4. Before sql/022 a ledger write
+        # bumped the account row's updated_at (the balance UPDATE did it as a side
+        # effect), which is what re-entered the account into the next delta with
+        # its new balance. Nothing writes the account row on a transaction now, so
+        # a balance can change without the account being re-delivered. The value
+        # is never wrong when it IS delivered — it just stops being pushed. No
+        # client is affected (sync_checkpoints holds zero rows) and WP4 deletes
+        # this endpoint. See docs/client-breaking-changes.md.
         inbox_rows = [inbox_from_row(r) for r in deltas["inbox"]]
         # `_fetch_transactions_with_hashtags` adds an aggregated `hashtag_ids`
         # uuid[] column; `transaction_from_row` reads it off the row directly.
@@ -85,7 +105,10 @@ async def sync(
 
         return {
             "sync_token": new_token,
-            "accounts": [account_from_row(r) for r in deltas["accounts"]],
+            "accounts": [
+                account_from_row(r, account_balances[str(r["id"])])
+                for r in deltas["accounts"]
+            ],
             "categories": [category_from_row(r) for r in deltas["categories"]],
             "hashtags": [hashtag_from_row(r) for r in deltas["hashtags"]],
             "inbox": inbox_rows,

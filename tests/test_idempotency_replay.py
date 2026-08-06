@@ -22,6 +22,7 @@ import uuid
 import pytest
 
 from app import db
+from app.helpers.account_balance import fetch_balance
 
 
 @pytest.mark.asyncio
@@ -105,11 +106,6 @@ async def test_create_transaction_replay_returns_identical_response(client, test
                     "DELETE FROM expense_transactions WHERE id = $1 AND user_id = $2",
                     txn_id, test_data.user_id,
                 )
-            # Restore the account balance.
-            await conn.execute(
-                "UPDATE expense_bank_accounts SET current_balance_cents = $1 WHERE id = $2",
-                before_balance, test_data.account_id,
-            )
             # Purge the idempotency key so it doesn't pollute other tests.
             await conn.execute(
                 "DELETE FROM idempotency_keys WHERE key = $1 AND user_id = $2",
@@ -118,11 +114,16 @@ async def test_create_transaction_replay_returns_identical_response(client, test
 
 
 async def _get_balance(account_id: str) -> int:
+    """Computed balance — the signed sum of the account's live rows (sql/022).
+
+    Reads through the same helper the engine's read paths use, so a test can
+    never disagree with production about what a balance is.
+    """
     async with db.pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT current_balance_cents FROM expense_bank_accounts WHERE id = $1",
-            account_id,
+        row = await conn.fetchrow(
+            "SELECT user_id FROM expense_bank_accounts WHERE id = $1", account_id
         )
+        return await fetch_balance(conn, str(row["user_id"]), account_id)
 
 
 @pytest.mark.asyncio

@@ -159,10 +159,9 @@ async def test_transfer_edit_guard_rejects_date(client, test_data):
             """
             INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order,
-                 created_at, updated_at)
+                 is_archived, sort_order, created_at, updated_at)
             VALUES ($1, $2, 'Guard-Transfer-Target', 'PEN', false, '#123456',
-                    0, false, 9, now(), now())
+                    false, 9, now(), now())
             """,
             second_account_id, test_data.user_id,
         )

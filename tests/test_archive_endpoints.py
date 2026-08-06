@@ -320,11 +320,6 @@ async def test_hashtag_archive_round_trip_and_list_filter(client, test_data):
                 "DELETE FROM expense_transactions WHERE id = $1 AND user_id = $2",
                 txn_id, test_data.user_id,
             )
-            # Restore the test_data account balance (we created a -100 expense).
-            await conn.execute(
-                "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + 100 WHERE id = $1",
-                test_data.account_id,
-            )
         await _cleanup_hashtag(hashtag_id, test_data.user_id)
 
 
@@ -463,11 +458,6 @@ async def test_dashboard_include_archived_returns_accounts_only(client, test_dat
                 "DELETE FROM expense_transactions WHERE id = $1 AND user_id = $2",
                 txn_id, test_data.user_id,
             )
-            # Restore the test_data account balance (-300 expense).
-            await conn.execute(
-                "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + 300 WHERE id = $1",
-                test_data.account_id,
-            )
         await _cleanup_category(cat_id, test_data.user_id)
 
 
@@ -573,11 +563,6 @@ async def test_update_transaction_rejects_archived_category(client, test_data):
             await conn.execute(
                 "DELETE FROM expense_transactions WHERE id = $1 AND user_id = $2",
                 txn_id, test_data.user_id,
-            )
-            # Restore the test_data account balance (-200 expense).
-            await conn.execute(
-                "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + 200 WHERE id = $1",
-                test_data.account_id,
             )
         await _cleanup_category(cat_id, test_data.user_id)
 

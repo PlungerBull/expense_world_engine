@@ -80,7 +80,7 @@ These apply everywhere, no exceptions:
 - Responses: `amount_cents` is always positive. `transaction_type` tells direction. The `?debit_as_negative=true` flag is a caller-side preference, not a schema property.
 - **A transfer is two ordinary rows paired by `transfer_transaction_id`.** That FK is the *only* discriminator — there is no transfer transaction type, and a transfer leg is an ordinary outflow or inflow. "Who the counterparty was" is a fact about the pairing; "which way the money moved" is a fact about the row. Keeping them in one column is what forced direction into a second column in the first place (`transaction_type = 3` + `transfer_direction`, deleted by `sql/020`).
 - **No column's sign means anything, anywhere.** Direction is always a separate typed column. `infer_transaction_type` (`app/schemas/transactions.py`) is the **single** place a sign is read — adding a second is the bug, not the fix. Its former twin `infer_transfer_direction` was byte-identical, which is what the duplication cost.
-- **One rendering of the sign matrix, in Python and in SQL.** `helpers/balance._delta_for_apply` for writes, `helpers/home_currency.signed_expr` for reads. `monthly_report.py` and `dashboard.py` call the latter rather than carrying their own copies — four literal copies drifting is audit finding WP9.1.
+- **One rendering of the sign matrix, and it is now in SQL only.** `helpers/home_currency.signed_expr` is the single implementation; `monthly_report.py`, `dashboard.py` and `account_balance.py` call it rather than carrying their own copies — four literal copies drifting is audit finding WP9.1. The Python twin (`helpers/balance._delta_for_apply`) went with the stored balance in `sql/022`, and it had *already* sprouted a third copy inline in `transactions.create_batch` that no grep for `apply_balance` surfaced and no test covered. Writes read no sign matrix at all now: recording a row is the whole of the write.
 - **This holds on the inbox identically.** The inbox is a draft ledger row: looser about *which fields are null*, never about *how a field encodes its meaning*. `transfer_amount_cents` was the one exception — signed until `sql/019` (2026-08-03), which is what let a same-sign transfer draft promote with a leg silently flipped (audit WP7.2). The lesson: a table that mirrors another copies the whole encoding or none of it — a half-copied convention makes the missing half load-bearing without anyone deciding it should be.
 - ⚠️ **When a CHECK enforces a closed enum, spell out `IS NOT NULL`.** A `CHECK` rejects a row only when it evaluates to `FALSE`; `NULL` passes. `transaction_type IN (1, 2)` is `NULL` — not `FALSE` — on a null column, so a coherence constraint written that way silently admits the row it was added to forbid. `sql/020`'s `inbox_transfer_fields_coherent` carries the explicit guard and a test pins it.
 
@@ -133,14 +133,16 @@ RLS policies (`auth.uid() = user_id`) exist on all 15 tables and `rowsecurity` i
 **UUID-first**
 All resources are identified by a UUID generated client-side before server confirmation. The frontend always has the ID before making a write. Resources are never looked up by name or any mutable attribute.
 
-**Balance updates are atomic** — ⏳ *scheduled for deletion by `docs/rework/WP3`*
-Whenever a transaction is created, updated, or deleted, `current_balance_cents` on the affected account(s) is updated in the same database transaction. Balance and transaction state are never out of sync.
+**Balances are computed at read time, never stored**
+An account's `current_balance_cents` is the signed sum of its non-deleted transactions, including its `@Opening` seed, in the account's own currency. `app/helpers/account_balance.py` is the single implementation, and it reuses `home_currency.SIGNED_CENTS_EXPR` rather than rendering the sign matrix again. The field's wire shape is unchanged; only its source is.
 
-> This convention exists only to protect a stored derived value. WP3 deletes
-> `current_balance_cents` and computes the balance from the rows instead, at which point
-> this rule has nothing left to protect and is replaced by "balances are computed at read
-> time, never stored" — the same sentence the currency model already uses. Until WP3 lands
-> the rule above is live and must be honoured.
+- **No write path touches an account balance.** Creating, editing, soft-deleting or restoring a transaction *is* the balance change. There is no second write to keep in step, so no path can forget one — which is the entire point (`sql/022`).
+- **`@Opening` is included in balances and excluded from flow reports.** Two rules that live one function apart. The report's `NOT EXISTS (… system_key = 'opening_balance')` filter belongs to `monthly_report.py` alone and must never be copied into the balance sum; an opening balance is not money that moved, but it is money you have.
+- **Zero is a balance, not a missing value.** An account with no transactions reports `0` — never `null`, never an absent row. `fetch_balances` seeds every id it was asked about, so callers index with `balances[id]` and a forgotten account raises rather than silently reading as empty.
+- **The balance is native-only.** Home-currency conversion is applied on top, per the home-currency rules above.
+- ⚠️ **Splits will break a naive `SUM`.** `parent_transaction_id` is reserved and always null, so the sum is correct today. The documented rule is that a parent row is a display container that does not move the balance and only its children do — which a `SUM` has no way to honour. The predicate needed the day splits ship is written out in `account_balance.py` and `sql/022`.
+
+*Replaced the "Balance updates are atomic" convention, 2026-08-06 (`docs/rework/WP3`). That rule existed only to protect a stored derived value; deleting the value leaves it nothing to protect. The sentence above is deliberately the same one the currency model uses — the two are one idea.*
 
 **Batch = all or nothing**
 Any batch endpoint wraps all operations in a single DB transaction. All succeed or all fail. Partial success is never acceptable for financial data.

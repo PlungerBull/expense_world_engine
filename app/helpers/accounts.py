@@ -4,8 +4,16 @@ Service-layer functions for expense_bank_accounts, called from
 routers/accounts.py. Routers stay thin (HTTP glue + idempotency) and
 delegate business logic here.
 
-See ``app/helpers/balance.py`` for the convention: these functions do NOT
-open their own ``conn.transaction()`` — callers own transaction boundaries.
+See ``app/helpers/idempotency.run_idempotent`` for the convention: these
+functions do NOT open their own ``conn.transaction()`` — callers own transaction
+boundaries.
+
+Account balances are computed from the ledger, never stored (sql/022). None of
+the mutations here can change a balance — renaming, archiving, soft-deleting or
+restoring an account moves no money — so each fetches the balance once and reuses
+that one value for the before-snapshot, the after-snapshot and the response.
+Reading it twice would let a concurrent ledger write land between them and make
+the activity-log pair disagree about a value neither mutation touched.
 """
 
 from datetime import datetime, timezone
@@ -16,6 +24,7 @@ import asyncpg
 
 from app.constants import ActivityAction, SystemCategoryKey
 from app.errors import conflict, not_found, validation_error
+from app.helpers.account_balance import fetch_balance
 from app.helpers.activity_log import write_activity_log
 from app.helpers.categories import ensure_system_category
 from app.helpers.exchange_rate import get_rate
@@ -113,8 +122,13 @@ async def create_account(
     except asyncpg.UniqueViolationError:
         raise conflict(f"An account with id '{account_id}' already exists.")
 
-    home = await get_home_balance(conn, row["currency_code"], row["current_balance_cents"], user_id)
-    response = account_from_row(row, home)
+    # A brand-new account has no transactions, so its balance is 0 by
+    # construction — querying the ledger to learn that would be a round-trip to
+    # confirm what the INSERT guarantees. The get_home_balance call stays,
+    # though: round(0 * rate) is 0, but "no rate available for this currency" is
+    # null, and that distinction is wire-visible.
+    home = await get_home_balance(conn, row["currency_code"], 0, user_id)
+    response = account_from_row(row, 0, home)
 
     await write_activity_log(
         conn, user_id, "account", str(row["id"]), ActivityAction.CREATED,
@@ -229,8 +243,9 @@ async def update_account(
         )
         if row is None:
             raise not_found("account")
-        home = await get_home_balance(conn, row["currency_code"], row["current_balance_cents"], user_id)
-        return account_from_row(row, home)
+        balance_cents = await fetch_balance(conn, user_id, account_id)
+        home = await get_home_balance(conn, row["currency_code"], balance_cents, user_id)
+        return account_from_row(row, balance_cents, home)
 
     # Check name uniqueness if name is changing. Preserve the 2-step check:
     # first find any name match, then verify full (name, currency) uniqueness.
@@ -275,19 +290,22 @@ async def update_account(
     if before_row is None:
         raise not_found("account")
 
-    home_before = await get_home_balance(
-        conn, before_row["currency_code"], before_row["current_balance_cents"], user_id
+    # Fetched once and reused for both snapshots. A PUT cannot move money, and
+    # currency_code is rejected above, so both the native and the home value are
+    # identical before and after by construction — reading them twice would only
+    # create a window for a concurrent ledger write to make the audit pair
+    # disagree about a field this mutation never touched.
+    balance_cents = await fetch_balance(conn, user_id, account_id)
+    home = await get_home_balance(
+        conn, before_row["currency_code"], balance_cents, user_id
     )
-    before = account_from_row(before_row, home_before)
+    before = account_from_row(before_row, balance_cents, home)
 
     after_row = await dynamic_update(conn, "expense_bank_accounts", fields, account_id, user_id)
     if after_row is None:
         raise not_found("account")
 
-    home_after = await get_home_balance(
-        conn, after_row["currency_code"], after_row["current_balance_cents"], user_id
-    )
-    after = account_from_row(after_row, home_after)
+    after = account_from_row(after_row, balance_cents, home)
 
     await write_activity_log(
         conn, user_id, "account", account_id, ActivityAction.UPDATED,
@@ -329,14 +347,16 @@ async def delete_account(
     if has_txns:
         raise conflict("Account has active transactions. Archive instead.")
 
-    home = await get_home_balance(conn, row["currency_code"], row["current_balance_cents"], user_id)
-    before = account_from_row(row, home)
+    # Soft-deleting the account does not soft-delete its transactions, so the
+    # balance is unchanged across the mutation. Fetched once, used for both.
+    # (It need not be zero: the guard above only rejects *active* transactions,
+    # so an account whose rows were all soft-deleted can still carry a figure.)
+    balance_cents = await fetch_balance(conn, user_id, account_id)
+    home = await get_home_balance(conn, row["currency_code"], balance_cents, user_id)
+    before = account_from_row(row, balance_cents, home)
 
     after_row = await soft_delete(conn, "expense_bank_accounts", account_id, user_id)
-    home_after = await get_home_balance(
-        conn, after_row["currency_code"], after_row["current_balance_cents"], user_id
-    )
-    after = account_from_row(after_row, home_after)
+    after = account_from_row(after_row, balance_cents, home)
 
     await write_activity_log(
         conn, user_id, "account", account_id, ActivityAction.DELETED,
@@ -364,16 +384,16 @@ async def restore_account(
     if before_row is None:
         raise not_found("account")
 
-    home_before = await get_home_balance(
-        conn, before_row["currency_code"], before_row["current_balance_cents"], user_id
+    # Restoring the account row does not restore any transaction, so the balance
+    # is the same on both sides of the mutation.
+    balance_cents = await fetch_balance(conn, user_id, account_id)
+    home = await get_home_balance(
+        conn, before_row["currency_code"], balance_cents, user_id
     )
-    before = account_from_row(before_row, home_before)
+    before = account_from_row(before_row, balance_cents, home)
 
     after_row = await restore(conn, "expense_bank_accounts", account_id, user_id)
-    home_after = await get_home_balance(
-        conn, after_row["currency_code"], after_row["current_balance_cents"], user_id
-    )
-    after = account_from_row(after_row, home_after)
+    after = account_from_row(after_row, balance_cents, home)
 
     await write_activity_log(
         conn, user_id, "account", account_id, ActivityAction.RESTORED,
@@ -429,10 +449,13 @@ async def _set_account_archive(
     if before_row is None:
         raise not_found("account")
 
-    home_before = await get_home_balance(
-        conn, before_row["currency_code"], before_row["current_balance_cents"], user_id
+    # Archiving moves no money — an archived account still holds a real balance
+    # and still reports it. One fetch, both snapshots.
+    balance_cents = await fetch_balance(conn, user_id, account_id)
+    home = await get_home_balance(
+        conn, before_row["currency_code"], balance_cents, user_id
     )
-    before = account_from_row(before_row, home_before)
+    before = account_from_row(before_row, balance_cents, home)
 
     after_row = await conn.fetchrow(
         """
@@ -446,10 +469,7 @@ async def _set_account_archive(
         archived,
     )
 
-    home_after = await get_home_balance(
-        conn, after_row["currency_code"], after_row["current_balance_cents"], user_id
-    )
-    after = account_from_row(after_row, home_after)
+    after = account_from_row(after_row, balance_cents, home)
 
     await write_activity_log(
         conn, user_id, "account", account_id, ActivityAction.UPDATED,

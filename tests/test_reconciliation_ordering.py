@@ -150,9 +150,9 @@ async def test_create_first_row_chained_with_no_neighbor_defaults_to_zero(
     async with db.pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO expense_bank_accounts
-                (id, user_id, name, currency_code, is_person, color, current_balance_cents,
+                (id, user_id, name, currency_code, is_person, color,
                  is_archived, sort_order, created_at, updated_at)
-               VALUES ($1, $2, 'Order Test Acct', 'PEN', false, '#000000', 0,
+               VALUES ($1, $2, 'Order Test Acct', 'PEN', false, '#000000',
                  false, 1, now(), now())""",
             acc_id, test_data.user_id,
         )

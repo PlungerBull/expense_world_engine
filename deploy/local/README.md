@@ -111,7 +111,10 @@ Run with `EXPENSE_CONFIG`/`EXPENSE_CACHE` pointed at a temp dir (the CLI's isola
   pg_restore -d expense_world_restoredrill "$DUMP"   # must exit 0 with empty stderr
   # then run against BOTH databases and diff:
   #   select count(*) ... per table (exact counts, not pg_stat n_live_tup)
-  #   select sum(amount_cents), sum(amount_home_cents), sum(current_balance_cents)
+  #   select sum(amount_cents) from expense_transactions where deleted_at is null
+  #   -- amount_home_cents (sql/021) and current_balance_cents (sql/022) are gone:
+  #   -- both were derived values and neither is stored, so neither can be compared
+  #   -- across a restore. The row-level sum above is the real financial fingerprint.
   #   select md5(string_agg(id::text, ',' order by id)) from expense_transactions
   dropdb expense_world_restoredrill
   ```

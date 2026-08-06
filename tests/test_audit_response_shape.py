@@ -78,14 +78,6 @@ async def _hard_delete_txn(txn_id: str, user_id: str) -> None:
         )
 
 
-async def _restore_balance(account_id: str, delta: int) -> None:
-    async with db.pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE expense_bank_accounts SET current_balance_cents = current_balance_cents + $1 WHERE id = $2",
-            delta, account_id,
-        )
-
-
 # ---------------------------------------------------------------------------
 # Inbox carries native amounts only
 # ---------------------------------------------------------------------------
@@ -305,7 +297,6 @@ async def test_debit_as_negative_flips_sync_transaction_amounts(client, test_dat
 
     finally:
         await _hard_delete_txn(txn_id, test_data.user_id)
-        await _restore_balance(test_data.account_id, 800)
 
 
 # ---------------------------------------------------------------------------
@@ -328,9 +319,9 @@ async def test_system_category_survives_rename(client, test_data):
             """
             INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order, created_at, updated_at)
+                 is_archived, sort_order, created_at, updated_at)
             VALUES ($1, $2, 'rename-target', 'PEN', false, '#abcdef',
-                    50000, false, 9, now(), now())
+                    false, 9, now(), now())
             """,
             second_account_id, test_data.user_id,
         )
@@ -446,7 +437,6 @@ async def test_system_category_survives_rename(client, test_data):
                     ids, test_data.user_id,
                 )
         # Restore primary account balance (we created two outflows of 300 and 200).
-        await _restore_balance(test_data.account_id, 500)
         # Drop the second account.
         async with db.pool.acquire() as conn:
             await conn.execute(

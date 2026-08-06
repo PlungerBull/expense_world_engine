@@ -6,13 +6,14 @@ from fastapi import APIRouter, Query
 
 from app import db
 from app.deps import CurrentUser
+from app.helpers.account_balance import balance_for, fetch_all_balances
 from app.helpers.exchange_rate import batch_get_rates
 from app.helpers.monthly_report import (
     compute_month_bounds,
     compute_month_flow,
     get_user_report_settings,
 )
-from app.schemas.dashboard import DashboardResponse
+from app.schemas.dashboard import DashboardResponse, dashboard_account_from_row
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -21,10 +22,17 @@ async def _load_accounts(
     conn: asyncpg.Connection,
     user_id: str,
     main_currency: str,
+    balances: dict[str, int],
     is_person: bool,
     archived: bool = False,
 ) -> list[dict]:
     """Fetch one of three dashboard account slices.
+
+    ``balances`` comes from a single ``fetch_all_balances`` call hoisted into the
+    handler, not from a per-slice query. This function runs two or three times
+    per request; summing the ledger inside it would scan every transaction two or
+    three times for one number per panel. An account absent from the mapping has
+    no transactions, which is a balance of 0 -- hence ``balance_for``.
 
     Slice selection:
       * ``is_person=True``                  → people (no archive filter; the
@@ -37,7 +45,7 @@ async def _load_accounts(
     """
     if is_person:
         query = """
-            SELECT id, name, currency_code, current_balance_cents
+            SELECT id, name, currency_code
             FROM expense_bank_accounts
             WHERE user_id = $1
               AND deleted_at IS NULL
@@ -47,7 +55,7 @@ async def _load_accounts(
     else:
         archive_clause = "is_archived = true" if archived else "is_archived = false"
         query = f"""
-            SELECT id, name, currency_code, current_balance_cents
+            SELECT id, name, currency_code
             FROM expense_bank_accounts
             WHERE user_id = $1
               AND deleted_at IS NULL
@@ -73,22 +81,13 @@ async def _load_accounts(
 
     result: list[dict] = []
     for row in rows:
+        balance_cents = balance_for(balances, row["id"])
         rate = rate_by_currency.get(row["currency_code"])
         home_cents: Optional[int] = (
-            round(int(row["current_balance_cents"]) * rate)
-            if rate is not None
-            else None
+            round(balance_cents * rate) if rate is not None else None
         )
 
-        result.append(
-            {
-                "id": str(row["id"]),
-                "name": row["name"],
-                "currency_code": row["currency_code"],
-                "current_balance_cents": int(row["current_balance_cents"]),
-                "current_balance_home_cents": home_cents,
-            }
-        )
+        result.append(dashboard_account_from_row(row, balance_cents, home_cents))
 
     return result
 
@@ -133,11 +132,16 @@ async def get_dashboard(
         settings = await get_user_report_settings(conn, auth_user.id)
         year, month, start_utc, end_utc = compute_month_bounds(settings["display_timezone"])
 
+        # One ledger scan for all two-or-three panels. Hoisted here rather than
+        # left inside _load_accounts because that runs per panel, and summing
+        # the ledger once per panel would triple the work for one number each.
+        balances = await fetch_all_balances(conn, auth_user.id)
+
         bank_accounts = await _load_accounts(
-            conn, auth_user.id, settings["main_currency"], is_person=False
+            conn, auth_user.id, settings["main_currency"], balances, is_person=False
         )
         people = await _load_accounts(
-            conn, auth_user.id, settings["main_currency"], is_person=True
+            conn, auth_user.id, settings["main_currency"], balances, is_person=True
         )
         flow = await compute_month_flow(
             conn, auth_user.id, start_utc, end_utc, settings["display_timezone"]
@@ -146,7 +150,7 @@ async def get_dashboard(
         archived_accounts: Optional[list[dict]] = None
         if include_archived:
             archived_accounts = await _load_accounts(
-                conn, auth_user.id, settings["main_currency"],
+                conn, auth_user.id, settings["main_currency"], balances,
                 is_person=False, archived=True,
             )
 

@@ -25,19 +25,18 @@ OPENING_KEY = "opening_balance"
 PAST_DATE = "2026-04-12T12:00:00Z"
 
 
-async def _make_account(user_id: str, balance_cents: int = 0) -> str:
+async def _make_account(user_id: str) -> str:
     account_id = str(uuid.uuid4())
     async with db.pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order,
-                 created_at, updated_at)
+                 is_archived, sort_order, created_at, updated_at)
             VALUES ($1, $2, $3, 'PEN', false, '#00FF00',
-                    $4, false, 9, now(), now())
+                    false, 9, now(), now())
             """,
-            account_id, user_id, f"Opening-Test {uuid.uuid4().hex[:8]}", balance_cents,
+            account_id, user_id, f"Opening-Test {uuid.uuid4().hex[:8]}",
         )
     return account_id
 
@@ -49,10 +48,9 @@ async def _make_person_account(user_id: str) -> str:
             """
             INSERT INTO expense_bank_accounts
                 (id, user_id, name, currency_code, is_person, color,
-                 current_balance_cents, is_archived, sort_order,
-                 created_at, updated_at)
+                 is_archived, sort_order, created_at, updated_at)
             VALUES ($1, $2, $3, 'PEN', true, '#00FF00',
-                    0, false, 9, now(), now())
+                    false, 9, now(), now())
             """,
             account_id, user_id, f"Opening-Person {uuid.uuid4().hex[:8]}",
         )

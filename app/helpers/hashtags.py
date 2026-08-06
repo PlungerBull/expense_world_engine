@@ -3,8 +3,9 @@
 Service-layer functions for expense_hashtags, called from routers/hashtags.py.
 Routers stay thin (HTTP glue + idempotency) and delegate business logic here.
 
-See ``app/helpers/balance.py`` for the convention: these functions do NOT
-open their own ``conn.transaction()`` — callers own transaction boundaries.
+See ``app/helpers/idempotency.run_idempotent`` for the convention: these
+functions do NOT open their own ``conn.transaction()`` — callers own
+transaction boundaries.
 """
 
 from typing import Optional

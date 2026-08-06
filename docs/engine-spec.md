@@ -213,7 +213,9 @@ Creates a new bank account (real account only — `is_person = false`).
 - `id` must not collide with an existing account — returns `409 CONFLICT` if taken.
 
 ### `POST /accounts/{id}/opening-balance`
-Seeds the account's opening balance as a transaction under the `@Opening` system category (`system_key = 'opening_balance'`, auto-created on first use). The seed is an **ordinary transaction** — editable and deletable via the transactions API, balance applied atomically — whose only special property is its category: flow reports exclude it entirely (see Dashboard & Reporting below). An opening balance is where tracking starts, not money that moved.
+Seeds the account's opening balance as a transaction under the `@Opening` system category (`system_key = 'opening_balance'`, auto-created on first use). The seed is an **ordinary transaction** — editable and deletable via the transactions API — whose only special property is its category: flow reports exclude it entirely (see Dashboard & Reporting below). An opening balance is where tracking starts, not money that moved.
+
+Since `sql/022` it is also the **first term of the account's balance**, which is a sum over the ledger rather than a stored figure. Under the old cached column a wrong or missing opening seed could hide behind the cache; now the account is wrong by exactly that amount, forever, on every screen. The invariant did not change — it became honest.
 
 **Required:** `transaction_id` (client-supplied UUID), `amount_cents` (signed; positive = money you had, negative = starting debt), `date` (RFC 3339, must not be in the future)
 **Optional:** `title` (defaults to `"Opening balance"`), `exchange_rate` (same semantics as `POST /transactions`)
@@ -415,8 +417,9 @@ If any condition fails, returns `422` with **all** the failing fields, not just 
 1. Creates `expense_transactions` row(s) using the client-supplied `id` (and `transfer_id` for the sibling). `inbox_id` points back to this inbox item. Copies `transaction_type` from the inbox row. Computes `amount_home_cents` from `amount_cents × exchange_rate`. For transfers, each leg's signed amount is reconstructed from the inbox row's `transfer_direction`: the primary takes that direction, the sibling the inverse.
 2. Sets `status = 2` (promoted) on the inbox row.
 3. Sets `deleted_at` on the inbox row (soft delete).
-4. Updates `current_balance_cents` on the account (decrements for expenses, increments for income).
-5. Writes `activity_log` entry (action=1 CREATED) for the new transaction(s).
+4. Writes `activity_log` entry (action=1 CREATED) for the new transaction(s).
+
+There is no balance step in this list, or in any other write flow below. An account's balance is the signed sum of its non-deleted transactions, computed at read time (`sql/022`), so inserting the row **is** the balance change.
 6. Writes `activity_log` entry (action=3 DELETED) for the inbox item.
 
 `status = 2` distinguishes a promoted inbox item from a dismissed one (which stays at `status = 1` with `deleted_at` set) — both end up soft-deleted, but the reason is preserved via the status column. Only the PENDING + deleted combination is restorable via `POST /inbox/{id}/restore`.
@@ -468,8 +471,7 @@ Auto-populates `exchange_rate` and computes `amount_home_cents` same as inbox. R
 
 **On success (atomic):**
 1. Creates `expense_transactions` row.
-2. Updates `current_balance_cents` on the account.
-3. Writes `activity_log` entry.
+2. Writes `activity_log` entry.
 
 ### `GET /transactions/{id}`
 ### `PUT /transactions/{id}`
@@ -485,17 +487,17 @@ Partial update.
 
 **Date change:** If `date` changes on a non-transfer transaction, the engine automatically re-fetches the historical exchange rate for the new date and recalculates `amount_home_cents`. The user's manually set `exchange_rate` is replaced with the historical rate for the new date. (If the user then wants to override it, they can in a follow-up PUT.) This does not apply to transfer legs — `date` is blocked by the transfer edit guard above, so the re-rate path is never reached for transfers.
 
-**Balance update:** If `amount_cents` or `account_id` changes, `current_balance_cents` is updated atomically on the affected account(s).
+**Balance:** nothing to update. Changing `amount_cents` changes what the row contributes; changing `account_id` moves that contribution from one account to the other. Both fall out of the single `UPDATE` on the transaction row.
 
 ### `DELETE /transactions/{id}`
-Soft-delete. Updates `current_balance_cents` on the account atomically.
+Soft-delete. The balance sum excludes soft-deleted rows, so setting `deleted_at` is the reversal — there is no separate balance write.
 
 **Response shape:** Always includes a `warnings: list[str]` field. Empty list when the delete is clean; populated with one or more strings when something notable happened. Currently the only warning emitted is `"Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."` — the delete is still allowed (the engine does not auto-adjust the reconciliation's totals); the field surfaces the staleness so clients can render a notice.
 
 If the transaction has a `transfer_transaction_id`, both the transaction and its paired sibling are soft-deleted atomically.
 
 ### `POST /transactions/{id}/restore`
-Undoes a soft-delete on a transaction. Re-applies the balance impact on the account, re-activates the cascaded hashtag junction rows, and atomically restores the transfer sibling if the row is part of a pair. Returns the restored transaction with the same `warnings: list[str]` envelope as DELETE (empty when restore is clean).
+Undoes a soft-delete on a transaction. Clearing `deleted_at` puts the row back into the balance sum, so the balance impact returns with no separate re-apply step. Also re-activates the cascaded hashtag junction rows, and atomically restores the transfer sibling if the row is part of a pair. Returns the restored transaction with the same `warnings: list[str]` envelope as DELETE (empty when restore is clean).
 
 **Reconciliation handling:** The transaction's `reconciliation_id` survives on the soft-deleted row. On restore, the link is conditionally cleared:
 
@@ -569,7 +571,7 @@ Include a `transfer` object on any transaction create request:
 
    **This is checked wherever both signs are supplied — including `POST`/`PUT /inbox`, before promotion.** A transfer draft is validated when it is written, not when it is promoted, because that is where the two signs still exist side by side; by promote time the row holds absolute amounts plus `transfer_direction`, and the legs are re-signed from that column and cannot disagree. ⚠️ Until 2026-08-03 the inbox had no direction column and promotion *derived* the primary's sign from the sibling's, so this rule was unreachable for drafts and a same-sign pair was silently rewritten. Audit WP7.2; fixed in `sql/019`.
 7. **Home currency zero-sum (cross-currency transfers):** For transfers between accounts in different currencies, the engine uses the **implied rate from the entered amounts** (the rate the user actually got), not the market rate, when computing `amount_home_cents`. The side whose currency matches `main_currency` is dominant — its home value equals its native amount. The other side's `amount_home_cents` is forced to equal the dominant side's by direct assignment, and its `exchange_rate` is derived from that (stored for audit/display). This guarantees the pair nets to zero in home currency by construction, matching how production fintech systems (Stripe, Wise, QuickBooks Online) treat the execution rate as the historical spot rate for the transaction. No separate FX gain/loss is recognized at transaction time — that's a period-end remeasurement concern handled elsewhere (if ever).
-8. Updates `current_balance_cents` on both accounts.
+8. Both account balances have moved by construction — each leg is an ordinary row on its own account, and the balance is a sum over rows.
 9. Writes `activity_log` entries for both transactions.
 
 ---

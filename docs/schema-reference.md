@@ -257,9 +257,9 @@ No `version` or `updated_at`: PATs are immutable between creation and revocation
 
 Real bank accounts and person virtual accounts (`is_person = true`). One currency per account. A real-world multi-currency card is modelled as separate accounts, one per currency. The same rule applies to person virtual accounts — if someone shares expenses in both PEN and USD, they have two rows.
 
-`current_balance_cents` is a cached field on the account row itself — not stored on transactions. Reading an account's balance is a single row lookup, never an aggregation. The engine updates this field atomically on every transaction write, edit, and soft-delete. If a transaction is soft-deleted, the engine reverses its balance contribution in the same database operation.
+`current_balance_cents` is **not a column** (`sql/022`, 2026-08-06). It is computed at read time as the signed sum of the account's non-deleted transactions, including its `@Opening` seed, in the account's own currency — `app/helpers/account_balance.py`. It remains on the wire unchanged; only its source moved. It was a cached column until sql/022, updated by hand on every transaction write, and that made it a derived value with two sources of truth that could disagree permanently and silently.
 
-Historical balance (e.g. "what was my balance on March 1?") is always computed on demand: `SUM(amount_cents WHERE transaction_date <= target_date)`.
+Historical balance (e.g. "what was my balance on March 1?") is the same sum with a date bound: `SUM(<signed amount> WHERE date <= target_date)`. It has always been computed on demand; now the current balance is too, by the same rule.
 
 ```
 expense_bank_accounts
@@ -272,10 +272,8 @@ expense_bank_accounts
                            — true for virtual accounts representing people (debt tracking)
                            — person accounts appear in the People sidebar section, not Accounts
   - color                  text, NOT NULL, default '#3b82f6'
-  - current_balance_cents  bigint, NOT NULL, default 0
-                           — cached running balance. Updated atomically on every transaction write.
-                           — never recalculate as SUM() at read time; always read this cached value.
-                           — soft-deleting a transaction reverses its balance contribution atomically.
+                           — (current_balance_cents was here; dropped by sql/022. The balance is
+                              computed from the ledger and appears on responses, not on the row.)
   - is_archived            boolean, NOT NULL, default false
                            — hides from pickers and entry flows but preserves all historical records
                            — accounts with transactions can be archived; they cannot be hard-deleted
@@ -392,7 +390,8 @@ expense_transaction_inbox
 2. Sets `inbox_id` on the new transaction row to link back to this item.
 3. Sets `status = 2` (promoted) on this inbox row.
 4. Sets `deleted_at` on this inbox row (soft delete).
-5. Updates `current_balance_cents` on the account (decrements for expenses, increments for income).
+
+There is no balance step. Writing the ledger row in step 1 *is* the balance change — balances are computed from the rows (`sql/022`).
 
 **Transfer promotion:** When the transfer columns are set, promoting creates a paired transfer instead of a single transaction. The `category_id` requirement is waived — categories are auto-assigned (`@Transfer` for real accounts, `@Debt` for person accounts), and `transfer_account_id` gets the same active/non-archived check the primary account does. Each leg's signed amount is reconstructed from `transfer_direction`: the primary takes that direction, the sibling the inverse.
 
@@ -410,7 +409,7 @@ expense_transaction_inbox
 
 Confirmed transactions — the clean, reliable ledger.
 
-**Balance update rule:** The engine updates `current_balance_cents` on the account for every transaction write. One exception: **parent transactions in a split do not update the balance**. Only child rows (where `parent_transaction_id IS NOT NULL`) and standalone rows (no parent, no children) update the balance. The parent is a display container only. Splits must be created atomically in a single API call.
+**Balance rule:** The engine writes no balance at all. An account's balance is the signed sum of its non-deleted transactions (`sql/022`), so every row below contributes by existing. ⚠️ **This is what splits must change.** The documented split rule is that a parent row is a display container that does not move the balance and only its children do — enforced, under the old stored column, by simply not calling the balance helper for a parent. A `SUM` has no such escape hatch, so shipping splits without excluding parents double-counts every split. The exact predicate is written out in `app/helpers/account_balance.py` and `sql/022`.
 
 ```
 expense_transactions
@@ -659,7 +658,7 @@ Reconciliation is **always done in the account's native currency**. You reconcil
 
 ### Dashboard net worth
 
-Each account's `current_balance_cents` is stored in its native currency. To show a combined net worth, the dashboard converts each account balance using today's most recent rate. This value is approximate by nature and is labeled as such: "~S/ 4,250 equivalent." No one expects a cross-currency net worth to be exact to the cent.
+Each account's `current_balance_cents` is computed in its native currency. To show a combined net worth, the dashboard converts each account balance using today's most recent rate. This value is approximate by nature and is labeled as such: "~S/ 4,250 equivalent." No one expects a cross-currency net worth to be exact to the cent.
 
 ### Home currency change
 
@@ -716,7 +715,7 @@ Split transactions are modelled using `parent_transaction_id` (self-reference on
 
 **Structure:** One parent row holds the original full amount. Child rows hold the split portions. `parent_transaction_id` on each child points to the parent's `id`.
 
-**Balance rule:** The parent row **never** updates `current_balance_cents`. Only child rows update the balance. The parent is a display and grouping container — its amount equals the sum of its children's amounts.
+**Balance rule:** The parent row must **never** contribute to the account balance. Only child rows do. The parent is a display and grouping container — its amount equals the sum of its children's amounts. Since `sql/022` the balance is a `SUM` over the ledger rather than a field each write path updates, so this rule has to be enforced *in the sum's `WHERE` clause*, not by omitting a call. See `app/helpers/account_balance.py` for the predicate.
 
 **Creation:** Splits must be created atomically in a single API call (parent + all children together). Creating a parent alone and adding children later is not supported — it would cause an incorrect transient balance state.
 

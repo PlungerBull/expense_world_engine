@@ -26,6 +26,32 @@ class DashboardAccount(BaseModel):
     )
 
 
+def dashboard_account_from_row(
+    row,
+    balance_cents: int,
+    balance_home_cents: Optional[int] = None,
+) -> dict:
+    """Serialize an account row for a dashboard panel.
+
+    Exists so that exactly two functions in the engine can emit
+    ``current_balance_cents`` -- this one and ``schemas.accounts.account_from_row``
+    -- and neither is callable without being handed a balance. The dashboard
+    previously built the field in a dict literal, which meant the required
+    positional on ``account_from_row`` guarded only half the surface.
+
+    Same contract as ``account_from_row``: ``balance_cents`` is required because
+    sql/022 dropped the stored column and there is nothing on ``row`` to fall
+    back to.
+    """
+    return DashboardAccount(
+        id=str(row["id"]),
+        name=row["name"],
+        currency_code=row["currency_code"],
+        current_balance_cents=balance_cents,
+        current_balance_home_cents=balance_home_cents,
+    ).model_dump(mode="json")
+
+
 # Every aggregate below is home-currency and nullable, and every one is paired
 # with `unconverted_count`. Both halves are load-bearing:
 #
