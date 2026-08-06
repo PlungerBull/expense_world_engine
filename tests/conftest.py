@@ -160,7 +160,6 @@ async def _cleanup_test_data(conn, user_id: str):
     async with conn.transaction():
         await conn.execute("DELETE FROM idempotency_keys WHERE user_id = $1", user_id)
         await conn.execute("DELETE FROM activity_log WHERE user_id = $1", user_id)
-        await conn.execute("DELETE FROM sync_checkpoints WHERE user_id = $1", user_id)
         await conn.execute("DELETE FROM expense_transaction_hashtags WHERE user_id = $1", user_id)
         await conn.execute("DELETE FROM expense_transactions WHERE user_id = $1", user_id)
         await conn.execute("DELETE FROM expense_transaction_inbox WHERE user_id = $1", user_id)

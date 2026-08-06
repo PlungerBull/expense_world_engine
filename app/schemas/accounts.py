@@ -69,7 +69,7 @@ def account_from_row(
 
     ``balance_home_cents`` stays optional and defaults to ``None`` because
     ``null`` is its real meaning: no rate was available for the account's
-    currency today. ``/sync`` passes nothing deliberately.
+    currency today.
     """
     return AccountResponse(
         id=str(row["id"]),

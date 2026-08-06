@@ -11,6 +11,29 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-06 — `GET /v1/sync` deleted; `sync_checkpoints` dropped; `X-Client-Id` no longer read
+
+**Engine change.** `docs/rework/WP4`. The delta-sync endpoint is gone: `app/routers/sync.py`,
+`app/helpers/sync.py`, the `sync_checkpoints` table, the seven `(user_id, updated_at)`
+indexes that served it (`sql/023`), and the `X-Client-Id` header handling. Requesting
+`GET /v1/sync` now returns `404`. The substrate stays untouched — `version`, `updated_at`,
+`deleted_at` tombstones, client-generated UUIDs — so a future mobile client can rebuild
+sync additively (and without open bug 3.1, which this deletion closes).
+
+**What breaks, and what absorbed it.** WP4's package text claimed the CLI never called
+`/sync`; that was wrong — the CLI's cache-by-default read path was built on it. The CLI
+was de-cached in a companion change that landed the same day, *before* this deletion:
+its replica, `expense sync`, `--no-cache` / `--no-sync-after`, and the config `client_id`
+are all deleted, and every read is a live engine call (CLI repo, `docs/decisions.md`
+"Delete the local replica"). Clients may keep sending `X-Client-Id`; the engine ignores
+unknown headers.
+
+**This also retires the gap recorded in the WP3 entry below** ("an account's balance can
+change without the account appearing in the next `/sync` delta") — there is no delta to
+fall out of.
+
+---
+
 ## 2026-08-06 — account balances are computed, not stored (wire shape unchanged; one `/sync` behaviour change)
 
 **Engine change.** `expense_bank_accounts.current_balance_cents` was a stored running

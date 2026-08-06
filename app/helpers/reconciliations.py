@@ -646,7 +646,7 @@ async def complete_reconciliation(
         user_id,
     )
 
-    # Bump version on every assigned transaction so delta-sync clients
+    # Bump version on every assigned transaction so clients and auditors
     # see them flip into the "fields locked" state in the same tick as
     # the reconciliation itself.
     await conn.execute(
@@ -695,8 +695,8 @@ async def revert_reconciliation(
         return await _serialize_with_neighbor(conn, user_id, row)
 
     # Mirror complete_reconciliation: lock assigned txns before flipping
-    # state so concurrent edits serialize behind the revert, and sync
-    # clients see the same tick bump the txn versions.
+    # state so concurrent edits serialize behind the revert, and readers
+    # see the same tick bump the txn versions.
     await conn.fetch(
         """
         SELECT id FROM expense_transactions

@@ -84,7 +84,7 @@ async def fetch_hashtag_ids_map(
     """Resolve active hashtag IDs for a set of ledger transactions.
 
     Returns ``{transaction_id: [hashtag_id, ...]}`` with each list sorted
-    ascending by UUID (matches the ``/sync`` convention). Soft-deleted
+    ascending by UUID (one stable convention everywhere). Soft-deleted
     junction rows are excluded — when a transaction is soft-deleted its
     junctions cascade-soft-delete, so deleted transactions resolve to ``[]``.
 
@@ -158,8 +158,8 @@ async def _sync_hashtags(
 
       2. **Stable junction IDs.** Attach → detach → re-attach cycles
          keep the same junction row (one row per logical pair forever),
-         instead of accumulating N+1 rows per cycle. ``/sync`` deltas
-         see a single junction lifecycle, not phantom rows.
+         instead of accumulating N+1 rows per cycle — a single junction
+         lifecycle, not phantom rows.
 
     The ``DO UPDATE`` clause only fires on rows that were soft-deleted
     (``WHERE expense_transaction_hashtags.deleted_at IS NOT NULL``), so

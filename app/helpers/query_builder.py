@@ -48,7 +48,7 @@ async def soft_delete(
 ) -> Optional[asyncpg.Record]:
     """Soft-delete a resource by setting deleted_at, returning the updated row.
 
-    Also bumps ``updated_at`` and ``version`` so delta sync picks up the change.
+    Also bumps ``updated_at`` and ``version`` (optimistic-concurrency counters).
     """
     return await conn.fetchrow(
         f"""
@@ -72,8 +72,8 @@ async def restore(
 
     Only matches rows that are currently soft-deleted — a restore on an
     already-active row returns ``None`` so callers can distinguish "not
-    deleted" from "not found". Bumps ``updated_at`` and ``version`` so
-    delta sync picks up the change.
+    deleted" from "not found". Bumps ``updated_at`` and ``version``
+    (optimistic-concurrency counters).
     """
     return await conn.fetchrow(
         f"""

@@ -95,7 +95,7 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
     §6 aggregate exception #1). When omitted, the field defaults to ``[]``.
 
     The row may also carry a pre-aggregated ``hashtag_ids`` column (this
-    is how ``/sync`` already supplies the array via in-query ``array_agg``).
+    is how the list endpoints supply the array via in-query ``array_agg``).
     An explicit ``hashtag_ids`` argument takes precedence over a column
     of the same name on the row.
     """

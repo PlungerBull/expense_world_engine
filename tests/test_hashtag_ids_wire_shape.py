@@ -16,7 +16,6 @@ The covered surface:
   * POST /v1/transactions/batch          (each created item)
   * POST /v1/inbox/{id}/promote          (promoted transaction)
   * GET  /v1/reconciliations/{id}        (each embedded transaction)
-  * GET  /v1/sync                        (the original embed site)
 
 These tests own their fixtures (fresh hashtags + transactions per test) so
 state from one parametrized case can't leak into another. Cleanup hard-
@@ -480,34 +479,4 @@ async def test_reconciliation_detail_embeds_hashtag_ids_per_transaction(
                 recon_id, test_data.user_id,
             )
         for h in tags:
-            await _cleanup_hashtag(h, test_data.user_id)
-
-
-# ---------------------------------------------------------------------------
-# Field-shape invariants (sorted, list-typed, no None) on /sync
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_sync_hashtag_ids_sorted_ascending(client, test_data):
-    """The /sync embed (the original surface) must also be sorted ASC and
-    list-typed. Regression guard for the shared serialization path.
-    """
-    h1 = await _create_hashtag(client, "sync-a")
-    h2 = await _create_hashtag(client, "sync-b")
-    h3 = await _create_hashtag(client, "sync-c")
-    txn_id, _ = await _create_txn(client, test_data, hashtag_ids=[h2, h3, h1])
-
-    try:
-        r = await client.get(
-            "/v1/sync",
-            params={"sync_token": "*"},
-            headers={"X-Client-Id": str(uuid.uuid4())},
-        )
-        assert r.status_code == 200, r.text
-        tx = next(t for t in r.json()["transactions"] if t["id"] == txn_id)
-        _assert_hashtag_ids_shape(tx, [h1, h2, h3])
-    finally:
-        await _cleanup_txn(txn_id, test_data.user_id)
-        for h in (h1, h2, h3):
             await _cleanup_hashtag(h, test_data.user_id)

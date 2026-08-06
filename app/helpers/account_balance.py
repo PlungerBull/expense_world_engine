@@ -38,7 +38,7 @@ account. A forgotten id raises ``KeyError`` instead.
 
 There is deliberately **no "all accounts" variant**. Every caller already knows
 which accounts it is rendering — the account list has its page, each dashboard
-panel has its slice, ``/sync`` has its delta — so a ledger-wide scan would be
+panel has its slice — so a ledger-wide scan would be
 doing more work to produce a less safe result. It would also have to hand back a
 mapping with accounts missing (those with no rows), which forces a
 ``.get(id, 0)`` at the call site: the fail-open shape this module exists to
@@ -88,10 +88,10 @@ Transaction boundaries
 
 These are reads and take no locks. Callers inside ``run_idempotent`` see them in
 the same transaction as their own writes; callers on GET paths run outside any
-transaction, which is what the account queries beside them already do. The one
-caller that genuinely needs a shared snapshot is ``routers/sync``, and it must
-call from inside its REPEATABLE READ block -- see
-``helpers/idempotency.run_idempotent`` for the boundary convention.
+transaction, which is what the account queries beside them already do. A future
+caller that genuinely needs a shared snapshot must call from inside its own
+REPEATABLE READ block -- see ``helpers/idempotency.run_idempotent`` for the
+boundary convention.
 """
 
 from typing import Iterable

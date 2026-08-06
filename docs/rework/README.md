@@ -187,7 +187,7 @@ boundaries, not defects.
 | [WP1](WP1-transfer-collapse.md) | `transaction_type` becomes direction on every row; `transfer_direction` deleted | Blocks WP2. **Has a deadline.** |
 | [WP2](WP2-read-time-currency.md) | Delete stored home values and rates; convert at read time | Needs WP1 |
 | [WP3](WP3-computed-balances-and-indexes.md) | Delete `current_balance_cents`; compute it; **add the missing indexes** | ✅ **Landed 2026-08-06** (`sql/022`). Unblocks WP4 |
-| [WP4](WP4-delete-sync.md) | Delete `/sync`, `sync_checkpoints`, and the `updated_at` indexes | Needs WP3 |
+| [WP4](WP4-delete-sync.md) | Delete `/sync`, `sync_checkpoints`, and the `updated_at` indexes | ✅ **Landed 2026-08-06** (`sql/023`) — see deviation note below |
 | [WP5](WP5-schema-slimming.md) | 15 columns and 4 routes with no readers | Independent |
 | [WP6](WP6-reconciliation-simplification.md) | Delete the chaining cascade; shrink the largest helper | Independent |
 | [WP7](WP7-documentation.md) | Reconcile spec, schema reference and conventions; delete this directory | Last |
@@ -199,7 +199,7 @@ this program removes:
 
 | Bug | Closed by |
 |---|---|
-| 3.1 — delta sync can permanently drop committed writes | WP4, by deletion |
+| ~~3.1 — delta sync can permanently drop committed writes~~ | ✅ **Closed by WP4**, by deletion (with the ⚪ `X-Client-Id` normalisation nit) |
 | ~~1.4 — inbox items promote at exchange rate 1.0~~ | ✅ **Closed by WP2**, by deletion |
 | ~~1.5 — changing `account_id` never re-rates~~ | ✅ **Closed by WP2**, by deletion |
 | ~~2.3 — `resolve_home_rates` reads an account with no `user_id` filter~~ | ✅ **Closed by WP2**, by deletion — a live cross-tenant read while it lasted |
@@ -306,3 +306,40 @@ the same change rather than left for WP7 — chiefly `schema-reference.md`'s
 broader rewrite of those two documents is still WP7's. Untouched WP2-era drift
 remains in both (`schema-reference.md:424` and `:633` still describe stored
 `exchange_rate` / `amount_home_cents`).
+
+---
+
+## WP4 landed, 2026-08-06 — one factual premise was wrong, and it changed the scope
+
+`sql/023` drops the seven `(user_id, updated_at)` indexes and `sync_checkpoints`;
+the sync router, helper, schemas and tests are deleted; `GET /v1/sync` 404s.
+Suite green at 215 (was 238; the deleted 23 were `tests/test_sync.py` plus three
+`/sync`-specific tests in other files whose sibling coverage on `/inbox`,
+`/transactions` and the list endpoints survives).
+
+**1. "The CLI never called `/sync`" was false.** The package (and the audit it
+came from) asserted the CLI uses only direct REST endpoints; in fact its
+cache-by-default read path hydrated a local SQLite replica from `/sync` on every
+default-mode read, and `expense sync` was a user-facing command. The zero rows in
+`sync_checkpoints` reflected a reset production DB, not an unused endpoint. By
+owner decision the deletion proceeded anyway, with a **companion CLI change that
+landed first**: the CLI's whole cache layer was deleted (replica, `expense sync`,
+`--no-cache`/`--no-sync-after`, config `client_id`, TUI Sync screen, post-write
+refresh, exit codes 4/5) and every read is now a live loopback call. Rationale in
+the CLI repo's `docs/decisions.md` ("Delete the local replica"); the wire change
+is recorded in `docs/client-breaking-changes.md`.
+
+**2. Everything else went as written.** WP3's four replacement indexes were
+verified present before the drops; no query outside `helpers/sync.py` filtered or
+ordered on `updated_at` (the seven indexes were sync-only);
+`idx_expense_transaction_hashtags_tx` was kept; `resolve_home_rates` was already
+gone (WP2); `X-Client-Id` lived only in the sync router. `version`, `updated_at`,
+`deleted_at` and client UUIDs are untouched on every table. Optimistic-concurrency
+coverage that survives: `tests/test_concurrency_hazards.py` (row-lock
+serialisation) plus version-bump assertions in the reconciliation/restore/archive
+suites — note honestly: there is no `If-Match`/409-version mechanism and never
+was; `version` is a server-incremented counter clients read but never send.
+
+**For WP7:** `engine-spec.md` still documents `GET /sync`, `sync_checkpoints`,
+and `X-Client-Id`; `schema-reference.md` still lists the table and the seven
+indexes. Route count is now 60.

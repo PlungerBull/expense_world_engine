@@ -14,17 +14,6 @@ Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high
 
 ## 🔴 Critical
 
-### 3.1 — Delta sync can permanently drop committed writes
-`helpers/sync.py` — the checkpoint stores `now()` at transaction *start*; writers
-stamp `updated_at` at *their* start; the delta reads `WHERE updated_at > $2`. A writer
-that begins before a sync and commits after it is never delivered, and the next delta
-starts past its timestamp.
-**Validate:** two connections, manual `BEGIN`/sleep/`COMMIT` around a sync.
-**Fix:** persist `now() - interval '5 seconds'` as the checkpoint (payloads are
-full-row upserts, so re-delivery is idempotent), or take
-`COALESCE(min(xact_start), now())` from `pg_stat_activity`. Correct the docstring too.
-⚠️ The `REPEATABLE READ` wrapper is correct — the bug is only the boundary value.
-
 ### 4.1 — Expired idempotency keys duplicate financial writes
 `helpers/idempotency.py` — `_claim` correctly ignores rows past `expires_at`, so the
 write re-executes; but `_store`'s `ON CONFLICT DO NOTHING` then hits the surviving
@@ -63,10 +52,9 @@ Add a purge job — the table grows unbounded today.
 ## ⚪ Low
 
 `/health` 500s when the DB is down (it is a readiness check — document or reshape) ·
-asyncpg pool has no `command_timeout` · `X-Client-Id` not case-normalised before
-checkpoint lookup · `?search=` is unescaped `ILIKE` (escape `%`/`_`, and fix the
-"full-text" claim) · `compute_month_flow` hashtag aggregation missing
-`transaction_source = 1`.
+asyncpg pool has no `command_timeout` · `?search=` is unescaped `ILIKE` (escape
+`%`/`_`, and fix the "full-text" claim) · `compute_month_flow` hashtag aggregation
+missing `transaction_source = 1`.
 
 ---
 
@@ -94,6 +82,8 @@ pins it · `2.2` JWKS fetch — `jwks.py` deleted with the branch ·
 **`1.4`/`1.5`/`2.3` read-time currency, `sql/021`** — all three by deletion rather than
 repair: with no stored conversion there is no rate to default to `1.0`, nothing to go
 stale when an account changes, and no `resolve_home_rates` to read an account without
-a `user_id` filter.
+a `user_id` filter · **`3.1` delta sync dropping committed writes — `/sync` deleted,
+`sql/023` (docs/rework/WP4)**, along with the ⚪ `X-Client-Id` case-normalisation nit,
+both by deletion.
 
 Details are in git history — `git log -- docs/open-bugs.md`.

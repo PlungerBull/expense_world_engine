@@ -8,8 +8,8 @@ Covers the wire-contract guarantees clients depend on:
     governs the currency — so there is nothing to combine and nothing to
     convert. This file used to assert the opposite; docs/rework/WP2 inverted it
     when sql/021 deleted the stored conversions.
-  * `?debit_as_negative=true` flips the sign of `amount_cents` on /inbox and
-    /sync (the two endpoints that grew the flag in Sprint 1.4 / 1.5). There is
+  * `?debit_as_negative=true` flips the sign of `amount_cents` on /inbox
+    (the /sync sibling test went with the endpoint, docs/rework/WP4). There is
     one amount to flip now, not two.
   * The system_key column on expense_categories survives a display-name
     rename — a renamed @Transfer / @Debt is still found by the transfer
@@ -23,10 +23,6 @@ import uuid
 import pytest
 
 from app import db
-
-
-CLIENT_ID = str(uuid.uuid4())
-SYNC_HEADERS = {"X-Client-Id": CLIENT_ID}
 
 
 # ---------------------------------------------------------------------------
@@ -59,22 +55,6 @@ async def _cleanup_recon(recon_id: str, user_id: str) -> None:
         await conn.execute(
             "DELETE FROM expense_reconciliations WHERE id = $1 AND user_id = $2",
             recon_id, user_id,
-        )
-
-
-async def _hard_delete_txn(txn_id: str, user_id: str) -> None:
-    async with db.pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM expense_transaction_hashtags WHERE transaction_id = $1 AND user_id = $2",
-            txn_id, user_id,
-        )
-        await conn.execute(
-            "DELETE FROM activity_log WHERE resource_id = $1 AND user_id = $2",
-            txn_id, user_id,
-        )
-        await conn.execute(
-            "DELETE FROM expense_transactions WHERE id = $1 AND user_id = $2",
-            txn_id, user_id,
         )
 
 
@@ -244,59 +224,6 @@ async def test_debit_as_negative_flips_inbox_expense_amounts(client, test_data):
 
     finally:
         await _cleanup_inbox(inbox_id, test_data.user_id)
-
-
-# ---------------------------------------------------------------------------
-# debit_as_negative on /sync
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_debit_as_negative_flips_sync_transaction_amounts(client, test_data):
-    """The sync delta flag negates expense and transfer-debit
-    amounts on the transactions[] payload; default keeps everything
-    positive.
-    """
-    txn_id = str(uuid.uuid4())
-    create_r = await client.post(
-        "/v1/transactions",
-        json={
-            "id": txn_id,
-            "title": f"sync-flag-{uuid.uuid4()}",
-            "amount_cents": -800,
-            "date": "2026-04-12T12:00:00Z",
-            "account_id": test_data.account_id,
-            "category_id": test_data.category_id,
-        },
-        headers={"X-Idempotency-Key": str(uuid.uuid4())},
-    )
-    assert create_r.status_code == 201, create_r.text
-
-    try:
-        # Wildcard sync, default.
-        r_default = await client.get(
-            "/v1/sync",
-            params={"sync_token": "*"},
-            headers=SYNC_HEADERS,
-        )
-        assert r_default.status_code == 200, r_default.text
-        txns_default = {t["id"]: t for t in r_default.json()["transactions"]}
-        assert txn_id in txns_default
-        assert txns_default[txn_id]["amount_cents"] == 800
-
-        # With flag.
-        r_flag = await client.get(
-            "/v1/sync",
-            params={"sync_token": "*", "debit_as_negative": "true"},
-            headers={"X-Client-Id": str(uuid.uuid4())},  # fresh client → fresh checkpoint
-        )
-        assert r_flag.status_code == 200, r_flag.text
-        txns_flag = {t["id"]: t for t in r_flag.json()["transactions"]}
-        assert txn_id in txns_flag
-        assert txns_flag[txn_id]["amount_cents"] == -800
-
-    finally:
-        await _hard_delete_txn(txn_id, test_data.user_id)
 
 
 # ---------------------------------------------------------------------------

@@ -272,7 +272,7 @@ async def archive_category(
     """Set ``is_archived = true`` on a category and log the change.
 
     Mirrors ``helpers.accounts.archive_account``: direct UPDATE bumps
-    ``version`` and ``updated_at`` so delta sync surfaces the flag flip,
+    ``version`` and ``updated_at`` so the flag flip is visible to clients,
     and the activity log carries before/after snapshots.
 
     System categories raise 403 — the transfer pipeline relies on them

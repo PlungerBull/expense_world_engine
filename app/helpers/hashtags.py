@@ -150,7 +150,7 @@ async def delete_hashtag(
       2. Soft-delete every ``expense_transaction_hashtags`` junction row for
          this hashtag, capturing the affected transaction IDs.
       3. Bump ``updated_at`` + ``version`` on each parent transaction so
-         delta sync picks up the hashtag_ids change.
+         readers see the hashtag_ids change.
       4. Soft-delete the hashtag row itself.
       5. Write the activity log with before/after snapshots.
 
@@ -169,13 +169,13 @@ async def delete_hashtag(
 
     # Soft-delete all junction rows for this hashtag, capturing the
     # affected transaction IDs so we can bump their version + updated_at.
-    # Without the parent bump, /sync would miss the hashtag_ids change.
+    # Without the parent bump, the row's version would miss the hashtag_ids change.
     #
     # Activity log — per-row entries for the junction table are
     # deliberately NOT written here (see helpers/transactions._sync_hashtags
-    # for the rationale). Each affected parent transaction's next delta
-    # sync carries the new hashtag_ids list via its version bump, and a
-    # single DELETED entry is written for the hashtag itself below.
+    # for the rationale). Each affected parent transaction carries the new
+    # hashtag_ids list via its version bump, and a single DELETED entry is
+    # written for the hashtag itself below.
     affected = await conn.fetch(
         """
         UPDATE expense_transaction_hashtags
@@ -217,7 +217,7 @@ async def archive_hashtag(
     """Set ``is_archived = true`` on a hashtag and log the change.
 
     Mirrors ``helpers.accounts.archive_account``: direct UPDATE bumps
-    ``version`` and ``updated_at`` so delta sync surfaces the flag flip,
+    ``version`` and ``updated_at`` so the flag flip is visible to clients,
     and the activity log carries before/after snapshots.
 
     Junction rows (``expense_transaction_hashtags``) are intentionally

@@ -7,7 +7,6 @@ Covers the engine work shipped alongside sql/014:
   * `POST /hashtags/{id}/archive` + `/unarchive` (new), including the
     deliberate non-cascade to junction rows.
   * `?include_archived=true` on `GET /categories` and `GET /hashtags`.
-  * `is_archived` field present in `GET /sync` payloads for both resources.
   * `?include_archived=true` on `GET /dashboard` populating the three
     archived panels with lifetime totals; default response leaves them null.
   * Attach guard: archived categories/hashtags are rejected by every
@@ -330,35 +329,6 @@ async def test_hashtag_archive_404_on_missing(client):
         headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
     assert r.status_code == 404, r.text
-
-
-# ---------------------------------------------------------------------------
-# Sync exposes is_archived for categories and hashtags
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_sync_payload_includes_is_archived_field(client, test_data):
-    """Every category and hashtag row in `/sync` carries `is_archived`.
-
-    The schema-level addition flows through `category_from_row` /
-    `hashtag_from_row`, which sync uses verbatim. Pin the field's presence
-    so a future schema rename or accidental field drop is caught.
-    """
-    headers = {"X-Client-Id": str(uuid.uuid4())}
-    r = await client.get("/v1/sync", params={"sync_token": "*"}, headers=headers)
-    assert r.status_code == 200
-    body = r.json()
-
-    assert body["categories"], "sync wildcard should return at least one category"
-    for c in body["categories"]:
-        assert "is_archived" in c, f"category row missing is_archived: {c}"
-        assert isinstance(c["is_archived"], bool)
-
-    assert body["hashtags"], "sync wildcard should return at least one hashtag"
-    for h in body["hashtags"]:
-        assert "is_archived" in h, f"hashtag row missing is_archived: {h}"
-        assert isinstance(h["is_archived"], bool)
 
 
 # ---------------------------------------------------------------------------
