@@ -442,6 +442,7 @@ async def test_reconciliation_detail_embeds_hashtag_ids_per_transaction(
             "id": recon_id,
             "account_id": test_data.account_id,
             "name": f"recon-{uuid.uuid4()}",
+            "beginning_balance_cents": 0,
         },
         headers=_idem(),
     )

@@ -11,6 +11,48 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-06 — reconciliation simplification: chaining and manual ordering deleted, beginning balance required, `difference_cents` added
+
+**Engine change.** `docs/rework/WP6`, `sql/025`. Reconciliation chaining rewrote a
+COMPLETED row's `beginning_balance_cents` whenever an upstream draft was edited —
+the cascade had no status predicate — so the derived-beginning-balance concept was
+deleted at the root, and `sort_order` (whose second job was defining the chain)
+went with it. **Engine-only by owner decision** — the CLI work below is recorded,
+not yet done, so the affected CLI commands and the TUI's default create path break
+until it lands.
+
+**1. `POST /reconciliations` requires `beginning_balance_cents`.** Omitting it —
+previously the way to opt into chained mode — is now a `422`. There is no derived
+mode and no prefill: both balances are typed off the statement. Both request
+schemas are now `extra="forbid"`, so a body still carrying `sort_order` or
+`beginning_balance_source` also `422`s (previously a silent drop — bug 5.3).
+
+**2. Three response fields removed, one added.** `beginning_balance_source`,
+`chained_from_reconciliation_id` and `sort_order` are gone from every
+reconciliation response. Added: `difference_cents` — `(ending − beginning)` minus
+the signed sum of the assigned non-deleted transactions, computed at read time,
+zero when the batch adds up. Native currency, present on list rows and detail.
+
+**3. `PUT /accounts/{id}/reconciliations/order` is gone** (404), and
+`recalculated_count` with it. Account-scoped `GET /reconciliations` now orders by
+`date_start ASC NULLS LAST, created_at ASC` — a reconciliation is a statement
+period, so its date is its position. Undated rows sort last. The cross-account
+list stays `created_at DESC`.
+
+### What the CLI must do (not yet done — engine-only scope)
+
+| Location | Required change |
+|---|---|
+| `expense/tui/screens/reconciliations.py:323-490` | **The default create path is broken:** the new-batch form starts at `source: "chained"` (`:328`), sends `beginning_balance_source` (`:478-480`) and omits the balance when chained — every TUI create now 422s. Make `begin` always-required and drop the source picker (`:311-318`, `:339-348`, `:433-441`). |
+| `expense/tui/screens/reconciliations.py:71-74,265-287` | Delete `_sort_key` (client-side `sort_order` sort — the field no longer arrives) and the `ctrl+↑/↓` reorder actions calling the deleted route; rely on server order. Docstring `:1-22` describes the chain model. |
+| `expense/commands/reconcile_cmd.py:646-770,807-891` | Delete the `move` and `reorder` commands whole — both end at the deleted route. `expense/_editor.py`'s only consumer is `reorder` (per `docs/cli-runtime.md:42`). |
+| `reconcile_cmd.py:40-45,133-138,158-168,187,201,256-259,346-360,368-371,392-394,421-425,434-437,450,614-643` | Drop `--source`/`--sort-order` flags and their mutual-exclusion guards, the `Source` column and `_format_source_marker`, the chained-ambiguity 422 sniffer, `ReconciliationSource`, and `_render_reorder_response`. Make `--beginning-balance` required on `create`. |
+| Anywhere rendering reconciliations | Optionally surface the new `difference_cents` — it is the add-up check the feature exists for. |
+| Tests | `tests/unit/test_cmd_reconcile.py`, `test_tui_reconciliations.py`, `test_tui_reconcile_detail.py`. |
+| Docs | `cli-spec.md:105-114` (sort contract, `move`/`reorder`, `--source`), `roadmap.md:170-186`, `tui-plan.md` chain references. |
+
+---
+
 ## 2026-08-06 — schema slimming: 16 dead columns and the 4 category/hashtag archive routes deleted
 
 **Engine change.** `docs/rework/WP5`, `sql/024`. Everything the 2026-08-04 audit

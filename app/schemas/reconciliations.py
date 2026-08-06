@@ -1,54 +1,37 @@
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict
 
-from app.constants import BeginningBalanceSource
 from app.schemas.transactions import TransactionResponse
 
 
-# Wire labels for beginning_balance_source. The DB column is a smallint
-# (1=manual, 2=chained per BeginningBalanceSource); the API surface uses
-# strings so clients don't pin to internal magic numbers.
-SOURCE_LABEL_BY_INT: dict[int, str] = {
-    BeginningBalanceSource.MANUAL: "manual",
-    BeginningBalanceSource.CHAINED: "chained",
-}
-SOURCE_INT_BY_LABEL: dict[str, int] = {v: k for k, v in SOURCE_LABEL_BY_INT.items()}
-
-
 class ReconciliationCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: UUID
     account_id: str
     name: str
     date_start: Optional[datetime] = None
     date_end: Optional[datetime] = None
-    # Provided => source becomes "manual" and value is stored verbatim.
-    # Omitted => source becomes "chained" and value is derived from the
-    # previous neighbor in sort_order (defaulting to 0 if none).
-    beginning_balance_cents: Optional[int] = None
+    # Required. A beginning balance is a fact the user reads off a statement;
+    # the engine never derives one. The former "chained" mode (omit the value,
+    # inherit the previous reconciliation's ending balance, recompute on every
+    # upstream edit) let a draft edit rewrite a COMPLETED row's balance through
+    # the back door and was deleted (sql/025, docs/rework/WP6).
+    beginning_balance_cents: int
     ending_balance_cents: Optional[int] = None
-    # Insert at this position (existing rows at >= sort_order shift +1).
-    # Omitted => append (max(sort_order)+1 for the account).
-    sort_order: Optional[int] = None
 
 
 class ReconciliationUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: Optional[str] = None
     date_start: Optional[datetime] = None
     date_end: Optional[datetime] = None
     beginning_balance_cents: Optional[int] = None
     ending_balance_cents: Optional[int] = None
-    # Toggle source explicitly. Setting "manual" freezes the current
-    # value. Setting "chained" re-derives from the current previous
-    # neighbor (or leaves the value alone if none exists). Sending
-    # beginning_balance_cents in the same body always wins and forces
-    # source to "manual".
-    beginning_balance_source: Optional[Literal["manual", "chained"]] = None
-    # sort_order is intentionally NOT here. The dedicated reorder endpoint
-    # is the only path that mutates it. The router rejects sort_order in
-    # request bodies via extra="forbid" / explicit guard.
 
 
 class ReconciliationResponse(BaseModel):
@@ -59,7 +42,6 @@ class ReconciliationResponse(BaseModel):
     date_start: Optional[datetime] = None
     date_end: Optional[datetime] = None
     status: int
-    sort_order: int
     # Native only. A reconciliation is scoped to ONE account, and the account
     # governs the currency — so there is nothing here to combine and nothing to
     # convert. The two `*_home_cents` fields that used to sit beside these were
@@ -67,30 +49,25 @@ class ReconciliationResponse(BaseModel):
     # than need; docs/currency-model-decision.md called that out as a known
     # inconsistency and docs/rework/WP2 settled it.
     beginning_balance_cents: int
-    beginning_balance_source: Literal["manual", "chained"]
-    chained_from_reconciliation_id: Optional[str] = None
     ending_balance_cents: int
+    # (ending − beginning) − signed sum of the assigned non-deleted
+    # transactions. Zero means the batch adds up. Computed at read time from
+    # the ledger, never stored — the same rule balances follow (sql/022).
+    difference_cents: int
     created_at: datetime
     updated_at: datetime
     version: int
     deleted_at: Optional[datetime] = None
 
 
-def reconciliation_from_row(
-    row,
-    chained_from_reconciliation_id: Optional[str] = None,
-) -> dict:
+def reconciliation_from_row(row) -> dict:
     """Serialize a reconciliation row.
 
-    ``chained_from_reconciliation_id`` is the UUID of the previous neighbor
-    in sort_order when the row's source is ``chained`` and a neighbor exists.
-    Always ``None`` for ``manual`` rows. Computed by the helper layer
-    (requires a per-row neighbor lookup); pass ``None`` to opt out.
+    ``row`` must carry ``difference_cents`` — every reconciliation SELECT goes
+    through ``helpers.reconciliations.RECONCILIATION_SELECT``, which projects
+    it. A bare ``SELECT *`` raises ``KeyError`` here rather than emitting a
+    response with the figure silently missing.
     """
-    begin = row["beginning_balance_cents"]
-    end = row["ending_balance_cents"]
-    source_int = row["beginning_balance_source"]
-    source_label = SOURCE_LABEL_BY_INT.get(source_int, "manual")
     return ReconciliationResponse(
         id=str(row["id"]),
         user_id=str(row["user_id"]),
@@ -99,11 +76,9 @@ def reconciliation_from_row(
         date_start=row["date_start"],
         date_end=row["date_end"],
         status=row["status"],
-        sort_order=row["sort_order"],
-        beginning_balance_cents=begin,
-        beginning_balance_source=source_label,
-        chained_from_reconciliation_id=chained_from_reconciliation_id,
-        ending_balance_cents=end,
+        beginning_balance_cents=row["beginning_balance_cents"],
+        ending_balance_cents=row["ending_balance_cents"],
+        difference_cents=row["difference_cents"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         version=row["version"],
@@ -128,20 +103,3 @@ class ReconciliationDetailResponse(ReconciliationResponse):
     transactions_limit: int
     transactions_offset: int
     transactions_truncated: bool
-
-
-class ReconciliationReorderRequest(BaseModel):
-    """Body for PUT /accounts/{account_id}/reconciliations/order.
-
-    The array is the desired final order for the rows it lists. Engine
-    reuses the sort_order slots currently held by the submitted rows
-    (sorted ASC) and reassigns them in the new order; rows not in the
-    array are untouched.
-    """
-    ordered_ids: list[UUID] = Field(..., min_length=1)
-
-
-class ReconciliationReorderResponse(BaseModel):
-    """Response shape from the reorder endpoint."""
-    reconciliations: list[ReconciliationResponse]
-    recalculated_count: int

@@ -189,7 +189,7 @@ boundaries, not defects.
 | [WP3](WP3-computed-balances-and-indexes.md) | Delete `current_balance_cents`; compute it; **add the missing indexes** | ✅ **Landed 2026-08-06** (`sql/022`). Unblocks WP4 |
 | [WP4](WP4-delete-sync.md) | Delete `/sync`, `sync_checkpoints`, and the `updated_at` indexes | ✅ **Landed 2026-08-06** (`sql/023`) — see deviation note below |
 | [WP5](WP5-schema-slimming.md) | 15 columns and 4 routes with no readers | ✅ **Landed 2026-08-06** (`sql/024`) — see deviation note below |
-| [WP6](WP6-reconciliation-simplification.md) | Delete the chaining cascade; shrink the largest helper | Independent |
+| [WP6](WP6-reconciliation-simplification.md) | Delete the chaining cascade; shrink the largest helper | ✅ **Landed 2026-08-06** (`sql/025`) — see owner decisions below |
 | [WP7](WP7-documentation.md) | Reconcile spec, schema reference and conventions; delete this directory | Last |
 
 ### Bugs that close as a side effect
@@ -396,3 +396,73 @@ archive routes, `?include_archived` on categories/hashtags, `users.email`, and
 claims `expires_at` is "processed_at + 24 hours" (it never was — it is
 `now() + 24 hours`). The `actor_type` paragraph in the spec was corrected in
 this change because it was load-bearing for audit-query guidance.
+
+---
+
+## WP6 landed, 2026-08-06 — three owner decisions, and the difference figure never existed
+
+`sql/025` drops `beginning_balance_source` and `sort_order`, drops the
+chained-neighbor index, and closes the reconciliation slice of bug 6.3 with
+`CHECK (status IN (1, 2))`. The chaining cascade, its five call sites, the
+neighbor/shift/serialize helpers, `reorder_reconciliations`, and
+`PUT /accounts/{id}/reconciliations/order` are deleted.
+`app/helpers/reconciliations.py` went **1,019 → 509 lines** (1,066 at audit
+time; WP2 had already taken 47). Suite green at **200** (was 210: the 17-test
+`tests/test_reconciliation_ordering.py` deleted whole, 7 new in
+`tests/test_wp6_reconciliation_simplification.py`, whose first test is the
+regression the package exists for — editing one reconciliation leaves another
+byte-identical, in draft *and* completed status). Route count **55**.
+
+**The package's open question and the two it flagged were all put to the owner
+(2026-08-06), in plain terms:**
+
+1. **`sort_order` deleted.** Account-scoped lists order by
+   `date_start ASC NULLS LAST, created_at ASC`; the cross-account list stays
+   `created_at DESC`. Dates went from pure labels to the thing that orders the
+   list. Undated rows sort last — both dates stay nullable and clearable.
+2. **No prefill.** `beginning_balance_cents` is **required on POST** — omitting
+   it is a 422, not an invitation to derive. This deliberately supersedes
+   decision D3's "one-time prefill on POST" sketch (annotated in
+   `open-bugs.md`), and D3's `continuity_gap_cents` was declined with it.
+3. **The add-up check now exists, as `difference_cents`.** WP6 asked whether
+   the difference figure was computed or stored; the answer was **neither — it
+   had never been built**. Nothing anywhere compared the assigned transactions
+   against the balances; you could complete a batch that didn't add up and the
+   engine would not know. It is now `(ending − beginning) − SUM(signed)` over
+   the assigned non-deleted transactions, projected in SQL on every read via
+   `home_currency.signed_expr` (no new sign-matrix rendering), never stored —
+   the same rule as WP3's balances. Completing with a non-zero difference stays
+   allowed: the figure informs, the user decides.
+
+**WP6's "work out" list, answered:** the field lock covers
+`{beginning, ending, date_start, date_end}` (the deleted `source` left the
+set), and with the cascade gone no path rewrites a completed record's
+*balances* — but bug **5.5 survives the package**: its four state-machine gaps
+live in `helpers/transactions.py` (silent unassignment from a completed
+reconciliation, double version bump, missing sibling warning, restore-race
+TypeError), not in the deleted machinery. The one-liner in `open-bugs.md` was
+re-elaborated from the pre-compression remediation plan so the next agent
+doesn't have to dig for it. Revert is asymmetric by design (complete requires
+≥1 assigned transaction, revert requires nothing) and restores only the
+status. Soft-delete unassigns transactions; restore deliberately does not
+re-link them. `resolve_home_rates` was already gone (WP2), tombstone comment
+deleted with the rewrite.
+
+**Also fixed at the root:** bug 5.3 — the `sort_order`-in-PUT guard was dead
+code (the schema silently dropped the key before it ran). Both request schemas
+are now `extra="forbid"` (advancing 6.1), so the deleted fields 422 instead of
+vanishing.
+
+**Date-driven assignment stays flagged, not built,** per the package: dates now
+order the list but still do not select transactions; assignment remains
+explicit by `reconciliation_id`.
+
+**For WP7:** `engine-spec.md` §Ordering (:604-610), §Beginning balance source
+(:612-629), §Cascade rule (:631-635), the GET sort contract (:638), POST
+(:640-650), PUT (:669-680), the reorder route (:682-707), the complete
+cross-reference (:710) and the restore "reclaims its original position" clause
+are all invalidated; none mentions `difference_cents`. `schema-reference.md`
+:523-574 still shows both dropped columns, the dropped index, the cascade
+commentary on both balance columns, and the five-field lock set. CLAUDE.md
+needed no amendment — the collection-ordering convention is conditional on a
+cascading reorder existing, and none does now.

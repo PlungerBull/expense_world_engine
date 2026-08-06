@@ -1,13 +1,31 @@
 """Reconciliation domain logic.
 
 Service-layer functions for expense_reconciliations, called from
-routers/reconciliations.py and routers/accounts.py (reorder endpoint).
-Routers stay thin (HTTP glue + idempotency) and delegate business logic
-here.
+routers/reconciliations.py. Routers stay thin (HTTP glue + idempotency)
+and delegate business logic here.
 
 See ``app/helpers/idempotency.run_idempotent`` for the convention: these
 functions do NOT open their own ``conn.transaction()`` — callers own
 transaction boundaries.
+
+The feature: name a period, record the beginning and ending balance from
+your statement, assign transactions to it, and check that they add up.
+Complete it when they do; revert if you were wrong. Both balances are
+facts the user reads off a statement — the engine never derives either.
+
+Chaining used to live here (docs/rework/WP6, deleted by sql/025): a
+"chained" reconciliation took its beginning balance from the previous
+row's ending balance and a cascade rewrote downstream rows on every
+upstream edit. The cascade had no status predicate, so editing a DRAFT
+silently rewrote a COMPLETED row's beginning_balance_cents — the exact
+mutation the completion field-lock exists to refuse. With it went
+``sort_order`` and the bulk-reorder endpoint: ordering is by period date
+now, and dates went from pure labels to the thing that orders the list.
+
+Whether a reconciliation adds up is ``difference_cents`` — computed at
+read time from the ledger on every response, never stored, exactly like
+account balances (sql/022). Completing with a non-zero difference is
+allowed: the check informs, the user decides.
 """
 
 from datetime import datetime
@@ -16,297 +34,71 @@ from uuid import UUID
 
 import asyncpg
 
-from app.constants import (
-    ActivityAction,
-    BeginningBalanceSource,
-    ReconciliationStatus,
-)
+from app.constants import ActivityAction, ReconciliationStatus
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
+from app.helpers.home_currency import SIGNED_CENTS_EXPR
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.helpers.validation import validate_active_account
 from app.schemas.reconciliations import reconciliation_from_row
 
 
-# ``resolve_home_rates`` was here. It fed ``beginning_balance_home_cents`` and
-# ``ending_balance_home_cents`` on every reconciliation response; both fields are
-# gone (docs/rework/WP2), and so is it.
-#
-# Deleting it was the point, not a side effect. A reconciliation belongs to
-# exactly ONE account, and the account governs the currency — so a reconciliation
-# is single-currency and has nothing to convert. Home values belong on figures
-# that combine currencies, and this was never one. That is the inconsistency
-# docs/currency-model-decision.md flagged as "deliberately left".
-#
-# Two defects closed with it:
-#
-#   * open bug 2.3 — it selected accounts with `WHERE id = ANY($1::uuid[])` and
-#     NO `user_id` predicate. RLS is inert under the owner connection, so query
-#     scoping is the only tenant guard the engine has; a missing `user_id` filter
-#     is a security defect, not a tidiness one.
-#   * an N+1 hidden in a write path — the chained-recalc loop called it with a
-#     single-row list per iteration, so each activity-log snapshot cost a
-#     user_settings fetch plus an account-currency fetch, defeating the batching
-#     the function was built for.
-
-
 # ---------------------------------------------------------------------------
-# Ordering / chaining primitives
+# The one way to SELECT a reconciliation
 # ---------------------------------------------------------------------------
 
+# The sign matrix is NOT rewritten here — SIGNED_CENTS_EXPR is the single
+# rendering in the engine and references only the ``t`` alias, so the
+# correlated sum needs no account join and no rate lateral. The figure is in
+# the account's native currency by construction: every assigned transaction
+# lives on the reconciliation's own account's currency or another single
+# account the user chose — either way each row is summed unconverted, and a
+# reconciliation compares against statement balances in that same currency.
+#
+# Served by idx_expense_transactions_user_reconciliation (sql/022), whose
+# partial predicate matches this WHERE exactly.
+_DIFFERENCE_CENTS_SQL = f"""(
+    (rec.ending_balance_cents - rec.beginning_balance_cents)
+    - COALESCE((
+        SELECT SUM({SIGNED_CENTS_EXPR})::bigint
+        FROM expense_transactions t
+        WHERE t.reconciliation_id = rec.id
+          AND t.user_id = rec.user_id
+          AND t.deleted_at IS NULL
+    ), 0)
+)"""
 
-async def _previous_chained_neighbor(
+# Every read of a reconciliation goes through this projection so
+# ``difference_cents`` is present on every row that reaches
+# ``reconciliation_from_row`` — list, detail, and the before/after snapshots
+# of every mutation. A bare ``SELECT *`` would KeyError at serialization
+# rather than ship a response with the figure missing.
+RECONCILIATION_SELECT = f"""SELECT rec.*,
+       {_DIFFERENCE_CENTS_SQL} AS difference_cents
+FROM expense_reconciliations rec
+"""
+
+
+async def fetch_reconciliation(
     conn: asyncpg.Connection,
     user_id: str,
-    account_id: str,
-    sort_order: int,
-    exclude_id: Optional[str] = None,
+    reconciliation_id: str,
+    *,
+    deleted: bool = False,
 ) -> Optional[asyncpg.Record]:
-    """Return the active reconciliation immediately before ``sort_order``.
+    """Fetch one reconciliation row with its computed ``difference_cents``.
 
-    "Immediately before" = highest ``sort_order`` strictly less than the
-    target on this account, scoped to the user, ignoring soft-deleted
-    rows. Returns ``None`` when no such row exists (e.g. the target is
-    the first in the chain).
-
-    ``exclude_id`` lets callers exclude themselves when re-deriving the
-    neighbor for a row that already lives at ``sort_order`` (otherwise
-    the row would find itself).
+    ``deleted=False`` (the default) resolves only active rows;
+    ``deleted=True`` resolves only soft-deleted rows (the restore path).
+    Returns ``None`` when no row matches.
     """
-    if exclude_id is None:
-        return await conn.fetchrow(
-            """
-            SELECT * FROM expense_reconciliations
-            WHERE user_id = $1 AND account_id = $2
-              AND deleted_at IS NULL
-              AND sort_order < $3
-            ORDER BY sort_order DESC
-            LIMIT 1
-            """,
-            user_id,
-            account_id,
-            sort_order,
-        )
+    predicate = "IS NOT NULL" if deleted else "IS NULL"
     return await conn.fetchrow(
-        """
-        SELECT * FROM expense_reconciliations
-        WHERE user_id = $1 AND account_id = $2
-          AND deleted_at IS NULL
-          AND sort_order < $3
-          AND id <> $4
-        ORDER BY sort_order DESC
-        LIMIT 1
+        f"""{RECONCILIATION_SELECT}
+        WHERE rec.id = $1 AND rec.user_id = $2 AND rec.deleted_at {predicate}
         """,
+        reconciliation_id,
         user_id,
-        account_id,
-        sort_order,
-        exclude_id,
-    )
-
-
-async def _next_sort_order(
-    conn: asyncpg.Connection,
-    user_id: str,
-    account_id: str,
-) -> int:
-    """Return ``max(sort_order) + 1`` for the account, or ``1`` if empty.
-
-    Counts soft-deleted rows so a deleted-then-restored row never collides
-    with a freshly appended row.
-    """
-    row = await conn.fetchval(
-        """
-        SELECT COALESCE(MAX(sort_order), 0) FROM expense_reconciliations
-        WHERE user_id = $1 AND account_id = $2
-        """,
-        user_id,
-        account_id,
-    )
-    return int(row) + 1
-
-
-async def _shift_sort_orders_at_or_above(
-    conn: asyncpg.Connection,
-    user_id: str,
-    account_id: str,
-    threshold: int,
-) -> None:
-    """Make room for an insertion at ``threshold`` by bumping every row
-    at or above that position by ``+1``. Operates on all rows including
-    soft-deleted so the relative order survives a future restore."""
-    await conn.execute(
-        """
-        UPDATE expense_reconciliations
-        SET sort_order = sort_order + 1, updated_at = now(), version = version + 1
-        WHERE user_id = $1 AND account_id = $2 AND sort_order >= $3
-        """,
-        user_id,
-        account_id,
-        threshold,
-    )
-
-
-async def _cascade_chained_recalc(
-    conn: asyncpg.Connection,
-    user_id: str,
-    account_id: str,
-    starting_sort_order: int,
-) -> int:
-    """Walk downstream chained rows recomputing beginning_balance_cents.
-
-    Starts at the smallest active ``sort_order`` strictly greater than
-    ``starting_sort_order``. For each row with
-    ``beginning_balance_source = CHAINED``, recomputes
-    ``beginning_balance_cents`` from the previous active neighbor's
-    ``ending_balance_cents``. Stops early at the first row whose value
-    didn't change — a no-op there means no further downstream change is
-    possible (chained rows only change when their direct upstream changes).
-
-    ``MANUAL`` rows are skipped (their ending_balance_cents still matters
-    for the next downstream chained row, but the manual row itself is
-    never recomputed). The walk does not "stop" at a manual row — it
-    continues past it, since a downstream chained row that points to the
-    manual row's ending balance still needs evaluation.
-
-    Writes one ``UPDATED`` activity log entry per row whose value
-    actually changed (with full before/after snapshots). Returns the
-    number of chained rows actually rewritten.
-    """
-    # Pull the active rows downstream of the starting position once,
-    # in order. The walk is in-memory after this single fetch — each
-    # row's "previous neighbor" ending balance is the prior iteration's
-    # (post-update) ending_balance_cents.
-    rows = await conn.fetch(
-        """
-        SELECT * FROM expense_reconciliations
-        WHERE user_id = $1 AND account_id = $2
-          AND deleted_at IS NULL
-          AND sort_order > $3
-        ORDER BY sort_order ASC
-        """,
-        user_id,
-        account_id,
-        starting_sort_order,
-    )
-    if not rows:
-        return 0
-
-    # Seed "previous neighbor's ending_balance" with the row immediately
-    # before the first downstream row — typically the row that just
-    # changed (its ending_balance is the current one in the DB). When
-    # no seed exists (the first downstream row is the absolute first in
-    # the chain on this account), ``has_upstream`` stays False until the
-    # walk processes its first row; chained rows encountered before any
-    # upstream is established are LEFT ALONE — never silently rewritten
-    # to 0. This matches the engine-spec rule: "When chained is requested
-    # but no previous neighbor exists, the existing value is left alone."
-    seed = await conn.fetchrow(
-        """
-        SELECT ending_balance_cents FROM expense_reconciliations
-        WHERE user_id = $1 AND account_id = $2
-          AND deleted_at IS NULL
-          AND sort_order <= $3
-        ORDER BY sort_order DESC
-        LIMIT 1
-        """,
-        user_id,
-        account_id,
-        starting_sort_order,
-    )
-    has_upstream = seed is not None
-    prev_ending = int(seed["ending_balance_cents"]) if has_upstream else 0
-
-    recalculated = 0
-    for row in rows:
-        if row["beginning_balance_source"] == BeginningBalanceSource.CHAINED and not has_upstream:
-            # Chained row with no upstream — leave its stored value
-            # alone. Its own ending_balance becomes the upstream for
-            # the next row in the walk, so flip has_upstream and move on.
-            has_upstream = True
-            prev_ending = int(row["ending_balance_cents"])
-            continue
-        if row["beginning_balance_source"] == BeginningBalanceSource.CHAINED:
-            new_beginning = prev_ending
-            current_beginning = int(row["beginning_balance_cents"])
-            if new_beginning == current_beginning:
-                # No-op for this row → no downstream chained row can
-                # change either, since the chain only propagates value
-                # diffs. Stop early.
-                return recalculated
-
-            before = reconciliation_from_row(
-                row,
-                chained_from_reconciliation_id=None,
-            )
-
-            updated_row = await conn.fetchrow(
-                """
-                UPDATE expense_reconciliations
-                SET beginning_balance_cents = $3,
-                    updated_at = now(),
-                    version = version + 1
-                WHERE id = $1 AND user_id = $2
-                RETURNING *
-                """,
-                row["id"],
-                user_id,
-                new_beginning,
-            )
-
-            # Look up the actual neighbor id for the after-snapshot.
-            neighbor = await _previous_chained_neighbor(
-                conn, user_id, account_id, updated_row["sort_order"],
-                exclude_id=str(updated_row["id"]),
-            )
-            after = reconciliation_from_row(
-                updated_row,
-                chained_from_reconciliation_id=str(neighbor["id"]) if neighbor else None,
-            )
-            await write_activity_log(
-                conn, user_id, "reconciliation", str(updated_row["id"]),
-                ActivityAction.UPDATED,
-                before_snapshot=before,
-                after_snapshot=after,
-            )
-            recalculated += 1
-            # This row's own ending_balance_cents feeds the next row
-            # downstream (chained or manual; the chain pointer follows
-            # the linear sort_order, not status).
-            prev_ending = int(updated_row["ending_balance_cents"])
-        else:
-            # Manual row: its stored ending_balance_cents feeds the next
-            # downstream row regardless. The walk does not terminate
-            # here. A manual row at the head of the walk also establishes
-            # an upstream for any subsequent chained row.
-            has_upstream = True
-            prev_ending = int(row["ending_balance_cents"])
-
-    return recalculated
-
-
-async def _serialize_with_neighbor(
-    conn: asyncpg.Connection,
-    user_id: str,
-    row: asyncpg.Record,
-) -> dict:
-    """Serialize a reconciliation row, resolving its chained-from neighbor.
-
-    Manual rows always emit ``chained_from_reconciliation_id: null``.
-    Chained rows look up the previous active neighbor by sort_order
-    (could be ``null`` if this row is at position #1 of an empty
-    upstream).
-    """
-    chained_from: Optional[str] = None
-    if row["beginning_balance_source"] == BeginningBalanceSource.CHAINED:
-        neighbor = await _previous_chained_neighbor(
-            conn, user_id, str(row["account_id"]), row["sort_order"],
-            exclude_id=str(row["id"]),
-        )
-        if neighbor is not None:
-            chained_from = str(neighbor["id"])
-    return reconciliation_from_row(
-        row,
-        chained_from_reconciliation_id=chained_from,
     )
 
 
@@ -323,22 +115,14 @@ async def create_reconciliation(
     name: str,
     date_start: Optional[datetime],
     date_end: Optional[datetime],
-    beginning_balance_cents: Optional[int],
+    beginning_balance_cents: int,
     ending_balance_cents: Optional[int],
-    sort_order: Optional[int] = None,
 ) -> dict:
     """Validate inputs, insert a DRAFT reconciliation, and log the creation.
 
-    Source of truth for ``beginning_balance_cents``:
-      * Caller provided a value → source = MANUAL, value stored verbatim.
-      * Caller omitted the value → source = CHAINED, value computed from
-        the previous active neighbor in ``sort_order`` (defaulting to 0
-        when no neighbor exists).
-
-    Sort position:
-      * ``sort_order`` omitted → append (max+1 for the account).
-      * ``sort_order`` provided → insert at that position; existing rows
-        at >= sort_order shift +1.
+    ``beginning_balance_cents`` is required at the schema layer — there is
+    no derived mode and no prefill (owner decision 2026-08-06, superseding
+    open-bugs decision D3's one-time-prefill sketch).
 
     Raises:
         validation_error: account reference is invalid or name is empty.
@@ -354,41 +138,16 @@ async def create_reconciliation(
             {"name": "Must not be empty."},
         )
 
-    # Resolve sort position. Insert-at-position shifts everyone at or
-    # above the target up by 1 to make room.
-    if sort_order is None:
-        target_sort = await _next_sort_order(conn, user_id, account_id)
-    else:
-        if sort_order < 1:
-            raise validation_error(
-                "sort_order must be a positive integer.",
-                {"sort_order": "Must be >= 1."},
-            )
-        await _shift_sort_orders_at_or_above(conn, user_id, account_id, sort_order)
-        target_sort = sort_order
-
-    # Resolve source + beginning balance.
-    if beginning_balance_cents is not None:
-        source = BeginningBalanceSource.MANUAL
-        beginning = beginning_balance_cents
-    else:
-        source = BeginningBalanceSource.CHAINED
-        prev = await _previous_chained_neighbor(
-            conn, user_id, account_id, target_sort,
-        )
-        beginning = int(prev["ending_balance_cents"]) if prev else 0
-
     ending = ending_balance_cents if ending_balance_cents is not None else 0
 
     try:
-        row = await conn.fetchrow(
+        await conn.execute(
             """
             INSERT INTO expense_reconciliations
                 (id, user_id, account_id, name, date_start, date_end, status,
-                 sort_order, beginning_balance_cents, beginning_balance_source,
-                 ending_balance_cents, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9, $10, now(), now())
-            RETURNING *
+                 beginning_balance_cents, ending_balance_cents,
+                 created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, now(), now())
             """,
             reconciliation_id,
             user_id,
@@ -396,9 +155,7 @@ async def create_reconciliation(
             name.strip(),
             date_start,
             date_end,
-            target_sort,
-            beginning,
-            int(source),
+            beginning_balance_cents,
             ending,
         )
     except asyncpg.UniqueViolationError:
@@ -406,19 +163,13 @@ async def create_reconciliation(
             f"A reconciliation with id '{reconciliation_id}' already exists."
         )
 
-    response = await _serialize_with_neighbor(conn, user_id, row)
+    row = await fetch_reconciliation(conn, user_id, str(reconciliation_id))
+    response = reconciliation_from_row(row)
 
     await write_activity_log(
         conn, user_id, "reconciliation", str(row["id"]), ActivityAction.CREATED,
         after_snapshot=response,
     )
-
-    # If we inserted into the middle, the row now sitting downstream may
-    # be CHAINED and its "previous neighbor" just changed — cascade from
-    # the new row's position so any chained downstream row catches up.
-    if sort_order is not None:
-        await _cascade_chained_recalc(conn, user_id, account_id, target_sort)
-
     return response
 
 
@@ -438,7 +189,6 @@ _LOCKED_FIELDS_WHEN_COMPLETED = frozenset(
         "ending_balance_cents",
         "date_start",
         "date_end",
-        "beginning_balance_source",
     }
 )
 
@@ -454,42 +204,21 @@ async def update_reconciliation(
     Returns the unchanged reconciliation if ``fields`` is empty (matches the
     prior router behaviour of treating empty-update as a fetch).
 
-    Source toggle semantics:
-      * ``beginning_balance_cents`` provided → forces source to MANUAL,
-        value stored verbatim. Any explicit ``beginning_balance_source``
-        in the same body is overridden.
-      * ``beginning_balance_source = "chained"`` (without a value) →
-        re-derive from the current previous neighbor. If no neighbor
-        exists, leave the value alone (never silently rewrite to 0).
-      * ``beginning_balance_source = "manual"`` (without a value) →
-        freeze the current value as manual.
-
-    Cascade: when ``ending_balance_cents`` changes, downstream chained
-    rows recalculate per the chain rule (single transaction).
+    An edit here changes this row and nothing else — no other
+    reconciliation's balances move, in any status. That locality is the
+    invariant docs/rework/WP6 exists for, and tests/test_wp6_* pins it.
 
     Raises:
         not_found: no active reconciliation with that id for this user.
-        validation_error: name is provided but empty after stripping, a
-            locked field is edited while status=COMPLETED, or sort_order
-            is included in the body.
+        validation_error: name is provided but empty after stripping, or a
+            locked field is edited while status=COMPLETED.
     """
-    # sort_order is reorder-endpoint-only.
-    if "sort_order" in fields:
-        raise validation_error(
-            "sort_order cannot be edited via PUT /reconciliations/{id}.",
-            {"sort_order": "Use PUT /accounts/{id}/reconciliations/order to reorder."},
-        )
-
     # Empty update — return current state unchanged
     if not fields:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_reconciliations WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            reconciliation_id,
-            user_id,
-        )
+        row = await fetch_reconciliation(conn, user_id, reconciliation_id)
         if row is None:
             raise not_found("reconciliation")
-        return await _serialize_with_neighbor(conn, user_id, row)
+        return reconciliation_from_row(row)
 
     # Validate name if changing
     if "name" in fields:
@@ -500,11 +229,7 @@ async def update_reconciliation(
             )
         fields["name"] = fields["name"].strip()
 
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_reconciliations WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        reconciliation_id,
-        user_id,
-    )
+    before_row = await fetch_reconciliation(conn, user_id, reconciliation_id)
     if before_row is None:
         raise not_found("reconciliation")
 
@@ -519,66 +244,22 @@ async def update_reconciliation(
                 {f: "Locked while reconciliation is completed." for f in attempted},
             )
 
-    # Resolve source toggle BEFORE handing off to dynamic_update. The
-    # column is a smallint internally; the wire is "manual"|"chained".
-    explicit_value = "beginning_balance_cents" in fields
-    source_label = fields.pop("beginning_balance_source", None)
+    before = reconciliation_from_row(before_row)
 
-    # Ambiguity rule: "source=chained" + an explicit beginning_balance is
-    # contradictory — chained mode has no slot for a user-supplied value.
-    # Reject the combo with a field-scoped 422 instead of silently
-    # picking a winner. The CLI/web should surface this as a clear
-    # "remove one of these" prompt.
-    if explicit_value and source_label == "chained":
-        raise validation_error(
-            "Cannot set beginning_balance_cents while source is 'chained'.",
-            {
-                "beginning_balance_cents": "Remove this field, or set beginning_balance_source to 'manual'.",
-                "beginning_balance_source": "Cannot be 'chained' while beginning_balance_cents is set.",
-            },
-        )
-
-    if explicit_value:
-        # Explicit value always wins (source_label is None or "manual"
-        # at this point — the chained+value combo was rejected above).
-        # Source becomes MANUAL.
-        fields["beginning_balance_source"] = int(BeginningBalanceSource.MANUAL)
-    elif source_label is not None:
-        if source_label == "manual":
-            fields["beginning_balance_source"] = int(BeginningBalanceSource.MANUAL)
-        elif source_label == "chained":
-            # Re-derive from current previous neighbor. Skip silently if
-            # none exists — never rewrite a stored balance to 0.
-            neighbor = await _previous_chained_neighbor(
-                conn, user_id, str(before_row["account_id"]),
-                before_row["sort_order"], exclude_id=str(before_row["id"]),
-            )
-            fields["beginning_balance_source"] = int(BeginningBalanceSource.CHAINED)
-            if neighbor is not None:
-                fields["beginning_balance_cents"] = int(neighbor["ending_balance_cents"])
-
-    before = await _serialize_with_neighbor(conn, user_id, before_row)
-
-    after_row = await dynamic_update(
+    updated = await dynamic_update(
         conn, "expense_reconciliations", fields, reconciliation_id, user_id,
     )
-    if after_row is None:
+    if updated is None:
         raise not_found("reconciliation")
 
-    after = await _serialize_with_neighbor(conn, user_id, after_row)
+    after_row = await fetch_reconciliation(conn, user_id, reconciliation_id)
+    after = reconciliation_from_row(after_row)
 
     await write_activity_log(
         conn, user_id, "reconciliation", reconciliation_id, ActivityAction.UPDATED,
         before_snapshot=before,
         after_snapshot=after,
     )
-
-    # Cascade if the ending balance moved.
-    if int(before_row["ending_balance_cents"]) != int(after_row["ending_balance_cents"]):
-        await _cascade_chained_recalc(
-            conn, user_id, str(after_row["account_id"]), after_row["sort_order"],
-        )
-
     return after
 
 
@@ -597,21 +278,21 @@ async def complete_reconciliation(
     Idempotent no-op if already COMPLETED: returns the current row without
     writing a new activity log entry.
 
+    A non-zero ``difference_cents`` does not block completion — the figure
+    informs, the user decides. The activity-log snapshots carry it, so the
+    audit trail records what the difference was at the moment of completion.
+
     Raises:
         not_found: no active reconciliation with that id for this user.
         validation_error: no transactions are assigned to this reconciliation.
     """
-    row = await conn.fetchrow(
-        "SELECT * FROM expense_reconciliations WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        reconciliation_id,
-        user_id,
-    )
+    row = await fetch_reconciliation(conn, user_id, reconciliation_id)
     if row is None:
         raise not_found("reconciliation")
 
     # Already completed — return idempotently (no activity log)
     if row["status"] == ReconciliationStatus.COMPLETED:
-        return await _serialize_with_neighbor(conn, user_id, row)
+        return reconciliation_from_row(row)
 
     # Lock and count assigned transactions in one shot. FOR UPDATE
     # serializes concurrent transaction edits against this status flip —
@@ -633,14 +314,13 @@ async def complete_reconciliation(
             {"transactions": "At least one transaction must be assigned."},
         )
 
-    before = await _serialize_with_neighbor(conn, user_id, row)
+    before = reconciliation_from_row(row)
 
-    after_row = await conn.fetchrow(
+    await conn.execute(
         """
         UPDATE expense_reconciliations
         SET status = 2, updated_at = now(), version = version + 1
         WHERE id = $1 AND user_id = $2
-        RETURNING *
         """,
         reconciliation_id,
         user_id,
@@ -659,7 +339,8 @@ async def complete_reconciliation(
         user_id,
     )
 
-    after = await _serialize_with_neighbor(conn, user_id, after_row)
+    after_row = await fetch_reconciliation(conn, user_id, reconciliation_id)
+    after = reconciliation_from_row(after_row)
 
     await write_activity_log(
         conn, user_id, "reconciliation", reconciliation_id, ActivityAction.UPDATED,
@@ -682,17 +363,13 @@ async def revert_reconciliation(
     Raises:
         not_found: no active reconciliation with that id for this user.
     """
-    row = await conn.fetchrow(
-        "SELECT * FROM expense_reconciliations WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        reconciliation_id,
-        user_id,
-    )
+    row = await fetch_reconciliation(conn, user_id, reconciliation_id)
     if row is None:
         raise not_found("reconciliation")
 
     # Already draft — return idempotently (no activity log)
     if row["status"] == ReconciliationStatus.DRAFT:
-        return await _serialize_with_neighbor(conn, user_id, row)
+        return reconciliation_from_row(row)
 
     # Mirror complete_reconciliation: lock assigned txns before flipping
     # state so concurrent edits serialize behind the revert, and readers
@@ -707,14 +384,13 @@ async def revert_reconciliation(
         user_id,
     )
 
-    before = await _serialize_with_neighbor(conn, user_id, row)
+    before = reconciliation_from_row(row)
 
-    after_row = await conn.fetchrow(
+    await conn.execute(
         """
         UPDATE expense_reconciliations
         SET status = 1, updated_at = now(), version = version + 1
         WHERE id = $1 AND user_id = $2
-        RETURNING *
         """,
         reconciliation_id,
         user_id,
@@ -730,7 +406,8 @@ async def revert_reconciliation(
         user_id,
     )
 
-    after = await _serialize_with_neighbor(conn, user_id, after_row)
+    after_row = await fetch_reconciliation(conn, user_id, reconciliation_id)
+    after = reconciliation_from_row(after_row)
 
     await write_activity_log(
         conn, user_id, "reconciliation", reconciliation_id, ActivityAction.UPDATED,
@@ -752,30 +429,20 @@ async def delete_reconciliation(
 ) -> dict:
     """Soft-delete a reconciliation and cascade-unassign its transactions.
 
-    Cascade: the deleted row's ending balance no longer participates in
-    the chain; downstream chained rows recalculate from whatever new
-    previous neighbor they now resolve to.
-
     Raises:
         not_found: no active reconciliation with that id for this user.
         conflict: reconciliation is COMPLETED (must be reverted first).
     """
-    row = await conn.fetchrow(
-        "SELECT * FROM expense_reconciliations WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        reconciliation_id,
-        user_id,
-    )
+    row = await fetch_reconciliation(conn, user_id, reconciliation_id)
     if row is None:
         raise not_found("reconciliation")
 
     if row["status"] == ReconciliationStatus.COMPLETED:
         raise conflict("Cannot delete a completed reconciliation. Revert to draft first.")
 
-    before = await _serialize_with_neighbor(conn, user_id, row)
+    before = reconciliation_from_row(row)
 
-    after_row = await soft_delete(conn, "expense_reconciliations", reconciliation_id, user_id)
-
-    after = await _serialize_with_neighbor(conn, user_id, after_row)
+    await soft_delete(conn, "expense_reconciliations", reconciliation_id, user_id)
 
     # Unassign all transactions from this batch
     await conn.execute(
@@ -788,18 +455,18 @@ async def delete_reconciliation(
         user_id,
     )
 
+    # After-snapshot is taken AFTER the unassignment so its
+    # difference_cents reflects the emptied batch (ending − beginning),
+    # not a membership that no longer exists.
+    after_row = await fetch_reconciliation(
+        conn, user_id, reconciliation_id, deleted=True,
+    )
+    after = reconciliation_from_row(after_row)
+
     await write_activity_log(
         conn, user_id, "reconciliation", reconciliation_id, ActivityAction.DELETED,
         before_snapshot=before,
         after_snapshot=after,
-    )
-
-    # Downstream chained rows now resolve to a different upstream than
-    # the one their stored beginning_balance reflects. Cascade from the
-    # deleted row's sort_order minus 1 so the row at the deleted position
-    # itself is re-evaluated.
-    await _cascade_chained_recalc(
-        conn, user_id, str(row["account_id"]), int(row["sort_order"]) - 1,
     )
     return after
 
@@ -818,202 +485,25 @@ async def restore_reconciliation(
     reconciliations or edited in ways that break the original balance
     assumptions.
 
-    Cascade: the restored row re-enters the chain at its original
-    ``sort_order``; downstream chained rows recalculate from the new
-    upstream landscape.
-
     Raises:
         not_found: no soft-deleted reconciliation with that id for this user.
     """
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_reconciliations WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL",
-        reconciliation_id,
-        user_id,
+    before_row = await fetch_reconciliation(
+        conn, user_id, reconciliation_id, deleted=True,
     )
     if before_row is None:
         raise not_found("reconciliation")
 
-    before = await _serialize_with_neighbor(conn, user_id, before_row)
+    before = reconciliation_from_row(before_row)
 
-    after_row = await restore(conn, "expense_reconciliations", reconciliation_id, user_id)
-    after = await _serialize_with_neighbor(conn, user_id, after_row)
+    await restore(conn, "expense_reconciliations", reconciliation_id, user_id)
+
+    after_row = await fetch_reconciliation(conn, user_id, reconciliation_id)
+    after = reconciliation_from_row(after_row)
 
     await write_activity_log(
         conn, user_id, "reconciliation", reconciliation_id, ActivityAction.RESTORED,
         before_snapshot=before,
         after_snapshot=after,
     )
-
-    # Cascade from one slot above the restored row's position so the
-    # restored row itself is re-evaluated (if it's chained, its beginning
-    # balance now needs to match the current upstream's ending balance).
-    await _cascade_chained_recalc(
-        conn, user_id, str(after_row["account_id"]), int(after_row["sort_order"]) - 1,
-    )
     return after
-
-
-# ---------------------------------------------------------------------------
-# Bulk reorder
-# ---------------------------------------------------------------------------
-
-
-async def reorder_reconciliations(
-    conn: asyncpg.Connection,
-    user_id: str,
-    account_id: str,
-    ordered_ids: list,
-) -> dict:
-    """Bulk-reorder a subset of an account's reconciliations atomically.
-
-    The ``ordered_ids`` array is the desired final order for the rows it
-    lists. The engine reuses the ``sort_order`` slots currently held by
-    the submitted rows (sorted ASC) and reassigns them in the new order;
-    rows not in the array are untouched. Then runs the chained-balance
-    cascade starting at the smallest affected sort_order.
-
-    Raises:
-        validation_error: account_id is invalid OR any id in ordered_ids
-            doesn't belong to (user_id, account_id), is soft-deleted, or
-            appears more than once.
-    """
-    # Validate account_id (raises 422 on invalid).
-    await validate_active_account(conn, account_id, user_id)
-
-    # Detect duplicates with an exact UUID match.
-    seen: set[str] = set()
-    str_ids: list[str] = []
-    for raw in ordered_ids:
-        sid = str(raw)
-        if sid in seen:
-            raise validation_error(
-                "Reorder list contains duplicate ids.",
-                {"ordered_ids": f"Duplicate id {sid} in ordered_ids."},
-            )
-        seen.add(sid)
-        str_ids.append(sid)
-
-    # Pull every submitted row in one query. Includes soft-deleted so we
-    # can return a precise error rather than a generic "not found".
-    rows = await conn.fetch(
-        """
-        SELECT * FROM expense_reconciliations
-        WHERE user_id = $1 AND id = ANY($2::uuid[])
-        """,
-        user_id,
-        str_ids,
-    )
-    by_id = {str(r["id"]): r for r in rows}
-
-    # Validate ownership, account scope, and not-deleted.
-    for sid in str_ids:
-        r = by_id.get(sid)
-        if r is None or str(r["account_id"]) != str(account_id):
-            raise validation_error(
-                "Reorder list contains an id that does not belong to this account.",
-                {"ordered_ids": f"Reconciliation {sid} does not belong to this account."},
-            )
-        if r["deleted_at"] is not None:
-            raise validation_error(
-                "Reorder list contains a soft-deleted reconciliation.",
-                {"ordered_ids": f"Reconciliation {sid} is soft-deleted and cannot be reordered."},
-            )
-
-    # The slots we reuse are the rows' current sort_order values, sorted ASC.
-    current_slots = sorted(int(by_id[sid]["sort_order"]) for sid in str_ids)
-    smallest_slot = current_slots[0]
-
-    # Build before-snapshots for the rows whose position will actually change
-    # (and capture the rows that don't change so we can return them too).
-    before_by_id: dict[str, dict] = {}
-    for sid in str_ids:
-        before_by_id[sid] = await _serialize_with_neighbor(conn, user_id, by_id[sid])
-
-    # Apply the new ordering. Two-phase to avoid unique-conflict-style
-    # collisions if we ever add a uniqueness constraint: temporarily push
-    # the affected rows to negative sort_order values, then write the
-    # final values. This is overkill today (no uniqueness constraint) but
-    # cheap and future-proofs the migration story.
-    for offset, sid in enumerate(str_ids):
-        await conn.execute(
-            """
-            UPDATE expense_reconciliations
-            SET sort_order = $3, updated_at = now(), version = version + 1
-            WHERE id = $1 AND user_id = $2
-            """,
-            sid,
-            user_id,
-            -(offset + 1),  # negative tmp slot, distinct per row
-        )
-    for offset, sid in enumerate(str_ids):
-        new_slot = current_slots[offset]
-        await conn.execute(
-            """
-            UPDATE expense_reconciliations
-            SET sort_order = $3, updated_at = now(), version = version + 1
-            WHERE id = $1 AND user_id = $2
-            """,
-            sid,
-            user_id,
-            new_slot,
-        )
-
-    # Re-fetch the affected rows in their new order and write a per-row
-    # UPDATED activity log entry for each one whose sort_order actually
-    # changed (no spam for "moved to the same slot it already had").
-    after_rows = await conn.fetch(
-        """
-        SELECT * FROM expense_reconciliations
-        WHERE user_id = $1 AND id = ANY($2::uuid[])
-        ORDER BY sort_order ASC
-        """,
-        user_id,
-        str_ids,
-    )
-
-    for after_row in after_rows:
-        sid = str(after_row["id"])
-        before_snap = before_by_id[sid]
-        if before_snap["sort_order"] == after_row["sort_order"]:
-            continue
-        after_snap = await _serialize_with_neighbor(conn, user_id, after_row)
-        await write_activity_log(
-            conn, user_id, "reconciliation", sid, ActivityAction.UPDATED,
-            before_snapshot=before_snap,
-            after_snapshot=after_snap,
-        )
-
-    # Cascade chained balances starting just above the smallest affected
-    # slot — i.e. the row at `smallest_slot` itself is re-evaluated.
-    recalculated = await _cascade_chained_recalc(
-        conn, user_id, account_id, smallest_slot - 1,
-    )
-
-    # One bulk activity entry on the account so the audit trail records
-    # the user's intent at request granularity, not just the per-row
-    # diffs above.
-    await write_activity_log(
-        conn, user_id, "account", str(account_id), ActivityAction.UPDATED,
-        after_snapshot={"reconciliations_reordered": str_ids},
-    )
-
-    # Final response: every affected row in its new order, plus the
-    # recalculated_count from the cascade walk.
-    final_rows = await conn.fetch(
-        """
-        SELECT * FROM expense_reconciliations
-        WHERE user_id = $1 AND id = ANY($2::uuid[])
-        ORDER BY sort_order ASC
-        """,
-        user_id,
-        str_ids,
-    )
-    serialized = [
-        await _serialize_with_neighbor(conn, user_id, r) for r in final_rows
-    ]
-    return {
-        "reconciliations": serialized,
-        "recalculated_count": recalculated,
-    }
-
-

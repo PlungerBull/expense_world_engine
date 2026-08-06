@@ -27,10 +27,10 @@ Add a purge job — the table grows unbounded today.
 
 ## 🟠 High
 
-- **6.1 `extra="forbid"` sweep** — request schemas silently drop unknown fields. Fail closed: unknown input must `422`. *Partially shipped:* the four schemas that lost `exchange_rate` in `sql/021` carry it (`TransactionCreateRequest`, `TransactionUpdateRequest`, `InboxCreateRequest`, `InboxUpdateRequest`), as does `OpeningBalanceRequest`; WP5 added the three auth schemas (`BootstrapRequest`, `SettingsUpdateRequest`, `ProfileUpdateRequest`). Every other request schema is still open.
+- **6.1 `extra="forbid"` sweep** — request schemas silently drop unknown fields. Fail closed: unknown input must `422`. *Partially shipped:* the four schemas that lost `exchange_rate` in `sql/021` carry it (`TransactionCreateRequest`, `TransactionUpdateRequest`, `InboxCreateRequest`, `InboxUpdateRequest`), as does `OpeningBalanceRequest`; WP5 added the three auth schemas (`BootstrapRequest`, `SettingsUpdateRequest`, `ProfileUpdateRequest`); WP6 added the two reconciliation schemas (`ReconciliationCreateRequest`, `ReconciliationUpdateRequest`). Every other request schema is still open.
 - **6.5 The transfer-leg edit guard is a deny-list, and it forgets `category_id`** — `helpers/transactions.update_transaction` blocks `{amount_cents, account_id, date}` on a row with a `transfer_transaction_id`, so a `PUT` can still move ONE leg out of `@Transfer`, stranding the other with nothing to cancel against — indistinguishable from a loan to a person, which is the other thing a non-zero `@Transfer` means. `CLAUDE.md`'s "fix at the root" corollary already describes this guard as having been inverted to an allow-list; it has not been. Invert it: enumerate what a transfer leg may change.
 - **6.2 UUID path/query params typed `str`** — malformed input reaches SQL and 500s instead of `422`.
-- **6.3 CHECK constraints for closed enums** — *partially shipped:* `sql/019` covers `expense_transaction_inbox`, `sql/020` covers `expense_transactions` (`transaction_type IN (1,2)` plus `amount_cents > 0`). Still open for `transaction_source`, reconciliation `status`, `exchange_rates.rate > 0` (`actor_type` and the `user_settings` enums left the list with their columns, `sql/024`). ⚠️ Write these as `col IS NOT NULL AND col IN (…)` on any nullable column — a `CHECK` passes on `NULL`, so the bare `IN` admits exactly the row it was added to forbid (found while writing `sql/020`).
+- **6.3 CHECK constraints for closed enums** — *partially shipped:* `sql/019` covers `expense_transaction_inbox`, `sql/020` covers `expense_transactions` (`transaction_type IN (1,2)` plus `amount_cents > 0`), `sql/025` covers reconciliation `status` (WP6). Still open for `transaction_source` and `exchange_rates.rate > 0` (`actor_type` and the `user_settings` enums left the list with their columns, `sql/024`). ⚠️ Write these as `col IS NOT NULL AND col IN (…)` on any nullable column — a `CHECK` passes on `NULL`, so the bare `IN` admits exactly the row it was added to forbid (found while writing `sql/020`).
 - **7.4 Reserved system-category names can permanently 500 transfers** — nothing stops a user claiming `@Debt`/`@Transfer`/`@Opening`; `ensure_system_category`'s `ON CONFLICT (user_id, system_key)` arbiter does not cover the `(user_id, LOWER(name))` index, so the `UniqueViolationError` escapes uncaught. Reject reserved names at the boundary *and* wrap the seeding INSERT.
 
 ---
@@ -39,8 +39,11 @@ Add a purge job — the table grows unbounded today.
 
 - **1.7** Rate hygiene — provider-rate validation, negative-lookup cache TTL, archived-account currencies missing from the fetch target list, `Decimal`/`ROUND_HALF_UP` instead of float. ⚠️ **Higher stakes since `sql/021`:** `exchange_rates` is now the only source of every home-currency figure, so a bad provider row misprices reports rather than one write. The float/rounding half is why `tests/test_home_currency_parity.py` compares rates and not cents — SQL keeps full `numeric` and rounds half-away-from-zero, while `_fetch_rate_from_db` truncates to binary float and Python rounds half-to-even.
 - **2.4** PAT plaintext sits 24 h in `idempotency_keys.response_snapshot`, cancelling "only the hash is stored". Exempt `POST /auth/pat` from snapshot storage; return `409` on replay.
-- **5.3** `sort_order` in a `PUT` body: dead guard, silent `200`.
-- **5.5** Reconciliation state-machine gaps.
+- **5.5** Reconciliation state-machine gaps — all four live in `helpers/transactions.py` interactions, so they survived WP6's deletion of the chaining machinery. (Re-elaborated 2026-08-06 from the pre-compression remediation plan; the one-liner had lost the content.)
+  - Unassigning a transaction from a COMPLETED reconciliation via `PUT /transactions/{id}` (`reconciliation_id: null`) is silent and unguarded — assignment *to* a completed one is refused, and DELETE at least warns. Sharper since WP6: unassignment now visibly changes a completed reconciliation's `difference_cents`. Emit the same warning, or block symmetrically with assignment.
+  - `PUT` changing `reconciliation_id` alongside other fields bumps the transaction's `version` twice, breaking read-modify-write conflict detection. Single bump.
+  - Deleting one transfer leg omits the sibling's stale-reconciliation warning; restore gets it right. Mirror it.
+  - `restore()` returning `None` (delete/restore race) flows into `reconciliation_from_row(None)` → TypeError (`helpers/reconciliations.py`, restore path; same pattern in categories/hashtags). Guard.
 - **7.1** `POST`/`PUT /inbox` do no referential or ownership validation — a bad FK 500s, and another user's `account_id` is stored and only rejected at promote. Use the existing `validate_active_account` / `validate_active_category`.
 - **8.2** CREATE snapshots record `hashtag_ids: []` on the batch and transfer paths.
 - **10.1** 57 of 61 routes declare no `response_model`, so `openapi.json` documents no response shapes.
@@ -62,7 +65,7 @@ missing `transaction_source = 1`.
 | # | Decision |
 |---|---|
 | **D2** | Strict IDs-only, no carve-out for aggregates. A second class of endpoint is how a standing rule rots. |
-| **D3** | Retire reconciliation chaining entirely — explicit values, one-time prefill on POST, read-time `continuity_gap_cents`. Deletes findings 5.1/5.2/5.4. Tracked in `TODO.md`. |
+| **D3** | Retire reconciliation chaining entirely — explicit values, one-time prefill on POST, read-time `continuity_gap_cents`. Deletes findings 5.1/5.2/5.4. **Executed by WP6 (`sql/025`, 2026-08-06) with two amendments by owner decision:** no prefill — `beginning_balance_cents` is required on POST and always typed — and no `continuity_gap_cents`; the read-time figure that shipped is `difference_cents`, the add-up check against the assigned transactions. |
 | **D4** | Balance writes get a documented activity-log exception; reconciliation side-effects get real entries. Derived balances were measured (19.3 ms for 8 accounts at 200k rows) and declined — a large refactor against a bug that does not exist. |
 | **D5** | Add `PROMOTED` action code (5) — promotion is a distinct user action, not an inbox edit. |
 | **D6** | Exempt `POST /auth/pat` from idempotency snapshot storage. |
@@ -85,6 +88,9 @@ a `user_id` filter · **`3.1` delta sync dropping committed writes — `/sync` d
 `sql/023` (docs/rework/WP4)**, along with the ⚪ `X-Client-Id` case-normalisation nit,
 both by deletion · **`6.4` settings validation — `sql/024` (docs/rework/WP5)**:
 `display_timezone` validated on both write paths, the six echo-only preference
-fields deleted, auth schemas `extra="forbid"`.
+fields deleted, auth schemas `extra="forbid"` · **`5.3` dead `sort_order` guard —
+`sql/025` (docs/rework/WP6)**: the column, the guard and the reorder endpoint are
+all gone, and the reconciliation request schemas are `extra="forbid"`, so the
+field now 422s at the root.
 
 Details are in git history — `git log -- docs/open-bugs.md`.

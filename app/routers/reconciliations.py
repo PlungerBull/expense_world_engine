@@ -36,33 +36,37 @@ async def list_reconciliations(
     offset: int = Query(0, ge=0),
 ):
     async with db.pool.acquire() as conn:
-        conditions = ["user_id = $1"]
+        conditions = ["rec.user_id = $1"]
         params: list = [auth_user.id]
 
         if not include_deleted:
-            conditions.append("deleted_at IS NULL")
+            conditions.append("rec.deleted_at IS NULL")
         if account_id is not None:
             params.append(account_id)
-            conditions.append(f"account_id = ${len(params)}")
+            conditions.append(f"rec.account_id = ${len(params)}")
 
         where = " AND ".join(conditions)
 
         total = await conn.fetchval(
-            f"SELECT count(*) FROM expense_reconciliations WHERE {where}", *params
+            f"SELECT count(*) FROM expense_reconciliations rec WHERE {where}",
+            *params,
         )
 
-        # Per-account lists are ordered by user-controlled sort_order (ASC).
-        # Cross-account lists fall back to created_at DESC since sort_order
-        # values across accounts are independent sequences.
+        # Per-account lists are chronological: a reconciliation is a
+        # statement period, so its start date is its natural position.
+        # Rows with no date (both dates are nullable, and the PUT allows
+        # clearing them) sort last, newest-created first among themselves.
+        # Cross-account lists fall back to created_at DESC — period dates
+        # across accounts are unrelated statements.
         order_clause = (
-            "ORDER BY sort_order ASC, created_at ASC"
+            "ORDER BY rec.date_start ASC NULLS LAST, rec.created_at ASC"
             if account_id is not None
-            else "ORDER BY created_at DESC"
+            else "ORDER BY rec.created_at DESC"
         )
 
         rows = await conn.fetch(
             f"""
-            SELECT * FROM expense_reconciliations
+            {reconciliations_service.RECONCILIATION_SELECT}
             WHERE {where}
             {order_clause}
             LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
@@ -72,28 +76,7 @@ async def list_reconciliations(
             offset,
         )
 
-        rows_list = list(rows)
-        # Resolve chained-from neighbor per row for chained sources.
-        # Manual rows always emit null. Walking sort_order on the same
-        # rows we already fetched would require building a neighbor map
-        # in Python; per-row neighbor lookups are cheap (indexed) and
-        # keep the response shape consistent with detail/create.
-        data = []
-        for row in rows_list:
-            chained_from = None
-            if row["beginning_balance_source"] == 2:  # CHAINED
-                neighbor = await reconciliations_service._previous_chained_neighbor(
-                    conn, auth_user.id, str(row["account_id"]),
-                    row["sort_order"], exclude_id=str(row["id"]),
-                )
-                if neighbor is not None:
-                    chained_from = str(neighbor["id"])
-            data.append(
-                reconciliation_from_row(
-                    row,
-                    chained_from_reconciliation_id=chained_from,
-                )
-            )
+        data = [reconciliation_from_row(row) for row in rows]
         return paginated_response(data, total, limit, offset)
 
 
@@ -120,7 +103,6 @@ async def create_reconciliation(
             body.date_end,
             body.beginning_balance_cents,
             body.ending_balance_cents,
-            body.sort_order,
         ),
     )
 
@@ -137,10 +119,8 @@ async def get_reconciliation(
     offset: int = Query(0, ge=0),
 ):
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_reconciliations WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            reconciliation_id,
-            auth_user.id,
+        row = await reconciliations_service.fetch_reconciliation(
+            conn, auth_user.id, reconciliation_id,
         )
         if row is None:
             raise not_found("reconciliation")
@@ -167,11 +147,7 @@ async def get_reconciliation(
             offset,
         )
 
-        # Resolve chained_from neighbor for the chained-source case so
-        # the detail response matches the create/list shape.
-        recon = await reconciliations_service._serialize_with_neighbor(
-            conn, auth_user.id, row,
-        )
+        recon = reconciliation_from_row(row)
         txns = [transaction_from_row(r) for r in txn_rows]
         await attach_hashtag_ids(conn, txns)
         if debit_as_negative:
