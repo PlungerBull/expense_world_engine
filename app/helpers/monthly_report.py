@@ -197,6 +197,7 @@ async def compute_month_flow(
                         SELECT array_agg(th.hashtag_id::text ORDER BY th.hashtag_id::text)
                         FROM expense_transaction_hashtags th
                         WHERE th.transaction_id = t.id
+                          AND th.transaction_source = 1
                           AND th.deleted_at IS NULL
                     ),
                     ARRAY[]::text[]

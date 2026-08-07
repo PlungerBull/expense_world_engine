@@ -11,6 +11,27 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-07 — `/health` failure is `503`, not `500`; `?search=` matches `%`/`_`/`\` literally
+
+**Engine change.** Two small behavior fixes (the four ⚪ Low bugs, open-bugs.md).
+
+1. **`GET /health` with the database unreachable now returns `503`** in the
+   standard error shape (`code: "SERVICE_UNAVAILABLE"`), previously an
+   uncontrolled `500`. A client testing `status == 200` is unaffected; one
+   branching specifically on `500` to mean "engine down" must accept `503`.
+2. **`?search=` on `GET /v1/transactions` now treats `%`, `_` and `\` in the
+   term as literal characters.** Previously they acted as SQL `ILIKE`
+   wildcards, so e.g. `search=50%` matched any title containing `50`. It was
+   always documented as a plain substring search; results simply get narrower
+   (and correct). No request or response shape changes.
+
+### Engine references
+
+- `app/routers/health.py`, `app/routers/transactions.py` (`_escape_like`)
+- `docs/engine-spec.md` §`GET /health`, §`GET /transactions`
+
+---
+
 ## 2026-08-07 — error/shape fixes: FX lookup `422` for bad currency, report error fields pruned, transfer sibling carries `inbox_id`, OpenAPI shapes are real (bugs 10.1/10.2)
 
 **Engine change.** Four behavioral pieces; the additive ones (`system_key` on

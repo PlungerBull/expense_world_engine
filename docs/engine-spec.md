@@ -78,9 +78,11 @@ Each phase is verified via Swagger UI before any CLI or iOS code is written.
 ## Health Check
 
 ### `GET /health`
-Infrastructure endpoint. Returns `200` if the engine is running. No authentication required. Not versioned under `/v1`.
+Infrastructure endpoint. No authentication required. Not versioned under `/v1`.
 
-**Response:** `{"status": "ok"}`
+Probes the database (`SELECT 1`) — this is a readiness check, not a liveness ping.
+
+**Response:** `200` with `{"status": "ok"}` when the engine and its database are both reachable. `503` in the standard error shape (`code: "SERVICE_UNAVAILABLE"`) when the engine is up but the database is not — never an uncontrolled `500`.
 
 ---
 
@@ -442,7 +444,7 @@ Returns all active ledger transactions. Supports filtering:
 - `?reconciliation_id=` — filter to transactions assigned to one reconciliation batch. This is the standalone escape hatch referenced under `GET /reconciliations/{id}`, and unlike that endpoint's embedded window it supports the full filter surface below.
 - `?date_from=` / `?date_to=` — date range (ISO 8601)
 - `?cleared=true/false`
-- `?search=` — full-text search across `title` and `description`
+- `?search=` — case-insensitive substring match across `title` and `description`; `%`, `_` and `\` in the term are matched literally, not as wildcards
 
 Standard `?include_deleted=true`, `?debit_as_negative=true`, and `?limit` / `?offset` also apply (see Base Conventions).
 

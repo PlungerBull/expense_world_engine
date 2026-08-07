@@ -33,6 +33,11 @@ from app.schemas.transactions import (
 router = APIRouter(prefix="/transactions", tags=["transactions"], responses=ERROR_RESPONSES)
 
 
+def _escape_like(term: str) -> str:
+    """Make a user-supplied search term literal inside a LIKE/ILIKE pattern."""
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 # ---------------------------------------------------------------------------
 # GET /transactions/{transaction_id}
 # ---------------------------------------------------------------------------
@@ -116,10 +121,11 @@ async def list_transactions(
             conditions.append(f"t.cleared = ${len(params)}")
 
         if search:
-            pattern = f"%{search}%"
+            pattern = f"%{_escape_like(search)}%"
             params.append(pattern)
             conditions.append(
-                f"(t.title ILIKE ${len(params)} OR t.description ILIKE ${len(params)})"
+                f"(t.title ILIKE ${len(params)} ESCAPE '\\' "
+                f"OR t.description ILIKE ${len(params)} ESCAPE '\\')"
             )
 
         where = " AND ".join(conditions)

@@ -38,15 +38,6 @@ Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high
 - **6.7** `POST`/`PUT /transactions` accept a system `category_id` — `validate_active_category` checks `deleted_at` only, not `is_system`, so a user can manually file an ordinary expense under `@Transfer`/`@Debt`/`@Opening`, breaking what a non-zero `@Transfer` month means (holes 1–2 in `docs/currency-model-decision.md`; hole 3 closed with 6.5). ⚠️ The fix belongs at the **public boundary**, not inside `validate_active_category`: the internal paths must keep working — `create_transfer_pair` assigns `@Transfer`/`@Debt` itself, and `create_opening_balance` delegates to `create_transaction` with `@Opening`, which calls that same helper. Same boundary-vs-internal shape as 7.4's reserved-name check (closed 2026-08-07).
 ---
 
-## ⚪ Low
-
-`/health` 500s when the DB is down (it is a readiness check — document or reshape) ·
-asyncpg pool has no `command_timeout` · `?search=` is unescaped `ILIKE` (escape
-`%`/`_`, and fix the "full-text" claim) · `compute_month_flow` hashtag aggregation
-missing `transaction_source = 1`.
-
----
-
 ## Decisions taken — kept because they record *why*, not *what*
 
 | # | Decision |

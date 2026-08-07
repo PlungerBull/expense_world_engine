@@ -19,6 +19,9 @@ async def connect() -> None:
         # makes us pgBouncer-safe; cost is negligible since round-trip latency
         # dominates parse cost for our query sizes.
         statement_cache_size=0,
+        # A statement that outlives this is a hung request, not a slow one —
+        # nothing the engine serves takes seconds, let alone thirty.
+        command_timeout=settings.db_command_timeout,
     )
 
 

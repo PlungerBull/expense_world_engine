@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # .env.example and deploy/cloud/README.md.
     db_pool_min_size: int = 5
     db_pool_max_size: int = 20
+    # Upper bound (seconds) on any single statement issued through the pool.
+    # Bounds request-serving queries only — the jobs in app/jobs/ build their
+    # own pools without it, since a backfill may legitimately run long.
+    db_command_timeout: float = 30.0
 
     model_config = {"env_file": ".env"}
 
