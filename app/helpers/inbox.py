@@ -444,11 +444,12 @@ async def promote_inbox_item(
     inbox_row = await conn.fetchrow(
         """
         SELECT * FROM expense_transaction_inbox
-        WHERE id = $1 AND user_id = $2 AND status = 1 AND deleted_at IS NULL
+        WHERE id = $1 AND user_id = $2 AND status = $3 AND deleted_at IS NULL
         FOR UPDATE
         """,
         inbox_id,
         user_id,
+        InboxStatus.PENDING,
     )
     if inbox_row is None:
         raise not_found("inbox item")
@@ -485,7 +486,7 @@ async def promote_inbox_item(
     else:
         account = await conn.fetchrow(
             """
-            SELECT id, currency_code FROM expense_bank_accounts
+            SELECT id FROM expense_bank_accounts
             WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
             """,
             inbox_row["account_id"],
@@ -630,17 +631,18 @@ async def promote_inbox_item(
             after_snapshot=txn_response,
         )
 
-    # 5. Shared cleanup: soft-delete inbox row with status = 2 (PROMOTED)
-    # This is NOT a plain soft_delete() because it also sets status = 2.
+    # 5. Shared cleanup: soft-delete inbox row with status = PROMOTED
+    # This is NOT a plain soft_delete() because it also flips the status.
     inbox_after_row = await conn.fetchrow(
         """
         UPDATE expense_transaction_inbox
-        SET status = 2, deleted_at = now(), updated_at = now(), version = version + 1
+        SET status = $3, deleted_at = now(), updated_at = now(), version = version + 1
         WHERE id = $1 AND user_id = $2
         RETURNING *
         """,
         inbox_id,
         user_id,
+        InboxStatus.PROMOTED,
     )
     inbox_after = inbox_from_row(inbox_after_row)
 

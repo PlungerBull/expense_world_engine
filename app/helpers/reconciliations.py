@@ -147,7 +147,7 @@ async def create_reconciliation(
                 (id, user_id, account_id, name, date_start, date_end, status,
                  beginning_balance_cents, ending_balance_cents,
                  created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $9, $7, $8, now(), now())
             """,
             reconciliation_id,
             user_id,
@@ -157,6 +157,7 @@ async def create_reconciliation(
             date_end,
             beginning_balance_cents,
             ending,
+            ReconciliationStatus.DRAFT,
         )
     except asyncpg.UniqueViolationError:
         raise conflict(
@@ -319,11 +320,12 @@ async def complete_reconciliation(
     await conn.execute(
         """
         UPDATE expense_reconciliations
-        SET status = 2, updated_at = now(), version = version + 1
+        SET status = $3, updated_at = now(), version = version + 1
         WHERE id = $1 AND user_id = $2
         """,
         reconciliation_id,
         user_id,
+        ReconciliationStatus.COMPLETED,
     )
 
     # Bump version on every assigned transaction so clients and auditors
@@ -389,11 +391,12 @@ async def revert_reconciliation(
     await conn.execute(
         """
         UPDATE expense_reconciliations
-        SET status = 1, updated_at = now(), version = version + 1
+        SET status = $3, updated_at = now(), version = version + 1
         WHERE id = $1 AND user_id = $2
         """,
         reconciliation_id,
         user_id,
+        ReconciliationStatus.DRAFT,
     )
 
     await conn.execute(

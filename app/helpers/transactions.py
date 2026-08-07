@@ -82,7 +82,7 @@ ALLOWED_ON_TRANSFER_LEG = {"title", "description", "cleared"}
 # hashtag_ids attach helpers (shared by every transaction-returning endpoint)
 # ---------------------------------------------------------------------------
 
-async def fetch_hashtag_ids_map(
+async def _fetch_hashtag_ids_map(
     conn: asyncpg.Connection,
     transaction_ids: list[str],
 ) -> dict[str, list[str]]:
@@ -108,9 +108,9 @@ async def fetch_hashtag_ids_map(
         """,
         transaction_ids,
     )
-    result: dict[str, list[str]] = {tid: [] for tid in transaction_ids}
+    result: dict[str, list[str]] = {str(tid): [] for tid in transaction_ids}
     for r in rows:
-        result.setdefault(str(r["transaction_id"]), []).append(str(r["hashtag_id"]))
+        result[str(r["transaction_id"])].append(str(r["hashtag_id"]))
     return result
 
 
@@ -127,7 +127,7 @@ async def attach_hashtag_ids(conn: asyncpg.Connection, payload) -> None:
     if not items:
         return
     ids = [item["id"] for item in items]
-    hashtag_map = await fetch_hashtag_ids_map(conn, ids)
+    hashtag_map = await _fetch_hashtag_ids_map(conn, ids)
     for item in items:
         item["hashtag_ids"] = hashtag_map.get(item["id"], [])
 
@@ -517,7 +517,7 @@ async def update_transaction(
                 "Reconciliation validation failed.",
                 {"reconciliation_id": "Reconciliation account does not match transaction account."},
             )
-        if recon["status"] == 2:
+        if recon["status"] == ReconciliationStatus.COMPLETED:
             raise validation_error(
                 "Reconciliation validation failed.",
                 {"reconciliation_id": "Cannot assign transactions to a completed reconciliation."},

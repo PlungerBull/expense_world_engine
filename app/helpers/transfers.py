@@ -72,7 +72,7 @@ async def create_transfer_pair(
     # ------------------------------------------------------------------
     primary_account = await conn.fetchrow(
         """
-        SELECT id, currency_code, is_person FROM expense_bank_accounts
+        SELECT is_person FROM expense_bank_accounts
         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
         """,
         primary_account_id,
@@ -83,7 +83,7 @@ async def create_transfer_pair(
 
     transfer_account = await conn.fetchrow(
         """
-        SELECT id, currency_code, is_person FROM expense_bank_accounts
+        SELECT is_person FROM expense_bank_accounts
         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
         """,
         transfer_account_id,

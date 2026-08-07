@@ -10,6 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, Query
 
 from app import db
+from app.constants import InboxStatus
 from app.deps import CurrentUser
 from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import inbox as inbox_service
@@ -43,8 +44,8 @@ async def list_inbox(
     offset: int = Query(0, ge=0),
 ):
     async with db.pool.acquire() as conn:
-        conditions = ["i.user_id = $1", "i.status = 1"]
-        params: list = [auth_user.id]
+        conditions = ["i.user_id = $1", "i.status = $2"]
+        params: list = [auth_user.id, int(InboxStatus.PENDING)]
 
         if not include_deleted:
             conditions.append("i.deleted_at IS NULL")

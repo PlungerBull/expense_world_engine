@@ -76,11 +76,11 @@ async def bootstrap(
         )
 
     # Upsert user_settings
-    settings_existing = await conn.fetchrow(
-        "SELECT user_id FROM user_settings WHERE user_id = $1", user_id
+    settings_row = await conn.fetchrow(
+        "SELECT * FROM user_settings WHERE user_id = $1", user_id
     )
 
-    if settings_existing is None:
+    if settings_row is None:
         settings_row = await conn.fetchrow(
             """
             INSERT INTO user_settings (user_id, display_timezone, created_at, updated_at)
@@ -93,10 +93,6 @@ async def bootstrap(
         await write_activity_log(
             conn, user_id, "user_settings", user_id, ActivityAction.CREATED,
             after_snapshot=settings_from_row(settings_row),
-        )
-    else:
-        settings_row = await conn.fetchrow(
-            "SELECT * FROM user_settings WHERE user_id = $1", user_id
         )
 
     return {
