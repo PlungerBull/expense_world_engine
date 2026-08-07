@@ -204,7 +204,9 @@ async def create_opening_balance(
             title=title,
             amount_cents=body.amount_cents,
             date=body.date,
-            account_id=account_id,
+            # The schema's account_id is str (UUID-valued body fields are a
+            # filed follow-up to bug 6.2); the path param arrives as UUID.
+            account_id=str(account_id),
             category_id=category_id,
         ),
     )

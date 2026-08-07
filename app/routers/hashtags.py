@@ -1,6 +1,7 @@
 """HTTP handlers for /hashtags — thin adapters over helpers.hashtags."""
 
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Header, Query
 
@@ -69,7 +70,7 @@ async def create_hashtag(
 
 
 @router.get("/{hashtag_id}")
-async def get_hashtag(hashtag_id: str, auth_user: CurrentUser):
+async def get_hashtag(hashtag_id: UUID, auth_user: CurrentUser):
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM expense_hashtags WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
@@ -83,7 +84,7 @@ async def get_hashtag(hashtag_id: str, auth_user: CurrentUser):
 
 @router.put("/{hashtag_id}")
 async def update_hashtag(
-    hashtag_id: str,
+    hashtag_id: UUID,
     body: HashtagUpdateRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
@@ -101,7 +102,7 @@ async def update_hashtag(
 
 @router.delete("/{hashtag_id}")
 async def delete_hashtag(
-    hashtag_id: str,
+    hashtag_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -117,7 +118,7 @@ async def delete_hashtag(
 
 @router.post("/{hashtag_id}/restore")
 async def restore_hashtag(
-    hashtag_id: str,
+    hashtag_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):

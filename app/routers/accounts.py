@@ -1,6 +1,7 @@
 """HTTP handlers for /accounts — thin adapters over helpers.accounts."""
 
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Header, Query
 
@@ -118,7 +119,7 @@ async def create_account(
 
 @router.post("/{account_id}/opening-balance", status_code=201)
 async def create_opening_balance(
-    account_id: str,
+    account_id: UUID,
     body: OpeningBalanceRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
@@ -134,7 +135,7 @@ async def create_opening_balance(
 
 
 @router.get("/{account_id}")
-async def get_account(account_id: str, auth_user: CurrentUser):
+async def get_account(account_id: UUID, auth_user: CurrentUser):
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
@@ -153,7 +154,7 @@ async def get_account(account_id: str, auth_user: CurrentUser):
 
 @router.put("/{account_id}")
 async def update_account(
-    account_id: str,
+    account_id: UUID,
     body: AccountUpdateRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
@@ -171,7 +172,7 @@ async def update_account(
 
 @router.delete("/{account_id}")
 async def delete_account(
-    account_id: str,
+    account_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -187,7 +188,7 @@ async def delete_account(
 
 @router.post("/{account_id}/restore")
 async def restore_account(
-    account_id: str,
+    account_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -203,7 +204,7 @@ async def restore_account(
 
 @router.post("/{account_id}/archive")
 async def archive_account(
-    account_id: str,
+    account_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -219,7 +220,7 @@ async def archive_account(
 
 @router.post("/{account_id}/unarchive")
 async def unarchive_account(
-    account_id: str,
+    account_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):

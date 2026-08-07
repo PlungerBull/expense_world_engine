@@ -1,6 +1,7 @@
 """HTTP handlers for /categories — thin adapters over helpers.categories."""
 
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Header, Query
 
@@ -69,7 +70,7 @@ async def create_category(
 
 
 @router.get("/{category_id}")
-async def get_category(category_id: str, auth_user: CurrentUser):
+async def get_category(category_id: UUID, auth_user: CurrentUser):
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
@@ -83,7 +84,7 @@ async def get_category(category_id: str, auth_user: CurrentUser):
 
 @router.put("/{category_id}")
 async def update_category(
-    category_id: str,
+    category_id: UUID,
     body: CategoryUpdateRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
@@ -101,7 +102,7 @@ async def update_category(
 
 @router.delete("/{category_id}")
 async def delete_category(
-    category_id: str,
+    category_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -117,7 +118,7 @@ async def delete_category(
 
 @router.post("/{category_id}/restore")
 async def restore_category(
-    category_id: str,
+    category_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):

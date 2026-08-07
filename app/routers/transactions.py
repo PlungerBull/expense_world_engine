@@ -7,6 +7,7 @@ and have no business logic worth extracting. The mutation endpoints
 
 from datetime import datetime
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Header, Query
 
@@ -33,7 +34,7 @@ router = APIRouter(prefix="/transactions", tags=["transactions"])
 # ---------------------------------------------------------------------------
 @router.get("/{transaction_id}")
 async def get_transaction(
-    transaction_id: str,
+    transaction_id: UUID,
     auth_user: CurrentUser,
     debit_as_negative: bool = Query(False),
 ):
@@ -58,10 +59,10 @@ async def get_transaction(
 @router.get("")
 async def list_transactions(
     auth_user: CurrentUser,
-    account_id: Optional[str] = Query(None),
-    category_id: Optional[str] = Query(None),
-    hashtag_id: Optional[str] = Query(None),
-    reconciliation_id: Optional[str] = Query(None),
+    account_id: Optional[UUID] = Query(None),
+    category_id: Optional[UUID] = Query(None),
+    hashtag_id: Optional[UUID] = Query(None),
+    reconciliation_id: Optional[UUID] = Query(None),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
     cleared: Optional[bool] = Query(None),
@@ -166,7 +167,7 @@ async def create_transaction(
 # ---------------------------------------------------------------------------
 @router.put("/{transaction_id}")
 async def update_transaction(
-    transaction_id: str,
+    transaction_id: UUID,
     body: TransactionUpdateRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
@@ -202,7 +203,7 @@ async def update_transaction(
 # ---------------------------------------------------------------------------
 @router.delete("/{transaction_id}")
 async def delete_transaction(
-    transaction_id: str,
+    transaction_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -221,7 +222,7 @@ async def delete_transaction(
 # ---------------------------------------------------------------------------
 @router.post("/{transaction_id}/restore")
 async def restore_transaction(
-    transaction_id: str,
+    transaction_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):

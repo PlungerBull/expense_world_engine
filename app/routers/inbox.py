@@ -5,6 +5,7 @@ DELETE, POST /promote) delegate to helpers.inbox.
 """
 
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Header, Query
 
@@ -139,7 +140,7 @@ async def create_inbox_item(
 # ---------------------------------------------------------------------------
 @router.get("/{inbox_id}")
 async def get_inbox_item(
-    inbox_id: str,
+    inbox_id: UUID,
     auth_user: CurrentUser,
     debit_as_negative: bool = Query(False),
 ):
@@ -162,7 +163,7 @@ async def get_inbox_item(
 # ---------------------------------------------------------------------------
 @router.put("/{inbox_id}")
 async def update_inbox_item(
-    inbox_id: str,
+    inbox_id: UUID,
     body: InboxUpdateRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
@@ -182,7 +183,7 @@ async def update_inbox_item(
 # ---------------------------------------------------------------------------
 @router.delete("/{inbox_id}")
 async def delete_inbox_item(
-    inbox_id: str,
+    inbox_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -201,7 +202,7 @@ async def delete_inbox_item(
 # ---------------------------------------------------------------------------
 @router.post("/{inbox_id}/restore")
 async def restore_inbox_item(
-    inbox_id: str,
+    inbox_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -220,7 +221,7 @@ async def restore_inbox_item(
 # ---------------------------------------------------------------------------
 @router.post("/{inbox_id}/promote")
 async def promote_inbox_item(
-    inbox_id: str,
+    inbox_id: UUID,
     body: InboxPromoteRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),

@@ -7,6 +7,7 @@ same /auth URL namespace.
 """
 
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Header
 
@@ -46,7 +47,7 @@ async def create_pat(
 
 @router.delete("/{pat_id}")
 async def revoke_pat(
-    pat_id: str,
+    pat_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):

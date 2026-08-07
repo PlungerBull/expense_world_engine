@@ -11,6 +11,22 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-07 — malformed UUID path/query params return `422`, previously `500`
+
+**Engine change.** Bug 6.2. Every UUID-valued path parameter (`/{account_id}`,
+`/{transaction_id}`, …) and query filter (`?account_id=`, `?category_id=`,
+`?hashtag_id=`, `?reconciliation_id=`) is now typed `uuid.UUID`, so a
+malformed id is rejected at the boundary with the standard `422`
+`VALIDATION_ERROR` envelope (field name in `fields`) instead of reaching SQL
+and returning `500 INTERNAL_ERROR`.
+
+**What breaks.** Only a client that special-cased the old `500` for garbage
+ids. Well-formed UUIDs — which every client generates client-side per the
+UUID-first convention — behave identically. Treat `422` on an id param as a
+client-side bug (mangled id), not a retryable server error.
+
+---
+
 ## 2026-08-07 — idempotency keys are permanent; key reuse with a different request is `409`; PAT-create replay is `409`
 
 **Engine change.** Bugs 4.1 (🔴) and 2.4, owner decision 2026-08-06; `sql/026`.

@@ -1,6 +1,7 @@
 """HTTP handlers for /reconciliations — thin adapters over helpers.reconciliations."""
 
 from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Header, Query
 
@@ -30,7 +31,7 @@ router = APIRouter(prefix="/reconciliations", tags=["reconciliations"])
 @router.get("")
 async def list_reconciliations(
     auth_user: CurrentUser,
-    account_id: Optional[str] = Query(None),
+    account_id: Optional[UUID] = Query(None),
     include_deleted: bool = Query(False),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
@@ -112,7 +113,7 @@ async def create_reconciliation(
 # ---------------------------------------------------------------------------
 @router.get("/{reconciliation_id}")
 async def get_reconciliation(
-    reconciliation_id: str,
+    reconciliation_id: UUID,
     auth_user: CurrentUser,
     debit_as_negative: bool = Query(False),
     limit: int = Query(50, ge=1, le=200),
@@ -175,7 +176,7 @@ async def get_reconciliation(
 # ---------------------------------------------------------------------------
 @router.put("/{reconciliation_id}")
 async def update_reconciliation(
-    reconciliation_id: str,
+    reconciliation_id: UUID,
     body: ReconciliationUpdateRequest,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
@@ -198,7 +199,7 @@ async def update_reconciliation(
 # ---------------------------------------------------------------------------
 @router.post("/{reconciliation_id}/complete")
 async def complete_reconciliation(
-    reconciliation_id: str,
+    reconciliation_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -217,7 +218,7 @@ async def complete_reconciliation(
 # ---------------------------------------------------------------------------
 @router.post("/{reconciliation_id}/revert")
 async def revert_reconciliation(
-    reconciliation_id: str,
+    reconciliation_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -236,7 +237,7 @@ async def revert_reconciliation(
 # ---------------------------------------------------------------------------
 @router.delete("/{reconciliation_id}")
 async def delete_reconciliation(
-    reconciliation_id: str,
+    reconciliation_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
@@ -255,7 +256,7 @@ async def delete_reconciliation(
 # ---------------------------------------------------------------------------
 @router.post("/{reconciliation_id}/restore")
 async def restore_reconciliation(
-    reconciliation_id: str,
+    reconciliation_id: UUID,
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
