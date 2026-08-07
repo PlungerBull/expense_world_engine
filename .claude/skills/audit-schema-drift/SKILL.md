@@ -43,7 +43,7 @@ Assign agents based on how many tables exist. A small schema (under 15 tables) c
 
 ```
 Assignment plan:
-- Agent 1: Infrastructure tables (users, user_settings, idempotency_keys, activity_log, sync_checkpoints, global_currencies, exchange_rates)
+- Agent 1: Infrastructure tables (users, user_settings, idempotency_keys, activity_log, global_currencies, exchange_rates, personal_access_tokens)
 - Agent 2: Core expense tables (accounts, categories, hashtags, expense_transactions, expense_transaction_hashtags)
 - Agent 3: Supporting tables (inbox_items, reconciliations, reconciliation_transactions) + index and constraint review
 - Assembler: receives all findings
@@ -123,10 +123,10 @@ If SQLAlchemy models, Pydantic schemas, or similar ORM definitions exist in the 
 
 ### Findings
 
-#### [MISSING FROM MIGRATIONS] Table `sync_checkpoints`
-**Schema doc says:** Table exists with columns: id (UUID PK), user_id (UUID FK), device_id (TEXT), version (BIGINT), created_at (TIMESTAMPTZ)
-**Migrations have:** Table not found in any migration file
-**Risk:** This table is required for the sync token pattern — the sync endpoint will not function without it
+#### [MISSING FROM MIGRATIONS] Table `<example_table>`
+**Schema doc says:** Table exists with columns: id (UUID PK), user_id (UUID FK), created_at (TIMESTAMPTZ)
+**Migrations have:** Table not found in any migration file (⚠️ check DROP migrations too — a table created in one file and dropped in a later one, like `sync_checkpoints` in sql/002→sql/023, is correctly absent)
+**Risk:** Any feature reading the table will fail at runtime
 
 #### [TYPE MISMATCH] `expense_transactions.amount_cents`
 **Schema doc says:** INTEGER

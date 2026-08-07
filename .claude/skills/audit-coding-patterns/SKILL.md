@@ -34,7 +34,7 @@ Produce an assignment plan:
 ```
 Assignment plan:
 - Agent 1: Error format consistency — all files
-- Agent 2: Response shape (null-over-omission + amount_home_cents) — all route/service files
+- Agent 2: Response shape (null-over-omission + the home-currency rules: home values only on cross-currency aggregates, absent-not-null on per-row records) — all route/service files
 - Agent 3: Auth + idempotency — all route files
 - Agent 4: Soft delete + activity log — all service/DB files
 - Agent 5: Pagination + sign conventions — all route/service files
@@ -133,7 +133,7 @@ Check for:
 - Read endpoints that return amounts but don't support the `debit_as_negative` flag
 - The flag being applied to responses where it shouldn't (e.g., home-currency amounts should follow the same flag)
 - Amount sign being baked into storage or response models rather than applied as a transformation at response time
-- **Direction expressed more than one way.** Every stored amount in the engine is positive, and direction lives on `transaction_type` + `transfer_direction` — on the inbox exactly as on the ledger. A column whose *sign* means something is the defect pattern here (audit WP7.2: the inbox's `transfer_amount_cents` was the last one, fixed in `sql/019`). Flag any new signed storage column, and any code that reads a sign to decide direction.
+- **Direction expressed more than one way.** Every stored amount in the engine is positive, and direction lives on `transaction_type` alone — on the inbox exactly as on the ledger (`transfer_direction` was deleted by `sql/020`). A column whose *sign* means something is the defect pattern here (audit WP7.2: the inbox's `transfer_amount_cents` was the last one, fixed in `sql/019`). Flag any new signed storage column, and any code that reads a sign to decide direction.
 - **Both legs of a transfer flipping together.** An inbox row carries both legs, so under the flag they must come back with opposite signs. Returning one flipped and one as-stored was WP10.2.
 
 ### Concern 6 — UUID discipline + IDs-only direction

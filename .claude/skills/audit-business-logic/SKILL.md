@@ -57,17 +57,17 @@ Every agent should check these universal rules first, then the domain-specific r
 
 **Universal (applies to every domain):**
 - Every write endpoint (POST, PUT, DELETE) checks for an idempotency key before processing
-- Every route requires JWT authentication — there are no unauthenticated routes
+- Every route requires PAT authentication (`Authorization: Bearer ewe_pat_…`) — the JWT branch was deleted 2026-08-03; the only unauthenticated route is `GET /health`
 - Every mutation writes to `activity_log` with before/after JSON snapshots
 - Every delete is a soft delete (`deleted_at = now()`) — no hard deletes on financial records
 - All error responses use the standard shape: `{error: {code, message, fields}}`
 
 **Auth domain:**
 - `POST /auth/bootstrap` is idempotent — it skips row creation if rows already exist, and always returns current state regardless
-- `PUT /auth/settings` handles the `main_currency` change case: enqueues async recalculation of `amount_home_cents` on all transactions, returns immediately with a `recalculation_job_id`
+- `PUT /auth/settings` rejects `main_currency` with `422` — the home currency is locked to PEN (`sql/018`) and there is no recalculation pass (conversion is read-time, `sql/021`); the only updatable field is `display_timezone` (IANA-validated)
 
 **Accounts domain:**
-- `POST /accounts`: rejects `is_person` — person accounts are created by the transfer engine only
+- `POST /accounts`: rejects `is_person` — person accounts are never auto-created (decision D7); the explicit People API that would create them is planned but unbuilt, so no row can currently have `is_person = true`
 - `PUT /accounts/{id}`: returns `422` if `currency_code` is included (it's immutable after creation)
 - `DELETE /accounts/{id}`: returns `409` if any non-deleted transactions exist — must archive instead
 - `POST /accounts/{id}/archive`: sets `is_archived = true`, does not delete
@@ -83,7 +83,7 @@ Every agent should check these universal rules first, then the domain-specific r
 
 **Inbox domain:**
 - `POST /inbox` and `PUT /inbox/{id}`: auto-populate `exchange_rate` when both `date` and `account_id` are present; fall back to most recent available rate if no exact date match
-- **The inbox is a draft ledger row.** Its looseness is confined to *which fields may be null*; the *encoding* of every field matches `expense_transactions` exactly. `amount_cents` and `transfer_amount_cents` are stored positive, `transaction_type` and `transfer_direction` carry direction. A diff that reintroduces a signed stored amount, or a second way of expressing direction, is wrong — that was audit finding WP7.2, fixed in `sql/019`.
+- **The inbox is a draft ledger row.** Its looseness is confined to *which fields may be null*; the *encoding* of every field matches `expense_transactions` exactly. `amount_cents` and `transfer_amount_cents` are stored positive, and `transaction_type` alone carries direction (`transfer_direction` was deleted by `sql/020`). A diff that reintroduces a signed stored amount, or a second way of expressing direction, is wrong — that was audit finding WP7.2, fixed in `sql/019`.
 - `POST /inbox` / `PUT /inbox/{id}` with a `transfer` object: takes `account_id` + `amount_cents` and **no `id`** (unlike `POST /transactions`). `transfer.amount_cents` must be signed opposite to the item's own `amount_cents` — same sign is `422`. `transaction_type` must be assigned exactly once per request; if an `amount_cents` in the same body can overwrite `TRANSFER`, that is the WP7.2 ordering bug regressing. `"transfer": null` clears the transfer and is the only explicit null the inbox accepts.
 - `POST /inbox/{id}/promote`: enforces all seven promotion conditions before proceeding, accumulating **all** failures into one response:
   1. `title` is present and not `'UNTITLED'`

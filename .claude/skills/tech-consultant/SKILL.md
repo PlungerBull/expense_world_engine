@@ -58,7 +58,7 @@ Read `CLAUDE.md` in the project root for the full set of project conventions. Th
 
 **Idempotency:** If the proposal involves write endpoints, does it include the idempotency key check? Duplicate writes on financial data corrupt balances.
 
-**Home currency:** If the proposal touches any amount, does it also handle `amount_home_cents`? The engine is the only thing that does currency conversion — clients never compute it.
+**Home currency:** If the proposal touches any amount, does it respect the read-time model (`sql/021`)? Nothing stores a conversion; home values appear only on cross-currency aggregates, paired with `unconverted_count`. The engine is the only thing that does currency conversion — clients never compute it.
 
 **Error shape:** Does the proposal produce errors in the standard format `{error: {code, message, fields}}`?
 
