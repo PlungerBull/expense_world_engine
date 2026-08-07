@@ -16,7 +16,6 @@ The Brain. A Python (FastAPI) backend, backed by Postgres. It is the single sour
 | `docs/design-philosophy.md` | UX philosophy and product vision. |
 | `docs/client-breaking-changes.md` | Engine changes that require work in a client repo. Append here whenever a change breaks the CLI/iOS/web contract. |
 | `docs/currency-model-decision.md` | How multi-currency works: native storage, conversion at read time, what `@Transfer ≠ 0` means. Read before touching exchange rates or home-currency conversion. |
-| `docs/rework/` | **Transient (2026-08-04).** The deletion program: work packages WP1–WP7, one per agent, executing the audit of 2026-08-04. Start at its `README.md`. **Read it before changing transfers, balances, currency, `/sync`, or reconciliations** — several conventions below are scheduled to change and WP7 rewrites them. Delete the directory and this row when WP7 lands. |
 
 ## Who this is for
 
