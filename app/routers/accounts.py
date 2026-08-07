@@ -7,7 +7,7 @@ from fastapi import APIRouter, Header, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import not_found
+from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import accounts as accounts_service
 from app.helpers.account_balance import fetch_balance, fetch_balances
 from app.helpers.exchange_rate import batch_get_rates, rate_lookup_date
@@ -16,15 +16,18 @@ from app.helpers.pagination import paginated_response
 from app.helpers.validation import extract_update_fields
 from app.schemas.accounts import (
     AccountCreateRequest,
+    AccountResponse,
     AccountUpdateRequest,
     OpeningBalanceRequest,
     account_from_row,
 )
+from app.schemas.pagination import Paginated
+from app.schemas.transactions import TransactionResponse
 
-router = APIRouter(prefix="/accounts", tags=["accounts"])
+router = APIRouter(prefix="/accounts", tags=["accounts"], responses=ERROR_RESPONSES)
 
 
-@router.get("")
+@router.get("", response_model=Paginated[AccountResponse])
 async def list_accounts(
     auth_user: CurrentUser,
     include_people: bool = Query(False),
@@ -101,7 +104,7 @@ async def list_accounts(
         return paginated_response(data, total, limit, offset)
 
 
-@router.post("", status_code=201)
+@router.post("", response_model=AccountResponse, status_code=201)
 async def create_account(
     body: AccountCreateRequest,
     auth_user: CurrentUser,
@@ -117,7 +120,8 @@ async def create_account(
     )
 
 
-@router.post("/{account_id}/opening-balance", status_code=201)
+# An opening balance IS a transaction — the response is the ledger row it seeds.
+@router.post("/{account_id}/opening-balance", response_model=TransactionResponse, status_code=201)
 async def create_opening_balance(
     account_id: UUID,
     body: OpeningBalanceRequest,
@@ -134,7 +138,7 @@ async def create_opening_balance(
     )
 
 
-@router.get("/{account_id}")
+@router.get("/{account_id}", response_model=AccountResponse)
 async def get_account(account_id: UUID, auth_user: CurrentUser):
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -152,7 +156,7 @@ async def get_account(account_id: UUID, auth_user: CurrentUser):
         return account_from_row(row, balance_cents, home)
 
 
-@router.put("/{account_id}")
+@router.put("/{account_id}", response_model=AccountResponse)
 async def update_account(
     account_id: UUID,
     body: AccountUpdateRequest,
@@ -170,7 +174,7 @@ async def update_account(
     )
 
 
-@router.delete("/{account_id}")
+@router.delete("/{account_id}", response_model=AccountResponse)
 async def delete_account(
     account_id: UUID,
     auth_user: CurrentUser,
@@ -186,7 +190,7 @@ async def delete_account(
     )
 
 
-@router.post("/{account_id}/restore")
+@router.post("/{account_id}/restore", response_model=AccountResponse)
 async def restore_account(
     account_id: UUID,
     auth_user: CurrentUser,
@@ -202,7 +206,7 @@ async def restore_account(
     )
 
 
-@router.post("/{account_id}/archive")
+@router.post("/{account_id}/archive", response_model=AccountResponse)
 async def archive_account(
     account_id: UUID,
     auth_user: CurrentUser,
@@ -218,7 +222,7 @@ async def archive_account(
     )
 
 
-@router.post("/{account_id}/unarchive")
+@router.post("/{account_id}/unarchive", response_model=AccountResponse)
 async def unarchive_account(
     account_id: UUID,
     auth_user: CurrentUser,

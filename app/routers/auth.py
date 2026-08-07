@@ -6,7 +6,7 @@ from fastapi import APIRouter, Header
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import not_found
+from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import auth as auth_service
 from app.helpers.idempotency import run_idempotent
 from app.helpers.validation import extract_update_fields
@@ -21,7 +21,7 @@ from app.schemas.auth import (
     user_from_row,
 )
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix="/auth", tags=["auth"], responses=ERROR_RESPONSES)
 
 
 @router.post("/bootstrap", response_model=BootstrapResponse, status_code=200)

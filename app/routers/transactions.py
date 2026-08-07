@@ -13,26 +13,30 @@ from fastapi import APIRouter, Header, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import not_found
+from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import transactions as transactions_service
 from app.helpers.formatting import apply_debit_as_negative
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
 from app.helpers.validation import extract_update_fields
+from app.schemas.pagination import Paginated
 from app.schemas.transactions import (
     TransactionBatchRequest,
+    TransactionBatchResponse,
     TransactionCreateRequest,
+    TransactionResponse,
     TransactionUpdateRequest,
+    TransactionWithWarningsResponse,
     transaction_from_row,
 )
 
-router = APIRouter(prefix="/transactions", tags=["transactions"])
+router = APIRouter(prefix="/transactions", tags=["transactions"], responses=ERROR_RESPONSES)
 
 
 # ---------------------------------------------------------------------------
 # GET /transactions/{transaction_id}
 # ---------------------------------------------------------------------------
-@router.get("/{transaction_id}")
+@router.get("/{transaction_id}", response_model=TransactionResponse)
 async def get_transaction(
     transaction_id: UUID,
     auth_user: CurrentUser,
@@ -56,7 +60,7 @@ async def get_transaction(
 # ---------------------------------------------------------------------------
 # GET /transactions
 # ---------------------------------------------------------------------------
-@router.get("")
+@router.get("", response_model=Paginated[TransactionResponse])
 async def list_transactions(
     auth_user: CurrentUser,
     account_id: Optional[UUID] = Query(None),
@@ -146,7 +150,8 @@ async def list_transactions(
 # ---------------------------------------------------------------------------
 # POST /transactions
 # ---------------------------------------------------------------------------
-@router.post("", status_code=201)
+# The transfer branch returns the primary leg only — same TransactionResponse.
+@router.post("", response_model=TransactionResponse, status_code=201)
 async def create_transaction(
     body: TransactionCreateRequest,
     auth_user: CurrentUser,
@@ -165,7 +170,7 @@ async def create_transaction(
 # ---------------------------------------------------------------------------
 # PUT /transactions/{transaction_id}
 # ---------------------------------------------------------------------------
-@router.put("/{transaction_id}")
+@router.put("/{transaction_id}", response_model=TransactionResponse)
 async def update_transaction(
     transaction_id: UUID,
     body: TransactionUpdateRequest,
@@ -201,7 +206,7 @@ async def update_transaction(
 # ---------------------------------------------------------------------------
 # DELETE /transactions/{transaction_id}
 # ---------------------------------------------------------------------------
-@router.delete("/{transaction_id}")
+@router.delete("/{transaction_id}", response_model=TransactionWithWarningsResponse)
 async def delete_transaction(
     transaction_id: UUID,
     auth_user: CurrentUser,
@@ -220,7 +225,7 @@ async def delete_transaction(
 # ---------------------------------------------------------------------------
 # POST /transactions/{transaction_id}/restore
 # ---------------------------------------------------------------------------
-@router.post("/{transaction_id}/restore")
+@router.post("/{transaction_id}/restore", response_model=TransactionWithWarningsResponse)
 async def restore_transaction(
     transaction_id: UUID,
     auth_user: CurrentUser,
@@ -239,7 +244,7 @@ async def restore_transaction(
 # ---------------------------------------------------------------------------
 # POST /transactions/batch
 # ---------------------------------------------------------------------------
-@router.post("/batch", status_code=201)
+@router.post("/batch", response_model=TransactionBatchResponse, status_code=201)
 async def batch_create_transactions(
     body: TransactionBatchRequest,
     auth_user: CurrentUser,

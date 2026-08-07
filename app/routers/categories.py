@@ -7,17 +7,23 @@ from fastapi import APIRouter, Header, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import not_found
+from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import categories as categories_service
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
 from app.helpers.validation import extract_update_fields
-from app.schemas.categories import CategoryCreateRequest, CategoryUpdateRequest, category_from_row
+from app.schemas.categories import (
+    CategoryCreateRequest,
+    CategoryResponse,
+    CategoryUpdateRequest,
+    category_from_row,
+)
+from app.schemas.pagination import Paginated
 
-router = APIRouter(prefix="/categories", tags=["categories"])
+router = APIRouter(prefix="/categories", tags=["categories"], responses=ERROR_RESPONSES)
 
 
-@router.get("")
+@router.get("", response_model=Paginated[CategoryResponse])
 async def list_categories(
     auth_user: CurrentUser,
     include_deleted: bool = Query(False),
@@ -53,7 +59,7 @@ async def list_categories(
         return paginated_response(data, total, limit, offset)
 
 
-@router.post("", status_code=201)
+@router.post("", response_model=CategoryResponse, status_code=201)
 async def create_category(
     body: CategoryCreateRequest,
     auth_user: CurrentUser,
@@ -69,7 +75,7 @@ async def create_category(
     )
 
 
-@router.get("/{category_id}")
+@router.get("/{category_id}", response_model=CategoryResponse)
 async def get_category(category_id: UUID, auth_user: CurrentUser):
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -82,7 +88,7 @@ async def get_category(category_id: UUID, auth_user: CurrentUser):
         return category_from_row(row)
 
 
-@router.put("/{category_id}")
+@router.put("/{category_id}", response_model=CategoryResponse)
 async def update_category(
     category_id: UUID,
     body: CategoryUpdateRequest,
@@ -100,7 +106,7 @@ async def update_category(
     )
 
 
-@router.delete("/{category_id}")
+@router.delete("/{category_id}", response_model=CategoryResponse)
 async def delete_category(
     category_id: UUID,
     auth_user: CurrentUser,
@@ -116,7 +122,7 @@ async def delete_category(
     )
 
 
-@router.post("/{category_id}/restore")
+@router.post("/{category_id}/restore", response_model=CategoryResponse)
 async def restore_category(
     category_id: UUID,
     auth_user: CurrentUser,

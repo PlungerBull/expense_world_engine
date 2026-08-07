@@ -1,11 +1,11 @@
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Union
 
 import asyncpg
 from fastapi import APIRouter, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import validation_error
+from app.errors import ERROR_RESPONSES, validation_error
 from app.helpers.monthly_report import (
     compute_month_bounds,
     compute_month_flow,
@@ -13,7 +13,7 @@ from app.helpers.monthly_report import (
 )
 from app.schemas.reports import MonthlyReportRangeResponse, MonthlyReportResponse
 
-router = APIRouter(prefix="/reports", tags=["reports"])
+router = APIRouter(prefix="/reports", tags=["reports"], responses=ERROR_RESPONSES)
 
 MAX_RANGE_MONTHS = 24
 
@@ -54,7 +54,9 @@ async def _compute_one(
     }
 
 
-@router.get("/monthly")
+# One route, two forms: (year, month) -> single-month shape; the from/to
+# range form -> {months: [...]}. Union renders an honest anyOf in OpenAPI.
+@router.get("/monthly", response_model=Union[MonthlyReportResponse, MonthlyReportRangeResponse])
 async def get_monthly_report(
     auth_user: CurrentUser,
     year: Optional[int] = Query(None, ge=1900, le=2100),

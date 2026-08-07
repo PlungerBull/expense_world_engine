@@ -7,17 +7,23 @@ from fastapi import APIRouter, Header, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import not_found
+from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import hashtags as hashtags_service
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
 from app.helpers.validation import extract_update_fields
-from app.schemas.hashtags import HashtagCreateRequest, HashtagUpdateRequest, hashtag_from_row
+from app.schemas.hashtags import (
+    HashtagCreateRequest,
+    HashtagResponse,
+    HashtagUpdateRequest,
+    hashtag_from_row,
+)
+from app.schemas.pagination import Paginated
 
-router = APIRouter(prefix="/hashtags", tags=["hashtags"])
+router = APIRouter(prefix="/hashtags", tags=["hashtags"], responses=ERROR_RESPONSES)
 
 
-@router.get("")
+@router.get("", response_model=Paginated[HashtagResponse])
 async def list_hashtags(
     auth_user: CurrentUser,
     include_deleted: bool = Query(False),
@@ -53,7 +59,7 @@ async def list_hashtags(
         return paginated_response(data, total, limit, offset)
 
 
-@router.post("", status_code=201)
+@router.post("", response_model=HashtagResponse, status_code=201)
 async def create_hashtag(
     body: HashtagCreateRequest,
     auth_user: CurrentUser,
@@ -69,7 +75,7 @@ async def create_hashtag(
     )
 
 
-@router.get("/{hashtag_id}")
+@router.get("/{hashtag_id}", response_model=HashtagResponse)
 async def get_hashtag(hashtag_id: UUID, auth_user: CurrentUser):
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -82,7 +88,7 @@ async def get_hashtag(hashtag_id: UUID, auth_user: CurrentUser):
         return hashtag_from_row(row)
 
 
-@router.put("/{hashtag_id}")
+@router.put("/{hashtag_id}", response_model=HashtagResponse)
 async def update_hashtag(
     hashtag_id: UUID,
     body: HashtagUpdateRequest,
@@ -100,7 +106,7 @@ async def update_hashtag(
     )
 
 
-@router.delete("/{hashtag_id}")
+@router.delete("/{hashtag_id}", response_model=HashtagResponse)
 async def delete_hashtag(
     hashtag_id: UUID,
     auth_user: CurrentUser,
@@ -116,7 +122,7 @@ async def delete_hashtag(
     )
 
 
-@router.post("/{hashtag_id}/restore")
+@router.post("/{hashtag_id}/restore", response_model=HashtagResponse)
 async def restore_hashtag(
     hashtag_id: UUID,
     auth_user: CurrentUser,

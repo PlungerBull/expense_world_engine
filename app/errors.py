@@ -6,7 +6,26 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.schemas.errors import ErrorResponse
+
 logger = logging.getLogger(__name__)
+
+# OpenAPI documentation for the error contract, passed as `responses=` to every
+# authenticated APIRouter. Declaring 422 here also replaces FastAPI's
+# auto-generated HTTPValidationError stub route-by-route — the app never emits
+# that shape (main.py's openapi override strips the leftover components).
+# 404/409 occur on many-but-not-all routes and are documented in engine-spec.md
+# rather than over-claimed router-wide here.
+ERROR_RESPONSES: dict = {
+    401: {
+        "description": "Missing or invalid bearer token.",
+        "model": ErrorResponse,
+    },
+    422: {
+        "description": "Validation failed. `fields` maps field name to message.",
+        "model": ErrorResponse,
+    },
+}
 
 _STARLETTE_CODE_MAP = {
     400: "BAD_REQUEST",

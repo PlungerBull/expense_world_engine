@@ -1,40 +1,19 @@
-import json
-from typing import Any, Optional
+from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Query
 
 from app import db
 from app.deps import CurrentUser
+from app.errors import ERROR_RESPONSES
 from app.helpers.pagination import paginated_response
-from app.schemas.activity import ActivityLogResponse
+from app.schemas.activity import ActivityLogResponse, activity_from_row
+from app.schemas.pagination import Paginated
 
-router = APIRouter(prefix="/activity", tags=["activity"])
-
-
-def _parse_snapshot(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return json.loads(value)
-    return value
+router = APIRouter(prefix="/activity", tags=["activity"], responses=ERROR_RESPONSES)
 
 
-def _activity_from_row(row) -> dict:
-    return ActivityLogResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
-        resource_type=row["resource_type"],
-        resource_id=str(row["resource_id"]),
-        action=row["action"],
-        before_snapshot=_parse_snapshot(row["before_snapshot"]),
-        after_snapshot=_parse_snapshot(row["after_snapshot"]),
-        changed_by=str(row["changed_by"]),
-        created_at=row["created_at"],
-    ).model_dump(mode="json")
-
-
-@router.get("")
+@router.get("", response_model=Paginated[ActivityLogResponse])
 async def list_activity(
     auth_user: CurrentUser,
     resource_type: Optional[str] = Query(None),
@@ -75,5 +54,5 @@ async def list_activity(
             offset,
         )
 
-        data = [_activity_from_row(row) for row in rows]
+        data = [activity_from_row(row) for row in rows]
         return paginated_response(data, total, limit, offset)

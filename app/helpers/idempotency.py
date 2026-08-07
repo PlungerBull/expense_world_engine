@@ -1,8 +1,12 @@
 """Idempotency layer for write endpoints.
 
 The public entry point is ``run_idempotent``. Every write handler calls
-it once and gets back a ``JSONResponse`` with the correct status code,
-whether the request is a first-time write or a replay.
+it once. A first-time write returns the plain body dict, which FastAPI
+then serializes through the route's declared ``response_model`` — that is
+what makes the OpenAPI shape declarations *enforced*, not decorative
+(bug 10.1). A replay returns a pre-built ``JSONResponse`` reconstructed
+from the stored snapshot, which deliberately bypasses the model: the
+contract is "the original answer, verbatim".
 
 Design notes:
 
@@ -32,9 +36,11 @@ Design notes:
   No double writes possible, no race window.
 
 * The snapshot captures both the body AND the HTTP status code. Replays
-  reconstruct the full ``JSONResponse`` envelope from the database, so a
-  future handler that forgets to wrap the result in ``JSONResponse(...,
-  status_code=201)`` can't silently downgrade replay to 200.
+  reconstruct the full ``JSONResponse`` envelope from the database. On
+  the fresh path the status comes from the route decorator's
+  ``status_code=``, so the ``status_code`` argument here exists to be
+  *stored* — keep the two in step (a mismatch would surface as replays
+  answering with a different status than the first write).
 
 * **One-time secrets are never snapshotted.** A route whose response
   contains a value that must not persist (the PAT plaintext — bug 2.4)
@@ -52,7 +58,7 @@ import json
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Union
 
 import asyncpg
 from fastapi import Request
@@ -201,14 +207,17 @@ async def run_idempotent(
     status_code: int,
     work: Work,
     store_snapshot: bool = True,
-) -> JSONResponse:
+) -> Union[dict, JSONResponse]:
     """Run a write under the idempotency guard.
 
     Acquires a pooled connection, opens a transaction, claims the per-key
     advisory lock, runs ``work(conn)`` inside the same transaction, stores
     the response envelope (body + status + request fingerprint), and
-    returns a ``JSONResponse``. Cached hits skip ``work`` entirely and
-    return the stored envelope verbatim.
+    returns the body dict for FastAPI to serialize through the route's
+    ``response_model``. Cached hits skip ``work`` entirely and return the
+    stored envelope verbatim as a pre-built ``JSONResponse`` (a Response
+    return bypasses response-model serialization — intended: a replay is
+    the original answer, not a re-render of it).
 
     ## Transaction boundaries and locks — the convention for every service helper
 
@@ -273,4 +282,4 @@ async def run_idempotent(
             response if store_snapshot else None,
             status_code,
         )
-        return JSONResponse(content=response, status_code=status_code)
+        return response

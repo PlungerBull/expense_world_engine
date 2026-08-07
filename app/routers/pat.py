@@ -12,14 +12,15 @@ from uuid import UUID
 from fastapi import APIRouter, Header
 
 from app.deps import CurrentUser
+from app.errors import ERROR_RESPONSES
 from app.helpers import pat as pat_service
 from app.helpers.idempotency import run_idempotent
-from app.schemas.pat import PatCreateRequest
+from app.schemas.pat import PatCreateRequest, PatCreateResponse, PatResponse
 
-router = APIRouter(prefix="/auth/pat", tags=["auth"])
+router = APIRouter(prefix="/auth/pat", tags=["auth"], responses=ERROR_RESPONSES)
 
 
-@router.post("", status_code=201)
+@router.post("", response_model=PatCreateResponse, status_code=201)
 async def create_pat(
     body: PatCreateRequest,
     auth_user: CurrentUser,
@@ -45,7 +46,7 @@ async def create_pat(
     )
 
 
-@router.delete("/{pat_id}")
+@router.delete("/{pat_id}", response_model=PatResponse)
 async def revoke_pat(
     pat_id: UUID,
     auth_user: CurrentUser,

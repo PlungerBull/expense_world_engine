@@ -82,6 +82,24 @@ class TransactionResponse(BaseModel):
     hashtag_ids: list[str] = Field(default_factory=list)
 
 
+class TransactionWithWarningsResponse(TransactionResponse):
+    """DELETE /transactions/{id} and POST /transactions/{id}/restore only.
+
+    ``warnings`` carries side-effect notes (reconciliation unlink on a
+    completed reconciliation). Required, no default: those two routes always
+    emit it — empty when the operation is clean — and a path that forgot to
+    set it should fail response validation, not be papered over. Deliberately
+    NOT on other mutations: the key exists where a warning can actually occur
+    (owner decision 2026-08-07, D9 in open-bugs.md).
+    """
+
+    warnings: list[str]
+
+
+class TransactionBatchResponse(BaseModel):
+    created: list[TransactionResponse]
+
+
 def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
     """Serialize a transaction row.
 

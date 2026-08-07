@@ -5,16 +5,17 @@ from fastapi import APIRouter, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import not_found, validation_error
+from app.errors import ERROR_RESPONSES, not_found, validation_error
 from app.helpers.exchange_rate import get_rate, rate_lookup_date
 from app.helpers.pagination import paginated_response
 from app.helpers.validation import currency_code_error
 from app.schemas.exchange_rates import ExchangeRateHistoryItem, ExchangeRateResponse
+from app.schemas.pagination import Paginated
 
-router = APIRouter(prefix="/exchange-rates", tags=["exchange-rates"])
+router = APIRouter(prefix="/exchange-rates", tags=["exchange-rates"], responses=ERROR_RESPONSES)
 
 
-@router.get("")
+@router.get("", response_model=ExchangeRateResponse)
 async def get_exchange_rate(
     auth_user: CurrentUser,
     target: str = Query(..., min_length=3, max_length=3),
@@ -70,7 +71,7 @@ async def get_exchange_rate(
     ).model_dump(mode="json")
 
 
-@router.get("/history")
+@router.get("/history", response_model=Paginated[ExchangeRateHistoryItem])
 async def list_exchange_rate_history(
     auth_user: CurrentUser,
     date: Optional[date_type] = Query(None),

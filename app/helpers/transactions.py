@@ -670,9 +670,10 @@ async def delete_transaction(
     disappears atomically, which matches the invariant that transfer
     pairs are never orphaned).
 
-    If the transaction was assigned to a completed reconciliation, the
-    response is augmented with a ``warning`` field so clients can surface
-    that the reconciliation totals may now be stale.
+    The response carries ``warnings: list[str]`` — always present on this
+    endpoint, empty when the delete is clean. A transaction assigned to a
+    completed reconciliation contributes a note so clients can surface that
+    the reconciliation totals may now be stale.
 
     Both the primary and the sibling (if any) are locked with
     ``FOR UPDATE`` before their balance is reversed — same hazard as

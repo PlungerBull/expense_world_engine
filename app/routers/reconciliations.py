@@ -7,28 +7,32 @@ from fastapi import APIRouter, Header, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import not_found
+from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import reconciliations as reconciliations_service
 from app.helpers.formatting import apply_debit_as_negative
 from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
 from app.helpers.validation import extract_update_fields
+from app.schemas.pagination import Paginated
 from app.schemas.reconciliations import (
     ReconciliationCreateRequest,
     ReconciliationDetailResponse,
+    ReconciliationResponse,
     ReconciliationUpdateRequest,
     reconciliation_from_row,
 )
 from app.schemas.transactions import transaction_from_row
 
-router = APIRouter(prefix="/reconciliations", tags=["reconciliations"])
+router = APIRouter(
+    prefix="/reconciliations", tags=["reconciliations"], responses=ERROR_RESPONSES
+)
 
 
 # ---------------------------------------------------------------------------
 # GET /reconciliations
 # ---------------------------------------------------------------------------
-@router.get("")
+@router.get("", response_model=Paginated[ReconciliationResponse])
 async def list_reconciliations(
     auth_user: CurrentUser,
     account_id: Optional[UUID] = Query(None),
@@ -84,7 +88,7 @@ async def list_reconciliations(
 # ---------------------------------------------------------------------------
 # POST /reconciliations
 # ---------------------------------------------------------------------------
-@router.post("", status_code=201)
+@router.post("", response_model=ReconciliationResponse, status_code=201)
 async def create_reconciliation(
     body: ReconciliationCreateRequest,
     auth_user: CurrentUser,
@@ -111,7 +115,7 @@ async def create_reconciliation(
 # ---------------------------------------------------------------------------
 # GET /reconciliations/{reconciliation_id}
 # ---------------------------------------------------------------------------
-@router.get("/{reconciliation_id}")
+@router.get("/{reconciliation_id}", response_model=ReconciliationDetailResponse)
 async def get_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,
@@ -174,7 +178,7 @@ async def get_reconciliation(
 # ---------------------------------------------------------------------------
 # PUT /reconciliations/{reconciliation_id}
 # ---------------------------------------------------------------------------
-@router.put("/{reconciliation_id}")
+@router.put("/{reconciliation_id}", response_model=ReconciliationResponse)
 async def update_reconciliation(
     reconciliation_id: UUID,
     body: ReconciliationUpdateRequest,
@@ -197,7 +201,7 @@ async def update_reconciliation(
 # ---------------------------------------------------------------------------
 # POST /reconciliations/{reconciliation_id}/complete
 # ---------------------------------------------------------------------------
-@router.post("/{reconciliation_id}/complete")
+@router.post("/{reconciliation_id}/complete", response_model=ReconciliationResponse)
 async def complete_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,
@@ -216,7 +220,7 @@ async def complete_reconciliation(
 # ---------------------------------------------------------------------------
 # POST /reconciliations/{reconciliation_id}/revert
 # ---------------------------------------------------------------------------
-@router.post("/{reconciliation_id}/revert")
+@router.post("/{reconciliation_id}/revert", response_model=ReconciliationResponse)
 async def revert_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,
@@ -235,7 +239,7 @@ async def revert_reconciliation(
 # ---------------------------------------------------------------------------
 # DELETE /reconciliations/{reconciliation_id}
 # ---------------------------------------------------------------------------
-@router.delete("/{reconciliation_id}")
+@router.delete("/{reconciliation_id}", response_model=ReconciliationResponse)
 async def delete_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,
@@ -254,7 +258,7 @@ async def delete_reconciliation(
 # ---------------------------------------------------------------------------
 # POST /reconciliations/{reconciliation_id}/restore
 # ---------------------------------------------------------------------------
-@router.post("/{reconciliation_id}/restore")
+@router.post("/{reconciliation_id}/restore", response_model=ReconciliationResponse)
 async def restore_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,

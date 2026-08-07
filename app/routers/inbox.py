@@ -11,7 +11,7 @@ from fastapi import APIRouter, Header, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import not_found
+from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import inbox as inbox_service
 from app.helpers.formatting import apply_debit_as_negative_inbox
 from app.helpers.idempotency import run_idempotent
@@ -19,17 +19,20 @@ from app.helpers.pagination import paginated_response
 from app.schemas.inbox import (
     InboxCreateRequest,
     InboxPromoteRequest,
+    InboxResponse,
     InboxUpdateRequest,
     inbox_from_row,
 )
+from app.schemas.pagination import Paginated
+from app.schemas.transactions import TransactionResponse
 
-router = APIRouter(prefix="/inbox", tags=["inbox"])
+router = APIRouter(prefix="/inbox", tags=["inbox"], responses=ERROR_RESPONSES)
 
 
 # ---------------------------------------------------------------------------
 # GET /inbox
 # ---------------------------------------------------------------------------
-@router.get("")
+@router.get("", response_model=Paginated[InboxResponse])
 async def list_inbox(
     auth_user: CurrentUser,
     ready: bool = Query(False),
@@ -119,7 +122,7 @@ async def list_inbox(
 # ---------------------------------------------------------------------------
 # POST /inbox
 # ---------------------------------------------------------------------------
-@router.post("", status_code=201)
+@router.post("", response_model=InboxResponse, status_code=201)
 async def create_inbox_item(
     body: InboxCreateRequest,
     auth_user: CurrentUser,
@@ -138,7 +141,7 @@ async def create_inbox_item(
 # ---------------------------------------------------------------------------
 # GET /inbox/{inbox_id}
 # ---------------------------------------------------------------------------
-@router.get("/{inbox_id}")
+@router.get("/{inbox_id}", response_model=InboxResponse)
 async def get_inbox_item(
     inbox_id: UUID,
     auth_user: CurrentUser,
@@ -161,7 +164,7 @@ async def get_inbox_item(
 # ---------------------------------------------------------------------------
 # PUT /inbox/{inbox_id}
 # ---------------------------------------------------------------------------
-@router.put("/{inbox_id}")
+@router.put("/{inbox_id}", response_model=InboxResponse)
 async def update_inbox_item(
     inbox_id: UUID,
     body: InboxUpdateRequest,
@@ -181,7 +184,7 @@ async def update_inbox_item(
 # ---------------------------------------------------------------------------
 # DELETE /inbox/{inbox_id}
 # ---------------------------------------------------------------------------
-@router.delete("/{inbox_id}")
+@router.delete("/{inbox_id}", response_model=InboxResponse)
 async def delete_inbox_item(
     inbox_id: UUID,
     auth_user: CurrentUser,
@@ -200,7 +203,7 @@ async def delete_inbox_item(
 # ---------------------------------------------------------------------------
 # POST /inbox/{inbox_id}/restore
 # ---------------------------------------------------------------------------
-@router.post("/{inbox_id}/restore")
+@router.post("/{inbox_id}/restore", response_model=InboxResponse)
 async def restore_inbox_item(
     inbox_id: UUID,
     auth_user: CurrentUser,
@@ -219,7 +222,8 @@ async def restore_inbox_item(
 # ---------------------------------------------------------------------------
 # POST /inbox/{inbox_id}/promote
 # ---------------------------------------------------------------------------
-@router.post("/{inbox_id}/promote")
+# Promote returns the ledger row the draft became (primary leg for transfers).
+@router.post("/{inbox_id}/promote", response_model=TransactionResponse)
 async def promote_inbox_item(
     inbox_id: UUID,
     body: InboxPromoteRequest,

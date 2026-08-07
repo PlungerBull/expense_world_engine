@@ -51,6 +51,26 @@ app = FastAPI(
     dependencies=[Depends(capture_request_fingerprint)],
 )
 
+def _openapi_without_fastapi_422_stub():
+    """FastAPI's default 422 advertises HTTPValidationError/{detail: [...]},
+    a shape this app never emits (errors are always {"error": {...}} — see
+    errors.py). Every router overrides its 422 with ERROR_RESPONSES, so the
+    stub components are unreferenced; this removes them from the document
+    rather than publishing schemas nothing can ever receive.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = _original_openapi()
+    components = schema.get("components", {}).get("schemas", {})
+    components.pop("HTTPValidationError", None)
+    components.pop("ValidationError", None)
+    app.openapi_schema = schema
+    return schema
+
+
+_original_openapi = app.openapi
+app.openapi = _openapi_without_fastapi_422_stub
+
 app.add_exception_handler(AppError, app_error_handler)
 app.add_exception_handler(RequestValidationError, validation_error_handler)
 app.add_exception_handler(StarletteHTTPException, starlette_http_exception_handler)

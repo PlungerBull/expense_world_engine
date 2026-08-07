@@ -6,6 +6,7 @@ from fastapi import APIRouter, Query
 
 from app import db
 from app.deps import CurrentUser
+from app.errors import ERROR_RESPONSES
 from app.helpers.account_balance import fetch_balances
 from app.helpers.exchange_rate import batch_get_rates, rate_lookup_date
 from app.helpers.monthly_report import (
@@ -15,7 +16,7 @@ from app.helpers.monthly_report import (
 )
 from app.schemas.dashboard import DashboardResponse, dashboard_account_from_row
 
-router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+router = APIRouter(prefix="/dashboard", tags=["dashboard"], responses=ERROR_RESPONSES)
 
 
 async def _load_accounts(
@@ -109,7 +110,7 @@ async def _load_accounts(
 # ACCOUNT still holds real money; an archived category holds only history.
 
 
-@router.get("")
+@router.get("", response_model=DashboardResponse)
 async def get_dashboard(
     auth_user: CurrentUser,
     include_archived: bool = Query(
