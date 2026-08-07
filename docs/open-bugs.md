@@ -36,9 +36,6 @@ Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high
 - **8.2** CREATE snapshots record `hashtag_ids: []` on the batch and transfer paths.
 - **6.6** UUID-valued *body* fields typed `str` (found closing 6.2, 2026-08-07) — `TransactionCreateRequest.account_id/category_id/hashtag_ids`, `TransactionUpdateRequest`'s same four, `TransferField.account_id`, the inbox create/update pair, `ReconciliationCreateRequest.account_id`. Same hazard one layer deeper: garbage reaches SQL as a bind param and 500s. The `id` PKs in the same models are already `UUID`, so each model is internally inconsistent. Converting requires `str()` at the two comparison sites (`helpers/transactions.py` ~507 and ~1142) and mirrors the `str(account_id)` coercion `create_opening_balance` now carries.
 - **6.7** `POST`/`PUT /transactions` accept a system `category_id` — `validate_active_category` checks `deleted_at` only, not `is_system`, so a user can manually file an ordinary expense under `@Transfer`/`@Debt`/`@Opening`, breaking what a non-zero `@Transfer` month means (holes 1–2 in `docs/currency-model-decision.md`; hole 3 closed with 6.5). ⚠️ The fix belongs at the **public boundary**, not inside `validate_active_category`: the internal paths must keep working — `create_transfer_pair` assigns `@Transfer`/`@Debt` itself, and `create_opening_balance` delegates to `create_transaction` with `@Opening`, which calls that same helper. Same boundary-vs-internal shape as 7.4's reserved-name check (closed 2026-08-07).
-- **10.1** 51 of 55 routes declare no `response_model` (only the four in `routers/auth.py` do), so `openapi.json` documents no response shapes.
-- **10.2** Error/shape nits: null-valued keys in `/reports/monthly` `fields`; `warnings` present on delete/restore but absent elsewhere; `system_key` missing from category responses; `GET /exchange-rates` 404 vs write paths' 422 for the same condition; transfer sibling gets no `inbox_id` on promote; `primary_id == sibling_id` checked late and outside the accumulate-errors pattern.
-
 ---
 
 ## ⚪ Low
@@ -61,5 +58,6 @@ missing `transaction_source = 1`.
 | **D6** | Exempt `POST /auth/pat` from idempotency snapshot storage. |
 | **D7** | Person accounts uncreatable = parked feature gap, not a defect. Correct the spec's People API claims. |
 | **D8** | ~~`parent_transaction_id` stays reserved and `null`.~~ **Superseded by the 2026-08-04 audit:** the column was a placeholder, not a foundation — dropped in `sql/024` (WP5). Splits get designed fresh if they ever ship; the parent-exclusion predicate they will need is preserved in `sql/022`'s header. |
+| **D9** | `warnings` stays **scoped** to the endpoints that can actually produce one (transaction delete/restore) — closing 10.2, a uniform `warnings: []` on every mutation was proposed and declined (2026-08-07). Uniformity is for *representation* rules (IDs-only, sign convention), where a carve-out rots; `warnings` is endpoint-specific *content*, and an always-empty key on ~30 endpoints is structure without meaning. The rule is stated in engine-spec's conventions ("Warnings channel"), so scoped reads as designed, not accidental. |
 
 Closed entries are deleted, not listed — `git log -- docs/open-bugs.md` holds them.

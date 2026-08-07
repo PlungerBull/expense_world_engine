@@ -26,6 +26,10 @@ This holds on **every** amount-bearing column in **every** table, including the 
 
 **Null over omission:** All optional fields are always present in responses, set to `null` when empty. The response shape never changes based on data presence.
 
+**Warnings channel:** An endpoint whose operation can produce a side-effect note carries `warnings: list[str]` in its response — always present *on that endpoint*, empty when the operation is clean. Currently: `DELETE /transactions/{id}` and `POST /transactions/{id}/restore` (reconciliation-staleness notes). The key exists exactly where a warning can occur, **not** on every mutation — a deliberate scope (decision D9 in `open-bugs.md`, 2026-08-07): uniformity is for representation rules, not endpoint-specific content, and an always-empty key on every write would be structure without meaning. Null-over-omission holds within each endpoint: where the key exists, it is never omitted. An endpoint that gains a real warning to emit adopts this same envelope.
+
+**OpenAPI is enforced, not decorative (2026-08-07, bug 10.1):** Every route declares a `response_model`, and a first-time write's body is serialized *through* that model — `run_idempotent` returns the plain dict and FastAPI validates it, so a stale declaration is a loud test failure, not doc drift. Idempotent replays bypass the model by design: they return the stored snapshot verbatim. Corollary of model-filtering: a new response field does not exist on the wire until it is added to the model (`tests/test_openapi_contract.py` pins live-vs-declared key sets). The documented 422 everywhere is the error envelope above; FastAPI's default `HTTPValidationError` stub is stripped from `openapi.json` because the app never emits it.
+
 **Error format:**
 ```json
 {
@@ -491,7 +495,7 @@ The same value rules as `POST` apply: `amount_cents` must be non-zero, `title` n
 ### `DELETE /transactions/{id}`
 Soft-delete. The balance sum excludes soft-deleted rows, so setting `deleted_at` is the reversal — there is no separate balance write.
 
-**Response shape:** Always includes a `warnings: list[str]` field. Empty list when the delete is clean; populated with one or more strings when something notable happened. Currently the only warning emitted is `"Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."` — the delete is still allowed (the engine does not auto-adjust the reconciliation's totals); the field surfaces the staleness so clients can render a notice.
+**Response shape:** Always includes a `warnings: list[str]` field (the "Warnings channel" convention above — this endpoint and restore are its two members). Empty list when the delete is clean; populated with one or more strings when something notable happened. Currently the only warning emitted is `"Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."` — the delete is still allowed (the engine does not auto-adjust the reconciliation's totals); the field surfaces the staleness so clients can render a notice.
 
 If the transaction has a `transfer_transaction_id`, both the transaction and its paired sibling are soft-deleted atomically.
 

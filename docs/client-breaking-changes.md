@@ -11,6 +11,39 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-07 — error/shape fixes: FX lookup `422` for bad currency, report error fields pruned, transfer sibling carries `inbox_id`, OpenAPI shapes are real (bugs 10.1/10.2)
+
+**Engine change.** Four behavioral pieces; the additive ones (`system_key` on
+category responses — nullable, ignorable) are not listed per this doc's rule.
+
+1. **`GET /exchange-rates` with an unsupported currency returns `422
+   VALIDATION_ERROR`** (field-scoped: `base` and/or `target`), previously
+   `404 NOT_FOUND`. `404` now means exactly one thing: a supported pair with
+   no rate row on/before the requested date. A client branching on `404` to
+   mean "no data yet" keeps working; one that sent unsupported codes and
+   expected `404` must treat the new `422` as the input error it always was.
+2. **`/reports/monthly` validation errors no longer include null-valued keys
+   in `fields`.** `?year=2026` now yields `fields: {"month": "required"}`,
+   previously `{"year": null, "month": "required"}`. A client iterating
+   `Object.keys(error.fields)` stops rendering spurious "year: null" rows;
+   nothing else changes.
+3. **Promoting a transfer draft sets `inbox_id` on BOTH ledger legs**,
+   previously the primary only. The sibling's `inbox_id: null` no longer
+   reads as "never was in the inbox". Rows promoted before 2026-08-07 keep
+   their null sibling backlink — treat null as "no recorded lineage", not
+   "not from the inbox".
+4. **`openapi.json` now documents every route's response shape**, and the
+   default FastAPI `HTTPValidationError` 422 stub (a shape the engine never
+   emitted) is gone — 422s document the real `{"error": {...}}` envelope.
+   A client generating types from the OpenAPI doc will see them all appear;
+   regenerate rather than pinning the old shapeless doc.
+
+Also in this batch, invisible to correct clients: the `transfer.id ≠ id`
+check is accumulated into the single 422 with the other transfer field
+errors (same status, same field key — one round trip instead of two).
+
+---
+
 ## 2026-08-07 — malformed UUID path/query params return `422`, previously `500`
 
 **Engine change.** Bug 6.2. Every UUID-valued path parameter (`/{account_id}`,
