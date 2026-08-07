@@ -19,11 +19,33 @@ from app.constants import (
     ActivityAction,
     SystemCategoryKey,
 )
-from app.errors import conflict, forbidden, not_found
+from app.errors import conflict, forbidden, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.helpers.validation import normalize_name
 from app.schemas.categories import category_from_row
+
+# Reserved display names, folded to match the case-insensitive
+# expense_categories_user_lower_name_active index (sql/012). Derived from the
+# constant so a new system category is reserved automatically. Only *user*
+# categories are checked against this set — system rows rename freely
+# (including back to their own default), because lookup is by system_key.
+RESERVED_CATEGORY_NAMES = {n.lower() for n in SYSTEM_CATEGORY_DEFAULT_NAMES.values()}
+
+
+def _reject_reserved_name(name: str) -> None:
+    """422 when a non-system category tries to claim a reserved name.
+
+    Without this, the user's category squats the name and every later
+    ``ensure_system_category`` seed hits the LOWER(name) unique index —
+    which its ON CONFLICT arbiter does not cover — 500ing transfers and
+    opening balances forever (bug 7.4).
+    """
+    if name.lower() in RESERVED_CATEGORY_NAMES:
+        raise validation_error(
+            "Category name validation failed.",
+            {"name": f"'{name}' is reserved for system categories."},
+        )
 
 
 async def ensure_system_category(
@@ -53,21 +75,33 @@ async def ensure_system_category(
         return str(row["id"])
 
     default_name = SYSTEM_CATEGORY_DEFAULT_NAMES[key]
-    row = await conn.fetchrow(
-        """
-        INSERT INTO expense_categories
-            (id, user_id, name, color, is_system, system_key, created_at, updated_at)
-        VALUES ($1, $2, $3, '#6b7280', true, $4, now(), now())
-        ON CONFLICT (user_id, system_key)
-            WHERE system_key IS NOT NULL AND deleted_at IS NULL
-            DO NOTHING
-        RETURNING id
-        """,
-        str(uuid.uuid4()),
-        user_id,
-        default_name,
-        key.value,
-    )
+    try:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO expense_categories
+                (id, user_id, name, color, is_system, system_key, created_at, updated_at)
+            VALUES ($1, $2, $3, '#6b7280', true, $4, now(), now())
+            ON CONFLICT (user_id, system_key)
+                WHERE system_key IS NOT NULL AND deleted_at IS NULL
+                DO NOTHING
+            RETURNING id
+            """,
+            str(uuid.uuid4()),
+            user_id,
+            default_name,
+            key.value,
+        )
+    except asyncpg.UniqueViolationError:
+        # The arbiter above covers only the system_key index. A violation
+        # landing here is the LOWER(name) index: a *user* category is
+        # squatting the reserved name. New squatters are rejected at the
+        # category boundary (_reject_reserved_name), but rows created before
+        # that check shipped can still exist — surface a clean 409 with the
+        # remedy instead of a 500 (bug 7.4).
+        raise conflict(
+            f"A category named '{default_name}' already exists and is not the "
+            f"system category. Rename it to enable this operation."
+        )
     if row is not None:
         return str(row["id"])
 
@@ -80,6 +114,11 @@ async def ensure_system_category(
         user_id,
         key.value,
     )
+    if row is None:
+        # DO NOTHING fired, yet the re-read found nothing: the concurrent
+        # seeder's row was soft-deleted in between. Vanishingly rare; a clean
+        # retryable 409 beats the TypeError this used to raise.
+        raise conflict("System category seeding raced with a concurrent delete. Retry.")
     return str(row["id"])
 
 
@@ -94,11 +133,13 @@ async def create_category(
     """Validate uniqueness, insert, and log the creation.
 
     Raises:
-        validation_error: name is empty after stripping.
+        validation_error: name is empty after stripping, or is a reserved
+            system-category name (created rows are never system rows).
         conflict: a non-deleted category with the same name (case-insensitive)
             or id already exists.
     """
     name = normalize_name(name)
+    _reject_reserved_name(name)
     existing = await conn.fetchrow(
         """
         SELECT id FROM expense_categories
@@ -172,9 +213,13 @@ async def update_category(
 
     before = category_from_row(before_row)
 
-    # Name normalization + case-insensitive uniqueness
+    # Name normalization + reserved-name guard + case-insensitive uniqueness.
+    # System rows skip the reserved check: they may rename freely, including
+    # back to their own default name — lookup is by system_key, never by name.
     if "name" in fields:
         fields["name"] = normalize_name(fields["name"])
+        if before_row["system_key"] is None:
+            _reject_reserved_name(fields["name"])
         dup = await conn.fetchrow(
             """
             SELECT id FROM expense_categories

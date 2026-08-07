@@ -286,6 +286,8 @@ Returns all active categories, sorted by `sort_order`. System categories (`is_sy
 
 **Name normalization:** `name` is trimmed before storage. An empty-after-trim name returns `422 VALIDATION_ERROR` with `fields: {"name": "Must not be empty."}`. Uniqueness is **case-insensitive** per user: "Food", "food", and "FOOD" collide. A conflicting name returns `409 CONFLICT`. The database enforces this with a partial unique index on `(user_id, LOWER(name)) WHERE deleted_at IS NULL`, so deleting a category and creating a new one with the same name works as expected.
 
+**Reserved names:** the system-category display names (`@Debt`, `@Transfer`, `@Opening` — derived from `SYSTEM_CATEGORY_DEFAULT_NAMES`, compared case-insensitively) cannot be claimed by a user category. Attempting to returns `422 VALIDATION_ERROR` with `fields: {"name": "… is reserved for system categories."}`. Without this, a user category squatting the name would make every later system-category seed hit the `LOWER(name)` unique index — which the seed's `ON CONFLICT (user_id, system_key)` arbiter does not cover — permanently 500ing transfers or opening balances (closed bug 7.4). As defense in depth for rows created before this check existed, the seeding INSERT itself catches the violation and returns a clean `409` naming the remedy (rename the squatting category).
+
 Categories carry no type restriction. The same category can be used on expenses, income, and transfers — including refunds (same category as the original expense, positive amount).
 
 **Auto-creation (engine-side, not via this endpoint):**
@@ -295,7 +297,7 @@ Categories carry no type restriction. The same category can be used on expenses,
 All are created with `is_system = true` and a stable `system_key` column (`"debt"` / `"transfer"` / `"opening_balance"`) — the engine looks them up by `system_key`, not by display name. This means users can freely rename the display text without breaking the pipelines that depend on them (which was a bug before the `system_key` column was added).
 
 ### `PUT /categories/{id}`
-System categories (`is_system = true`) CAN be renamed — the engine identifies them by `system_key`, not by `name`. Any other field is also editable. Returns `404` if the category is missing. The same name normalization rules as `POST` apply: renames are trimmed, empty names return `422`, and case-insensitive conflicts return `409`.
+System categories (`is_system = true`) CAN be renamed — the engine identifies them by `system_key`, not by `name`. Any other field is also editable. Returns `404` if the category is missing. The same name normalization rules as `POST` apply: renames are trimmed, empty names return `422`, and case-insensitive conflicts return `409`. The reserved-name rule applies to renames of **non-system** categories only: a system row may take any name, including its own default back; a user row renamed to `@Debt`/`@Transfer`/`@Opening` (any casing) returns `422`.
 
 ### `DELETE /categories/{id}`
 Soft-delete. Returns `409` if the category is referenced by any non-deleted transaction (inbox or ledger). System categories (`is_system = true`) always return `403` — they must remain available for the transfer pipeline.
