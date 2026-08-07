@@ -47,8 +47,9 @@ Corollaries:
 
 - **Fix at the root, not at the call site.** A guard added to stop one symptom is a
   smell — ask what design let the symptom exist. (Standing example: the transfer-leg
-  field guard is *still* a deny-list that forgets `category_id` — bug 6.5. The root
-  fix is inverting it to an allow-list, not adding one more field.)
+  field guard shipped as a deny-list and forgot `category_id` — bug 6.5, closed
+  2026-08-07. The root fix was inverting it to an allow-list, not adding one more
+  field; `ALLOWED_ON_TRANSFER_LEG` now blocks every future field by default.)
 - **Fail closed.** Enumerate what is *permitted*, never what is forbidden. New
   fields must default to blocked, unknown input must 422 rather than be silently
   dropped, and missing data must surface as `null` + a flag rather than a

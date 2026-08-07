@@ -457,31 +457,28 @@ Without this, the `@Transfer` semantics above are unenforceable — the two
 non-zero cases stop being the *only* two, and the category is no longer a
 trustworthy FX indicator.
 
-### Three holes, all currently open
+### Three holes, two still open
 
 | # | Hole | Where |
 |---|---|---|
 | 1 | `POST /transactions` accepts a system `category_id` | `validate_active_category` (`helpers/validation.py:94-114`) checks `deleted_at` and `is_archived` but **not `is_system`**; no other guard found |
 | 2 | `PUT /transactions/{id}` can move an ordinary transaction *into* a system category | same missing check |
-| 3 | `PUT /transactions/{id}` can move a transfer leg *out of* `@Transfer` | the transfer edit guard in `helpers/transactions.update_transaction` blocks `amount_cents`, `account_id`, `date` — **`category_id` is not in the set**, and it is a deny-list, which is the shape that produces exactly this omission. Filed as open bug **6.5** on 2026-08-05. |
+| 3 | ~~`PUT /transactions/{id}` can move a transfer leg *out of* `@Transfer`~~ | **Closed 2026-08-07** (was bug 6.5): the transfer edit guard in `helpers/transactions.update_transaction` is now an allow-list (`ALLOWED_ON_TRANSFER_LEG = {title, description, cleared}`), so `category_id` — and any future field — is blocked on a transfer leg by default. |
 
-Hole 3 is the mirror image of 1 and 2 and breaks the invariant just as
+Hole 3 was the mirror image of 1 and 2 and broke the invariant just as
 effectively: re-categorising one leg of a pair leaves the other stranded in
 `@Transfer` with nothing to cancel against — indistinguishable from a loan.
 
-### Fix
+### Fix (for the two still open)
 
 - Reject `is_system = true` category targets at the **public boundary** (request
   validation), returning `422`. The internal paths must keep working:
   `create_transfer_pair` assigns `@Transfer`/`@Debt`, and
   `create_opening_balance` delegates to `create_transaction` with `@Opening`.
-  Same public-boundary-plus-internal-path shape as open bug 7.4.
-- Add `category_id` to the transfer edit guard's blocked set.
-
-Coordinate with **open bug 7.4** (finding 7.4 of the 2026-08-01 audit — not the WP7
-documentation package), which rejects reserved system-category *names* at the
-same boundary. Together they make `@Transfer` mean exactly what this document
-says it means.
+  Same public-boundary-plus-internal-path shape as bug 7.4's reserved-name
+  check (closed 2026-08-07), which rejects reserved system-category *names* at
+  the same boundary. Together they make `@Transfer` mean exactly what this
+  document says it means.
 
 ---
 

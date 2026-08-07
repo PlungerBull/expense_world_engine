@@ -71,6 +71,12 @@ from app.schemas.transactions import (
     transaction_from_row,
 )
 
+# Fields a transfer leg may change via PUT — everything else in ``fields`` is
+# rejected by the guard in ``update_transaction``. See the comment there for
+# why these three are safe and why ``hashtag_ids``/``reconciliation_id`` are
+# absent (they never enter ``fields``).
+ALLOWED_ON_TRANSFER_LEG = {"title", "description", "cleared"}
+
 
 # ---------------------------------------------------------------------------
 # hashtag_ids attach helpers (shared by every transaction-returning endpoint)
@@ -433,7 +439,8 @@ async def update_transaction(
     service raises 422 rather than silently dropping them.
 
     Transfer edit guard: if this transaction is part of a transfer pair,
-    ``amount_cents`` and ``account_id`` changes are rejected (transfers
+    only the fields in ``ALLOWED_ON_TRANSFER_LEG`` (title, description,
+    cleared) may change; anything else is rejected with 422 (transfers
     are edited by deleting and recreating).
 
     Args:
@@ -516,27 +523,33 @@ async def update_transaction(
                 {"reconciliation_id": "Cannot assign transactions to a completed reconciliation."},
             )
 
-    # Transfer edit guard — reject changes that would desync the pair.
-    # ``date`` is blocked because this PUT path mutates only the edited leg,
-    # and both legs of a pair are required to share ``primary_date`` — a
-    # one-sided date change lands them in different months, which is what
-    # would let @Transfer report a spread that was never paid. Transfers are
-    # edited by delete + recreate.
+    # Transfer edit guard — allow-list. On a transfer leg, only fields with
+    # no cross-leg invariant may change; everything else is rejected, so a
+    # column added to TransactionUpdateRequest later is blocked here by
+    # default. Transfers are otherwise edited by delete + recreate.
     #
-    # ``exchange_rate`` and ``amount_home_cents`` used to be in this set;
-    # sql/021 deleted both columns, so there is nothing left to block.
+    # Why the allowed three are safe: ``title`` and ``description`` are pure
+    # display; ``cleared`` is genuinely per-leg (each leg clears at its own
+    # bank on its own schedule). ``hashtag_ids`` and ``reconciliation_id``
+    # never appear in ``fields`` — the router passes them as separate
+    # parameters — and both are per-leg too (a reconciliation is scoped to
+    # one account, and the legs are on different accounts), so they need no
+    # handling here.
     #
-    # ⚠️ This is a deny-list, which is the shape CLAUDE.md's "fix at the root"
-    # corollary warns about: ``category_id`` is absent, so one leg of a pair
-    # can still be moved out of @Transfer, stranding the other with nothing to
-    # cancel against. Inverting it to an allow-list is the real fix; it is out
-    # of WP2's scope and is filed in docs/open-bugs.md.
+    # Why the rest are blocked: a one-sided ``amount_cents`` change breaks
+    # the pair's netting; ``account_id`` moves a leg to an account the pair
+    # was never between; ``date`` lands the legs in different months, which
+    # is what would let @Transfer report a spread that was never paid; and
+    # ``category_id`` moves one leg out of @Transfer/@Debt, stranding the
+    # sibling with nothing to cancel against. Blocked outright rather than
+    # mirrored — the legs legitimately hold *different* categories (@Debt on
+    # a person leg, @Transfer on the real one).
     if before_row["transfer_transaction_id"] is not None:
-        blocked = {"amount_cents", "account_id", "date"} & fields.keys()
+        blocked = set(fields) - ALLOWED_ON_TRANSFER_LEG
         if blocked:
             raise validation_error(
                 "Transfer edits not yet supported.",
-                {f: "Cannot modify on a transfer transaction." for f in blocked},
+                {f: "Cannot modify on a transfer transaction." for f in sorted(blocked)},
             )
 
     # Process amount_cents change

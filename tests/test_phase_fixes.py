@@ -108,16 +108,18 @@ async def test_hashtag_name_case_insensitive_uniqueness(client, test_data):
 
 
 # ---------------------------------------------------------------------------
-# Transfer edit guard — date rejected on transfer legs
+# Transfer edit guard — allow-list: only title/description/cleared per leg
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_transfer_edit_guard_rejects_date(client, test_data):
-    """PUT on a transfer leg must reject `date` with 422.
+async def test_transfer_edit_guard_allowlist(client, test_data):
+    """PUT on a transfer leg rejects everything outside the allow-list with 422.
 
-    The PUT path mutates only the edited leg, so letting a date change through
-    would desync the pair — the two legs are required to share a date, and
-    splitting them across a month boundary would make @Transfer report a spread
-    that was never paid.
+    The guard is an allow-list (bug 6.5): only ``title``, ``description`` and
+    ``cleared`` — fields with no cross-leg invariant — may change on a leg.
+    ``amount_cents`` breaks the pair's netting, ``account_id`` moves a leg to
+    an account the pair was never between, ``date`` splits the legs across
+    months (a phantom @Transfer spread), and ``category_id`` strands the
+    sibling in @Transfer with nothing to cancel against.
 
     `exchange_rate` used to be asserted here alongside `date`. It is gone: since
     sql/021 there is no such column and no such request field, and rejecting it
@@ -164,16 +166,19 @@ async def test_transfer_edit_guard_rejects_date(client, test_data):
 
         async with db.pool.acquire() as conn:
             before_primary = await conn.fetchrow(
-                "SELECT date, amount_cents, account_id FROM expense_transactions WHERE id = $1",
+                "SELECT date, amount_cents, account_id, category_id FROM expense_transactions WHERE id = $1",
                 primary_id,
             )
             before_sibling = await conn.fetchrow(
-                "SELECT date, amount_cents, account_id FROM expense_transactions WHERE id = $1",
+                "SELECT date, amount_cents, account_id, category_id FROM expense_transactions WHERE id = $1",
                 sibling_id,
             )
 
         for field, payload in (
             ("date", {"date": "2026-04-20T12:00:00Z"}),
+            ("amount_cents", {"amount_cents": -2000}),
+            ("account_id", {"account_id": second_account_id}),
+            ("category_id", {"category_id": test_data.category_id}),
         ):
             r = await client.put(
                 f"/v1/transactions/{primary_id}",
@@ -187,15 +192,31 @@ async def test_transfer_edit_guard_rejects_date(client, test_data):
 
         async with db.pool.acquire() as conn:
             after_primary = await conn.fetchrow(
-                "SELECT date, amount_cents, account_id FROM expense_transactions WHERE id = $1",
+                "SELECT date, amount_cents, account_id, category_id FROM expense_transactions WHERE id = $1",
                 primary_id,
             )
             after_sibling = await conn.fetchrow(
-                "SELECT date, amount_cents, account_id FROM expense_transactions WHERE id = $1",
+                "SELECT date, amount_cents, account_id, category_id FROM expense_transactions WHERE id = $1",
                 sibling_id,
             )
         assert dict(after_primary) == dict(before_primary), "primary leg was mutated by a rejected PUT"
         assert dict(after_sibling) == dict(before_sibling), "sibling leg was mutated by a rejected PUT"
+
+        # The allow-list itself: per-leg display/state fields still go through.
+        allowed_r = await client.put(
+            f"/v1/transactions/{primary_id}",
+            json={"title": "renamed leg", "description": "per-leg note", "cleared": True},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert allowed_r.status_code == 200, allowed_r.text
+        assert allowed_r.json()["title"] == "renamed leg"
+        async with db.pool.acquire() as conn:
+            sibling_after_allowed = await conn.fetchrow(
+                "SELECT date, amount_cents, account_id, category_id, title FROM expense_transactions WHERE id = $1",
+                sibling_id,
+            )
+        assert dict(sibling_after_allowed) == {**dict(before_sibling), "title": sibling_after_allowed["title"]}
+        assert sibling_after_allowed["title"] != "renamed leg", "allowed edit leaked onto the sibling leg"
 
     finally:
         if created_ids:
