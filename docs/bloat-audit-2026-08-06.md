@@ -12,21 +12,17 @@ The rework achieved its stated goals: every sacred convention is genuinely singl
 
 ## Correctness-relevant drift (fix first)
 
-These came out of the duplication analysis but are defects today, not just cleanups:
+These came out of the duplication analysis but are defects today, not just cleanups.
 
-1. **Three reconciliation-status fetches have no `user_id` filter** — `app/helpers/transactions.py:456`, `:750`, `:916` read `SELECT … FROM expense_reconciliations WHERE id = $1` with no tenant predicate; the fourth copy (`:469`) has it. CLAUDE.md classes a missing `user_id` filter as a security defect. One shared `fetch_recon_status(conn, user_id, recon_id)` closes all three.
-2. **Eight request models silently drop unknown fields** — `extra="forbid"` is copy-pasted onto 9 models and absent from 8: `AccountUpdateRequest` (`schemas/accounts.py:32`), `CategoryCreateRequest`/`CategoryUpdateRequest` (`schemas/categories.py:8`, `:15`), `HashtagCreateRequest`/`HashtagUpdateRequest` (`schemas/hashtags.py:8`, `:14`), `PatCreateRequest` (`schemas/pat.py:7`), `InboxPromoteRequest` (`schemas/inbox.py:53`), `TransactionBatchRequest` (`schemas/transactions.py:52`). Violates fail-closed ("unknown input must 422"). Fix: shared `StrictModel` base in the empty `schemas/__init__.py`; every request model inherits it.
-3. **`monthly_report` runs an expression the parity test doesn't pin** — `monthly_report.py:74` re-derives `signed_expr(HOME_CENTS_EXPR)` locally while the exported `home_currency.SIGNED_HOME_CENTS_EXPR` (`home_currency.py:276`) is consumed only by `tests/test_home_currency_parity.py`. One-line import fix restores the coverage the test is assumed to provide.
-4. **`pat.py:27-31` comment claims JWT auth and RLS scoping** — both deleted/inert; it asserts a security control that does not exist. Rewrite to PAT-only + engine-side scoping. (Lesser stale wording: `idempotency.py:156`, `auth_token.py:13`, `routers/accounts.py:66` names `_get_home_balance` which no longer exists, and the dead `amount_home_cents` comment tail at `schemas/transactions.py:61-67`.)
+*Items 1–4 and 7 fixed 2026-08-06 (commits `6ac4deb`…`040f1a7`): `fetch_recon_status` closes the three unscoped fetches; `schemas.StrictModel` closes the strictness gap (found to be 10 models, not 8 — the nested `TransferField`/`InboxTransferField` were also leaky); `SIGNED_HOME_CENTS_EXPR` is imported; the stale JWT/RLS comments are rewritten; `rate_lookup_date` resolves "today" in `display_timezone` (owner decision), and the fix surfaced + closed a pre-existing 500 on junk stored timezones reaching `AT TIME ZONE` (`validation.resolve_timezone`). The two rows below are deferred by owner decision into the Duplicates §3 `reference_data.py` refactor, where both land single-sourced:*
+
 5. **The `sort_order` append convention is unimplemented** — no `MAX(sort_order)` exists anywhere in `app/` or `sql/`; all three creates use `sort_order or 0` (`accounts.py:120`, `categories.py:125`, `hashtags.py:61`), so every new row lands at 0 and CLAUDE.md's "new rows append max+1" is false. (`or 0` also collapses an explicit `sort_order: 0` into the default.) Behavior change if fixed — log in `docs/client-breaking-changes.md`.
 6. **Account names skipped the rules categories/hashtags enforce** — no `normalize_name`, case-**sensitive** uniqueness (`accounts.py:93`, `:253` use `name = $2`, not `LOWER()`), and no restore-collision check (`restore_account`, `accounts.py:369-403`, vs `categories.py:290` / `hashtags.py:239`). Product of the triplicated CRUD body (see Duplicates §3).
-7. **"Today" for rate lookups is UTC in 4 places while reports use `display_timezone`** — `helpers/accounts.py:57`, `routers/accounts.py:82`, `routers/dashboard.py:71`, `routers/exchange_rates.py:23` all use `datetime.now(timezone.utc).date()`; balances and reports can disagree near midnight in `America/Lima`. Owner decision needed on which rule is right; either way, one `rate_lookup_date()` helper.
 
 ---
 
 ## Dead Code — Delete
 
-- **`app/helpers/transactions.py:70`** — `TransactionUpdateRequest` imported, never used (the only unused import in the app; verified by ruff/pyflakes and by hand).
 - **`InboxStatus.PROMOTED` (constants.py:73) has zero references** — the one place it is assigned writes literal `2` (`inbox.py:632`). Same read-side-enum/write-side-literal split for `ReconciliationStatus` (`reconciliations.py:150`, `:322`, `:392`) and `InboxStatus.PENDING` (`inbox.py:446`). Fix by *using* the enums at write sites, not deleting them.
 - **`bootstrap` redundant existence probe** — `auth.py:79-100` probes `SELECT user_id`, discards it, then re-fetches `SELECT *` on the common path. Widen the probe and reuse it; one round trip saved per login.
 - **Dead columns in projections** — `transfers.py:72`, `:83` select `currency_code` never read; `inbox.py:487` likewise. Residue of the deleted pre-`sql/021` dominant-side FX rule.
@@ -36,7 +32,7 @@ These came out of the duplication analysis but are defects today, not just clean
 
 ## Unused Imports — Delete
 
-- `app/helpers/transactions.py:70` — `TransactionUpdateRequest`. **That is the complete list** — every other file in `app/` is clean (ruff `F401,F811,F841` + pyflakes verified by two agents independently).
+- None remaining. The one hit (`app/helpers/transactions.py` — `TransactionUpdateRequest`) was deleted 2026-08-06; every other file in `app/` was already clean (ruff `F401,F811,F841` + pyflakes verified by two agents independently).
 
 ---
 
@@ -122,7 +118,6 @@ Active-row: `routers/accounts.py:141`, `routers/categories.py:75`, `routers/hash
 | `transaction_source = 1` | `transactions.py:100,144,204,222,683,718,977,1021` | `TransactionSource(IntEnum): LEDGER = 1; INBOX = 2` in `constants.py` (confirm inbox value against schema) |
 | Idempotency TTL | `idempotency.py:103` (`interval '24 hours'` inside an SQL string) | `IDEMPOTENCY_TTL_HOURS = 24`, testable |
 | Hex color defaults | `accounts.py:119` (`#3b82f6`), `categories.py:60` (`#6b7280`) — restating `sql/003` column DEFAULTs | omit the column when caller passed nothing; let the DB default own it |
-| "Today" for rate lookups | `helpers/accounts.py:57` · `routers/accounts.py:82` · `routers/dashboard.py:71` · `routers/exchange_rates.py:23` | `rate_lookup_date()` in `exchange_rate.py` (see Correctness §7 for the timezone question) |
 
 ## Dependency Report
 
@@ -145,7 +140,7 @@ Active-row: `routers/accounts.py:141`, `routers/categories.py:75`, `routers/hash
 
 ## Suggested execution order
 
-1. **Correctness first (small, self-contained):** the three missing `user_id` filters; `StrictModel`; the `SIGNED_HOME_CENTS_EXPR` import; the `pat.py` security comment; delete the unused import.
+1. ~~**Correctness first (small, self-contained)**~~ — ✅ done 2026-08-06, including the `rate_lookup_date` timezone decision (Correctness items 5–6 ride with step 3).
 2. **`query_builder` layer:** `fetch_owned_row(_or_404)`; `soft_delete_with_audit`/`restore_with_audit`; route `transactions.py` through the existing helpers (pure deletion).
 3. **`reference_data.py` ResourceSpec extraction** — deciding account-name normalization and `sort_order` max+1 on the way (both behavior changes → `client-breaking-changes.md`).
 4. **Tier 2 twins:** `_delete_leg`/`_restore_leg` + junction cascade, `_transition_status`, `assert_opposite_signs`, validation predicates.
