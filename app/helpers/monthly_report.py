@@ -60,18 +60,18 @@ import asyncpg
 from app.constants import HOME_CURRENCY
 from app.errors import settings_missing
 from app.helpers.home_currency import (
-    HOME_CENTS_EXPR,
+    SIGNED_HOME_CENTS_EXPR,
     UNCONVERTIBLE_FLAG_EXPR,
     home_rate_join,
-    signed_expr,
 )
 
-# Built once at import. The magnitude is the read-time conversion, not a stored
-# column: helpers/home_currency.HOME_CENTS_EXPR resolves the rate for the row's
-# date through the lateral join below. Until sql/021 this read
-# ``COALESCE(t.amount_home_cents, t.amount_cents)``, which did not convert — it
-# relabelled, reading USD cents as PEN cents.
-_SIGNED_HOME_CENTS_SQL = signed_expr(HOME_CENTS_EXPR)
+# SIGNED_HOME_CENTS_EXPR is imported, never re-derived here via
+# signed_expr(HOME_CENTS_EXPR) — the two are byte-identical, but only the
+# exported constant is what tests/test_home_currency_parity.py pins, so
+# importing it is what makes that coverage apply to the SQL this module runs.
+# (Until sql/021 the magnitude here read
+# ``COALESCE(t.amount_home_cents, t.amount_cents)``, which did not convert —
+# it relabelled, reading USD cents as PEN cents.)
 
 # Both queries below bind $1 user_id, $2 start, $3 end — so the timezone, which
 # must be BOUND and never interpolated (it is unvalidated user input), is $4.
@@ -187,7 +187,7 @@ async def compute_month_flow(
             SELECT
                 t.id,
                 t.category_id,
-                {_SIGNED_HOME_CENTS_SQL} AS signed_home_cents,
+                {SIGNED_HOME_CENTS_EXPR} AS signed_home_cents,
                 {UNCONVERTIBLE_FLAG_EXPR} AS is_unconvertible,
                 COALESCE(
                     (
@@ -263,7 +263,7 @@ async def compute_month_flow(
         f"""
         WITH signed_txns AS (
             SELECT
-                {_SIGNED_HOME_CENTS_SQL} AS signed_home_cents,
+                {SIGNED_HOME_CENTS_EXPR} AS signed_home_cents,
                 {UNCONVERTIBLE_FLAG_EXPR} AS is_unconvertible
             FROM expense_transactions t
             LEFT JOIN expense_bank_accounts a ON a.id = t.account_id
