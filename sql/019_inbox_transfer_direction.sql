@@ -33,7 +33,7 @@
 -- meant the sibling was receiving, so the primary was the outflow leg.
 --
 -- The ledger's equivalent CHECK constraints (expense_transactions) are NOT here.
--- They belong to the transfer collapse -- see docs/rework/WP1-transfer-collapse.md,
+-- They belong to the transfer collapse -- see sql/020 (WP1 of the deletion program),
 -- which also deletes the transfer_direction column this migration added. That is not
 -- a reversal: the lesson holds (direction lives in a typed column, never in a sign),
 -- the direction just moves to transaction_type, which every row already carries.

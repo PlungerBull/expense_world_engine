@@ -97,8 +97,8 @@ class DashboardResponse(BaseModel):
     # `archived_categories` and `archived_hashtags` used to sit here. Archiving a
     # category was never a distinct feature — soft delete already hides a row
     # from pickers while leaving its past transactions intact — and these panels
-    # were the last readers of `is_archived` on those two tables (docs/rework/WP2,
-    # then WP5). An archived ACCOUNT is different: it still holds real money,
+    # were the last readers of `is_archived` on those two tables (WP2 of the
+    # deletion program, then sql/024). An archived ACCOUNT is different: it still holds real money,
     # which is why this one panel survives.
     archived_accounts: Optional[list[DashboardAccount]] = Field(
         None,

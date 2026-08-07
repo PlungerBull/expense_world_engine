@@ -1,7 +1,7 @@
 """Integration tests for the account archive/unarchive surface.
 
 Accounts are the only archivable resource. Category and hashtag archiving
-was deleted by sql/024 (docs/rework/WP5): archiving them was never distinct
+was deleted by sql/024 (WP5 of the deletion program): archiving them was never distinct
 from soft deleting them — `deleted_at` already hides a row from pickers
 while leaving its past transactions intact. An archived ACCOUNT is
 different: it still holds real money, so it keeps its flag, its two routes,
@@ -96,7 +96,7 @@ async def test_dashboard_default_omits_archived_accounts(client):
 
     There is exactly one archived panel. `archived_categories` and
     `archived_hashtags` were deleted with the read-time currency work
-    (docs/rework/WP2), and sql/024 (WP5) then dropped `is_archived` from
+    (WP2, sql/021 era), and sql/024 (WP5) then dropped `is_archived` from
     those two tables entirely.
     """
     r = await client.get("/v1/dashboard")

@@ -424,10 +424,11 @@ async def promote_inbox_item(
          and reference active resources (account, category).
       3. Branch on transfer vs non-transfer:
            - Transfer: delegate to ``create_transfer_pair``, passing
-             ``inbox_id`` so both ledger legs are linked back to the
-             inbox row for audit.
-           - Non-transfer: insert a single ledger row, apply the
-             balance delta, write an activity log for the new
+             ``inbox_id`` so the primary leg links back to the inbox
+             row (the sibling carries no backlink; it is reachable via
+             ``transfer_transaction_id``).
+           - Non-transfer: insert a single ledger row and write an
+             activity log for the new
              transaction.
       4. Shared cleanup: soft-delete the inbox row with
          ``status = 2`` (PROMOTED) and write an activity log.

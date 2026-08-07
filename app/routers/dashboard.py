@@ -96,13 +96,13 @@ async def _load_accounts(
 
 
 # The `archived_categories` and `archived_hashtags` panels were here — two
-# lifetime aggregators over `is_archived` rows. They are gone (docs/rework/WP2).
+# lifetime aggregators over `is_archived` rows. They are gone (sql/021 era, WP2).
 #
 # Not because converting them was hard, but because archiving a category was
 # never a distinct feature: soft delete already hides a row from pickers while
 # leaving past transactions that reference it fully intact, which is what
 # archiving was for. These panels were `expense_categories.is_archived` and
-# `expense_hashtags.is_archived`'s last readers, and docs/rework/WP5 removes
+# `expense_hashtags.is_archived`'s last readers, and sql/024 then removed
 # both columns.
 #
 # `archived_accounts` stays, and the asymmetry is deliberate: an archived

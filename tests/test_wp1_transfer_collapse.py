@@ -10,7 +10,7 @@ These tests pin the invariants the transfer collapse exists to establish:
     coherence CHECK was rewritten without ``transfer_direction``.
 
 The USD→USD case is open bug 1.3, closed here rather than in WP2 by owner
-decision — see ``docs/rework/WP1-transfer-collapse.md`` and the entry in
+decision — see sql/020's header (WP1 work package in git history) and the entry in
 ``docs/client-breaking-changes.md``.
 """
 import uuid

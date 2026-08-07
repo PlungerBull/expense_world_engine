@@ -1,4 +1,4 @@
-"""WP5 — schema slimming (sql/024, docs/rework/WP5).
+"""WP5 — schema slimming (sql/024; WP5 work package in git history).
 
 Pins the behaviour the deletion program changed:
 

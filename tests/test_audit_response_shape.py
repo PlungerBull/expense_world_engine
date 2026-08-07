@@ -6,10 +6,10 @@ Covers the wire-contract guarantees clients depend on:
     exchange rate. Both are single-currency surfaces — an inbox draft belongs
     to one account, a reconciliation belongs to one account, and the account
     governs the currency — so there is nothing to combine and nothing to
-    convert. This file used to assert the opposite; docs/rework/WP2 inverted it
+    convert. This file used to assert the opposite; WP2 (sql/021) inverted it
     when sql/021 deleted the stored conversions.
   * `?debit_as_negative=true` flips the sign of `amount_cents` on /inbox
-    (the /sync sibling test went with the endpoint, docs/rework/WP4). There is
+    (the /sync sibling test went with the endpoint, sql/023). There is
     one amount to flip now, not two.
   * The system_key column on expense_categories survives a display-name
     rename — a renamed @Transfer / @Debt is still found by the transfer
@@ -143,7 +143,7 @@ async def test_reconciliation_response_carries_no_home_value(client, test_data):
     reconciliation is single-currency and has nothing to convert. The two
     `*_home_cents` fields that used to sit here were the last per-account home
     values in the engine, kept out of inertia; docs/currency-model-decision.md
-    flagged that as a known inconsistency and docs/rework/WP2 settled it.
+    flagged that as a known inconsistency and sql/021 (WP2) settled it.
 
     Deleting the helper behind them also closed open bug 2.3: it selected
     accounts with no `user_id` predicate, and engine-side scoping is the only

@@ -57,7 +57,7 @@
 -- The denormalisation was buying an index the schema should have had anyway, and
 -- charging a drift risk for it.
 --
--- The sync indexes are NOT touched here. They belong to docs/rework/WP4, which
+-- The sync indexes are NOT touched here. They belong to WP4 (sql/023), which
 -- must land after this migration and removes them once these exist.
 --
 -- Each index below is justified by a query that exists today, verified by grep
@@ -137,7 +137,7 @@ ALTER TABLE expense_bank_accounts
 -- Recorded because an unexplained absence reads as an oversight, and because the
 -- 2026-08-04 audit recommended all three. Its index table is explicitly labelled
 -- a recommendation rather than a prescription
--- (docs/rework/WP3-computed-balances-and-indexes.md:72-74).
+-- (WP3 work package, in git history).
 --
 -- expense_transactions (transfer_transaction_id) -- NO QUERY USES IT.
 --     Not a judgement call: `grep -rn "transfer_transaction_id\s*=\s*\$"` over

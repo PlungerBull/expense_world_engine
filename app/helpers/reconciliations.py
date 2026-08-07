@@ -13,7 +13,7 @@ your statement, assign transactions to it, and check that they add up.
 Complete it when they do; revert if you were wrong. Both balances are
 facts the user reads off a statement — the engine never derives either.
 
-Chaining used to live here (docs/rework/WP6, deleted by sql/025): a
+Chaining used to live here (deleted by sql/025, WP6 of the deletion program): a
 "chained" reconciliation took its beginning balance from the previous
 row's ending balance and a cascade rewrote downstream rows on every
 upstream edit. The cascade had no status predicate, so editing a DRAFT
@@ -206,7 +206,7 @@ async def update_reconciliation(
 
     An edit here changes this row and nothing else — no other
     reconciliation's balances move, in any status. That locality is the
-    invariant docs/rework/WP6 exists for, and tests/test_wp6_* pins it.
+    invariant sql/025 exists for, and tests/test_wp6_* pins it.
 
     Raises:
         not_found: no active reconciliation with that id for this user.

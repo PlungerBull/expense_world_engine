@@ -50,7 +50,7 @@ async def test_other_settings_still_updatable(client):
     and the response no longer carries a `recalculation` field.
 
     display_timezone is the one remaining mutable field since sql/024
-    dropped the six echo-only preference columns (docs/rework/WP5)."""
+    dropped the six echo-only preference columns (sql/024, WP5)."""
     r = await client.put(
         "/v1/auth/settings",
         json={"display_timezone": "America/Lima"},

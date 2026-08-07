@@ -98,8 +98,9 @@ consequences worth knowing:
 
   * Python and SQL disagree on a bad value: ``compute_month_bounds`` catches the
     bad zone and falls back to UTC, while ``AT TIME ZONE`` raises and would 500.
-    The root fix is validating ``display_timezone`` on write; that is tracked in
-    ``docs/rework/WP5``, not here.
+    The root fix is validating ``display_timezone`` on write; that shipped with
+    ``sql/024`` (helpers/validation.validate_timezone), so this covers only
+    out-of-band DB writes.
   * Callers already have the value from ``monthly_report.get_user_report_settings``
     (already called by ``routers/dashboard.py`` and ``routers/reports.py``). Reuse
     it; do not add a second settings loader.
@@ -138,7 +139,7 @@ The get_rate duplication
 Python, and it stays: account balances convert at *today's* rate, the account list
 uses ``batch_get_rates`` to avoid an N+1, and ``GET /exchange-rates`` serves rates
 directly. (Reconciliations used to be on that list; they report native only as of
-docs/rework/WP2.) So the rule is
+``sql/021``, the read-time currency migration.) So the rule is
 implemented twice, in two languages. **That is a real DRY violation, accepted
 deliberately** — aggregates must run in SQL, and pulling every row into Python to
 convert would be worse.

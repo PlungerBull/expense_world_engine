@@ -19,7 +19,7 @@ class ReconciliationCreateRequest(BaseModel):
     # the engine never derives one. The former "chained" mode (omit the value,
     # inherit the previous reconciliation's ending balance, recompute on every
     # upstream edit) let a draft edit rewrite a COMPLETED row's balance through
-    # the back door and was deleted (sql/025, docs/rework/WP6).
+    # the back door and was deleted (sql/025, WP6 of the deletion program).
     beginning_balance_cents: int
     ending_balance_cents: Optional[int] = None
 
@@ -47,7 +47,7 @@ class ReconciliationResponse(BaseModel):
     # convert. The two `*_home_cents` fields that used to sit beside these were
     # the last surviving per-account home values, kept out of inertia rather
     # than need; docs/currency-model-decision.md called that out as a known
-    # inconsistency and docs/rework/WP2 settled it.
+    # inconsistency and sql/021 (WP2, read-time currency) settled it.
     beginning_balance_cents: int
     ending_balance_cents: int
     # (ending − beginning) − signed sum of the assigned non-deleted
