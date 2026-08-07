@@ -67,7 +67,6 @@ from app.helpers.validation import validate_active_account, validate_active_cate
 from app.schemas.transactions import (
     TransactionBatchRequest,
     TransactionCreateRequest,
-    TransactionUpdateRequest,
     infer_transaction_type,
     transaction_from_row,
 )
@@ -125,6 +124,34 @@ async def attach_hashtag_ids(conn: asyncpg.Connection, payload) -> None:
     hashtag_map = await fetch_hashtag_ids_map(conn, ids)
     for item in items:
         item["hashtag_ids"] = hashtag_map.get(item["id"], [])
+
+
+async def fetch_recon_status(
+    conn: asyncpg.Connection,
+    user_id: str,
+    recon_id,
+) -> Optional[asyncpg.Record]:
+    """Fetch ``(status, deleted_at)`` for a reconciliation, tenant-scoped.
+
+    Post-fetch coherence read: ``recon_id`` always comes off an
+    already-scoped transaction row, so a ``user_id`` mismatch is impossible
+    by construction — but the predicate is still mandatory (a missing
+    ``user_id`` filter is a security defect, not a tidiness one).
+
+    Soft-deleted rows ARE returned: ``restore_transaction`` distinguishes
+    "recon deleted" from "recon completed", so this must not filter on
+    ``deleted_at`` — callers that only care about COMPLETED ignore it.
+
+    Returns ``None`` when no row the caller owns exists; callers treat that
+    exactly as "no reconciliation" (no field lock, no warning, unlink on
+    restore) — the same behaviour a genuinely missing row gets.
+    """
+    return await conn.fetchrow(
+        "SELECT status, deleted_at FROM expense_reconciliations"
+        " WHERE id = $1 AND user_id = $2",
+        recon_id,
+        user_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -452,11 +479,8 @@ async def update_transaction(
 
     # Field locking check — reconciliation completed
     if before_row["reconciliation_id"] is not None:
-        recon = await conn.fetchrow(
-            "SELECT status FROM expense_reconciliations WHERE id = $1",
-            before_row["reconciliation_id"],
-        )
-        if recon and recon["status"] == 2:
+        recon = await fetch_recon_status(conn, user_id, before_row["reconciliation_id"])
+        if recon and recon["status"] == ReconciliationStatus.COMPLETED:
             locked = {"amount_cents", "account_id", "title", "date"}
             attempted = locked & fields.keys()
             if attempted:
@@ -746,11 +770,8 @@ async def delete_transaction(
     # the response contract.
     warnings: list[str] = []
     if row["reconciliation_id"] is not None:
-        recon = await conn.fetchrow(
-            "SELECT status FROM expense_reconciliations WHERE id = $1",
-            row["reconciliation_id"],
-        )
-        if recon and recon["status"] == 2:
+        recon = await fetch_recon_status(conn, user_id, row["reconciliation_id"])
+        if recon and recon["status"] == ReconciliationStatus.COMPLETED:
             warnings.append(
                 "Transaction belonged to a completed reconciliation. "
                 "Reconciliation totals may be stale."
@@ -912,10 +933,7 @@ async def restore_transaction(
     async def _resolve_recon_unlink(recon_id) -> tuple[bool, Optional[str]]:
         if recon_id is None:
             return False, None
-        recon = await conn.fetchrow(
-            "SELECT status, deleted_at FROM expense_reconciliations WHERE id = $1",
-            recon_id,
-        )
+        recon = await fetch_recon_status(conn, user_id, recon_id)
         if recon is None or recon["deleted_at"] is not None:
             return True, (
                 "Transaction's previous reconciliation no longer exists. "
