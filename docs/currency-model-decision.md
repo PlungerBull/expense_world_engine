@@ -46,8 +46,11 @@ hashtags are **assumed** to span currencies rather than checked.
 balance is single-currency like a reconciliation — but the account *list* is the
 only surface that shows all your money at once, and reading `S/8,500` beside
 `$1,200` with no common unit is the thing that makes the list unusable. So the
-balance keeps `current_balance_home_cents`, computed at **today's** rate, and the
-Python half of the conversion rule (`helpers/exchange_rate.get_rate`,
+balance keeps `current_balance_home_cents`, computed at **today's** rate — where
+"today" resolves in the user's `display_timezone`
+(`exchange_rate.rate_lookup_date`, owner decision 2026-08-06; previously these
+lookups used the UTC date and could disagree with the reports near midnight) —
+and the Python half of the conversion rule (`helpers/exchange_rate.get_rate`,
 `batch_get_rates`) stays alive to serve it. `CLAUDE.md`'s home-currency table is
 authoritative on this; an earlier revision of this document said per-account
 figures were native-only, and that was never implemented.
@@ -382,11 +385,13 @@ Two consequences to know:
   cannot reproduce it. ~~The divergence is deliberate~~ — **and it is gone as of
   `sql/021`: no write resolves a rate, so there is only one rate date and it is
   this one.**
-- **`display_timezone` is unvalidated user input** (`sql/002:22`, settable via
-  `PUT /auth/settings`). It must reach SQL as a bind parameter, never interpolated.
-  `compute_month_bounds` silently falls back to UTC on an invalid zone name while
-  `AT TIME ZONE` would raise — validating it on write is the root fix and belongs
-  in the fail-closed sweep.
+- **`display_timezone` must reach SQL as a bind parameter, never interpolated.**
+  It is validated on write since the fail-closed sweep
+  (`helpers/validation.validate_timezone`, both write paths), and reads tolerate
+  pre-validation junk rows via `validation.resolve_timezone` — the single
+  read-side fallback (added 2026-08-06) covering both Python `ZoneInfo`
+  construction and the `AT TIME ZONE` bind, which previously would raise and
+  500 every report read on a bad stored zone.
 
 ---
 

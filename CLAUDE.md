@@ -52,7 +52,10 @@ Corollaries:
 - **Fail closed.** Enumerate what is *permitted*, never what is forbidden. New
   fields must default to blocked, unknown input must 422 rather than be silently
   dropped, and missing data must surface as `null` + a flag rather than a
-  convenient substitute value.
+  convenient substitute value. For request bodies this is structural: every
+  request model — including nested fragments like `transfer` — inherits
+  `schemas.StrictModel`, the single `extra="forbid"` implementation
+  (per-model copies were the drift that left 10 models leaky until 2026-08-06).
 - **Breaking a client is a documented cost, not a blocker.** Record it in
   `docs/client-breaking-changes.md` and proceed.
 

@@ -49,6 +49,8 @@ This holds on **every** amount-bearing column in **every** table, including the 
 
 **Optimistic locking:** All mutable resources include a `version` field in responses, incremented on every update. Clients can use this for conflict detection.
 
+**Unknown request fields:** Every request body rejects unknown fields with `422 VALIDATION_ERROR` — no endpoint silently drops input (fail-closed). Since 2026-08-06 this is enforced structurally: all request models inherit `schemas.StrictModel` (`extra="forbid"`), including nested request objects (`transfer` on transactions and inbox) — Pydantic config does not propagate into nested models, so a nested fragment must inherit the base itself. The error names the offending key in `fields`, nested keys as dotted paths (`transfer.bogus`, `transactions.0.bogus`). Per-endpoint "unknown fields 422" notes below call out cases where the rejection carries extra meaning (a deliberately-deleted field, a locked field); the rule itself is global.
+
 **Datetime inputs:** All datetime fields in request bodies must be RFC 3339 with a timezone offset. Accepted: `2026-04-25T16:30:00Z`, `2026-04-25T16:30:00+00:00`, `2026-04-25T11:30:00-05:00`. Rejected with `422 VALIDATION_ERROR`: naive datetimes (`2026-04-25T16:30:00`, `2026-04-25 16:30`, `2026-04-25`). Clients are responsible for resolving the user's local timezone and emitting canonical RFC 3339 — the engine never guesses a timezone for unqualified input. Response datetimes are always emitted in UTC with a `Z` suffix.
 
 ---
@@ -731,7 +733,7 @@ Returns the current calendar month overview. Single endpoint, one call, everythi
 - **`hashtag_breakdown`** — array of `{ hashtag_ids, spent_home_cents, unconverted_count }` rows. Aggregation is `GROUP BY (category_id, sorted_array_of_hashtag_ids)`. The hashtag set is sorted by `id` before grouping so `[#a, #b]` and `[#b, #a]` collapse to the same row. Transactions with no hashtags appear as a row with `hashtag_ids: []`. **The sum of all fully-converted `hashtag_breakdown` rows under a category equals that category's `spent_home_cents` exactly** — no double-counting, no orphaned amounts.
 - **Opening balances are excluded from flow views entirely** (dashboard month panel and `/reports/monthly` alike): transactions under the `opening_balance` system category contribute nothing to `totals`, and the `@Opening` category row is omitted from `categories`. Rationale: an opening balance is where tracking starts, not money that moved — including it would report phantom income in the seed month. Exclusion keys off `system_key`, so renaming the category never breaks it. Account balances **do** include opening balances by construction, and the seed rows appear normally in transaction lists. Consequence: any transaction manually assigned to the `@Opening` category is likewise excluded from flow reports — the category carries the semantic.
 - All `*_home_cents` fields are pre-converted by the engine. Clients never compute currency conversions.
-- `bank_accounts[].current_balance_home_cents` and `people[].current_balance_home_cents` are `Optional[int]`. They are always populated for same-currency accounts (identity rate). For cross-currency accounts, they are `null` only when no exchange rate is available from the account's currency to `main_currency` for today's date — in that case, clients should display the native balance as a fallback.
+- `bank_accounts[].current_balance_home_cents` and `people[].current_balance_home_cents` are `Optional[int]`. They are always populated for same-currency accounts (identity rate). For cross-currency accounts, they are `null` only when no exchange rate is available from the account's currency to `main_currency` for today's date (today resolved in the user's `display_timezone` via `exchange_rate.rate_lookup_date`, matching the reports) — in that case, clients should display the native balance as a fallback.
 - "Current month" means `[first_day_of_month, last_day_of_month]` in the user's `display_timezone`.
 - `?debit_as_negative=true` is accepted for API consistency with other read endpoints but is a no-op here — dashboard aggregates are already signed by construction (per-category `spent_home_cents` is positive for income and negative for expense; totals return split positive `inflow_home_cents`/`outflow_home_cents` with `net_home_cents` as their difference).
 
@@ -819,7 +821,7 @@ The "every mutation gets an activity_log row" rule has three deliberate exceptio
 ## Exchange Rates
 
 ### `GET /exchange-rates`
-**Query params:** `base` (default `USD`), `target`, `date` (ISO date, default today)
+**Query params:** `base` (default `USD`), `target`, `date` (ISO date; default: today in the user's `display_timezone` — `exchange_rate.rate_lookup_date`, the same "today" every current-date rate lookup uses since 2026-08-06; an invalid stored zone falls back to UTC)
 
 Returns the rate for the given pair and date. Falls back to the most recent available rate if no exact match exists for the requested date.
 
