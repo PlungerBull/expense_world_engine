@@ -2,6 +2,10 @@
 
 > Single source of truth for all database tables.
 > Conventions: `../CLAUDE.md`
+>
+> Regenerated 2026-08-06 from the live catalog (`information_schema` + `pg_indexes` +
+> `pg_constraint` + `pg_policies`) after the deletion program landed (`sql/020`–`sql/025`).
+> **14 tables, 126 columns.**
 
 ---
 
@@ -10,34 +14,38 @@
 These rules apply to all mutable tables unless explicitly noted as an exception.
 
 - **Amounts in cents:** All monetary values stored as `bigint` in cents (e.g. $30.50 = 3050). Never floating point.
-- **Amounts always positive:** `amount_cents` is always stored as a positive integer representing magnitude. The direction (inflow vs outflow) is determined by `transaction_type`, not by the sign of the amount. The API may expose negative numbers to clients via the `debit_as_negative` convention — this is a display concern only, never a storage concern.
-- **Soft deletes:** All mutable tables have `deleted_at` (nullable timestamptz). `NULL` = active. Timestamp = soft-deleted. Hard deletion is never performed on financial records.
-- **Sync version:** Every mutable table has `version` (integer, default 1), incremented on every update. Used by the sync token mechanism — each client tracks the max version it has seen and requests only rows with a higher version on the next sync.
+- **Amounts always positive:** `amount_cents` is always stored as a positive integer representing magnitude — enforced by CHECK constraints. Direction (outflow vs inflow) is `transaction_type`, never the sign of the amount. The API may expose negative numbers to clients via the `debit_as_negative` convention — a display concern only, never a storage concern.
+- **Soft deletes:** All mutable *domain* tables have `deleted_at` (nullable timestamptz). `NULL` = active. Timestamp = soft-deleted. Hard deletion is never performed on financial records. `user_settings` is the deliberate exception — a settings row lives and dies with its user (`sql/024`).
+- **Optimistic version counter:** Mutable tables carry `version` (integer, default 1), incremented by the engine on every update. Clients read it and may use it to detect concurrent edits; they never send it, and there is no `If-Match`/409 mechanism. (Its original purpose — the `/sync` delta protocol — was deleted with `/sync` in `sql/023`; the counter itself stays.)
 - **UUIDs:** All primary keys are UUID (`uuid_generate_v4()`), generated client-side before server confirmation.
 - **Timestamps:** `created_at` and `updated_at` on every mutable table, both `timestamptz`, defaulting to `now()`. Always stored in UTC.
 - **snake_case:** All column and table names.
-- **Smallints for enums:** Enum-like fields stored as `smallint`. Never raw strings. Mappings documented below.
+- **Smallints for enums:** Enum-like fields stored as `smallint`. Never raw strings. Mappings documented below. Closed enums are CHECK-enforced; a CHECK on a nullable column must spell out `IS NOT NULL` (see `CLAUDE.md`, sign convention).
 
 ### Smallint Enum Mappings
 
 | Field | Table | Mapping |
 |---|---|---|
-| `transaction_type` | `expense_transactions` | 1 = expense, 2 = income, 3 = transfer |
-| `transaction_type` | `expense_transaction_inbox` | 1 = expense, 2 = income, 3 = transfer |
-| `transfer_direction` | `expense_transactions` | 1 = debit (balance decreases), 2 = credit (balance increases) |
-| `transfer_direction` | `expense_transaction_inbox` | same enum; describes the primary leg (the inbox row itself) |
+| `transaction_type` | `expense_transactions` | 1 = outflow (expense), 2 = inflow (income). **There is no value 3** — a transfer leg is an ordinary outflow or inflow, identified by `transfer_transaction_id` (`sql/020`). CHECK-enforced. |
+| `transaction_type` | `expense_transaction_inbox` | same enum, nullable (a draft may have no amount yet). CHECK-enforced with an explicit `IS NULL OR` arm. |
 | `status` | `expense_transaction_inbox` | 1 = pending, 2 = promoted, 3 = dismissed |
-| `status` | `expense_reconciliations` | 1 = draft, 2 = completed |
-| `transaction_source` | `expense_transaction_hashtags` | 1 = inbox, 2 = ledger |
+| `status` | `expense_reconciliations` | 1 = draft, 2 = completed. CHECK-enforced (`sql/025`). |
+| `transaction_source` | `expense_transaction_hashtags` | 1 = ledger attach path — the only value ever written; see the table's section |
 | `action` | `activity_log` | 1 = created, 2 = updated, 3 = deleted, 4 = restored |
 
 ### Exceptions (no version / no deleted_at)
 
 - `global_currencies` — static lookup, predefined rows, never user-edited
 - `exchange_rates` — append-only reference, never edited or deleted by clients
-- `users` — managed by Supabase Auth
+- `users` — managed alongside auth; no version, no deleted_at
+- `user_settings` — has `version`, has **no** `deleted_at` (`sql/024`)
 - `activity_log` — immutable append-only audit trail. No soft delete, no version, no updated_at.
 - `idempotency_keys` — expire via TTL; hard-deleted by a cleanup job after expiry.
+- `expense_transaction_hashtags` — has `deleted_at`, has **no** `version` (`sql/024`); versioning lives on the parent transaction (see the table's section).
+
+### Row-level security
+
+Every table carries an RLS policy (`auth.uid() = user_id`; `users` uses `= id`; `global_currencies` and `exchange_rates` are authenticated-read-only) and `rowsecurity` is on. Under the local profile these are **inert** — the engine connects as the table owner — so the engine-side `user_id` predicate in every query is the only live isolation. See `CLAUDE.md`, "Tenant isolation is engine-side, not RLS".
 
 ---
 
@@ -45,52 +53,47 @@ These rules apply to all mutable tables unless explicitly noted as an exception.
 
 ### users
 
-Supabase Auth mirror. One row per authenticated user, created by the engine on first login contact. The `id` mirrors `auth.users.id` — the bridge between Supabase Auth and all application tables.
+Auth mirror. One row per authenticated user, created by the engine on first contact. The `id` mirrors `auth.uids.id` under the cloud profile — the bridge between auth and all application tables.
 
 ```
 users
-  - id              UUID, primary key              — mirrors auth.users.id
-  - email           text
+  - id              UUID, primary key              — mirrors auth.users.id (cloud profile)
   - display_name    text, nullable
   - last_login_at   timestamptz, nullable           — updated on every successful authentication
   - created_at      timestamptz, NOT NULL, default now()
   - updated_at      timestamptz, NOT NULL, default now()
 ```
 
+`email` was dropped in `sql/024` — the engine never read it, and auth identity lives with the auth provider, not in this table.
+
 **Active user:** Derived at query time — not stored. A user is considered active if `last_login_at > now() - interval '30 days'`.
+
+**`handle_new_auth_user()`** — a trigger function (rewritten by `sql/024` to stop inserting `email`) that seeds `users` + `user_settings` when an `auth.users` row appears. Under the cloud profile it is attached to a trigger on `auth.users`; under the local profile the function exists but no trigger fires it — `POST /auth/bootstrap` does the seeding instead.
 
 ---
 
 ### user_settings
 
-App preferences. One row per user, created alongside the `users` row on first login.
+App preferences. One row per user, created alongside the `users` row. Never soft-deleted — the row lives and dies with its user.
 
 ```
 user_settings
-  - user_id                        UUID, primary key, FK → users
-  - theme                          smallint, NOT NULL, default 1
-                                   — 1=system, 2=light, 3=dark
-  - start_of_week                  smallint, NOT NULL, default 0
-                                   — 0=Sunday, 1=Monday
-  - main_currency                  text, NOT NULL, default 'PEN', FK → global_currencies.code
-  - transaction_sort_preference    smallint, NOT NULL, default 1
-                                   — 1=date, 2=created_at
-  - display_timezone               text, NOT NULL, default 'UTC'
-                                   — IANA string e.g. 'America/Lima'. Used for all client-side date boundaries.
-  - sidebar_show_bank_accounts     boolean, NOT NULL, default true
-  - sidebar_show_people            boolean, NOT NULL, default true
-  - sidebar_show_categories        boolean, NOT NULL, default true
-  - created_at                     timestamptz, NOT NULL, default now()
-  - updated_at                     timestamptz, NOT NULL, default now()
-  - version                        integer, NOT NULL, default 1
-                                   — bumped on every PUT /auth/settings update
-  - deleted_at                     timestamptz, NULL
-                                   — present for sync uniformity; always NULL in practice (settings can't be deleted)
+  - user_id            UUID, primary key, FK → users
+  - main_currency      text, NOT NULL, default 'PEN', FK → global_currencies.code
+                       — CHECK (main_currency = 'PEN') since sql/018: home currency is
+                         locked; PUT /auth/settings 422s any attempt to change it.
+  - display_timezone   text, NOT NULL, default 'UTC'
+                       — IANA string e.g. 'America/Lima'. Used for all date boundaries.
+                         Validated on every write path (helpers/validation.validate_timezone,
+                         422 on a non-IANA zone) since sql/024.
+  - created_at         timestamptz, NOT NULL, default now()
+  - updated_at         timestamptz, NOT NULL, default now()
+  - version            integer, NOT NULL, default 1
 ```
 
-`user_settings` is fully sync-capable and appears in `GET /sync` responses as a singleton `settings` object.
+The six client-preference columns (`theme`, `start_of_week`, `transaction_sort_preference`, three `sidebar_show_*` flags) and `deleted_at` were dropped in `sql/024` — echo-only client state the engine never read.
 
-**Timezone architecture:** All timestamps stored in UTC. `display_timezone` is the IANA string used for all "today" calculations, date boundaries, and overdue detection. Set to device timezone on first launch. Conversion to local time always happens at the presentation layer.
+**Timezone architecture:** All timestamps stored in UTC. `display_timezone` is the IANA string used for all "today" calculations, date boundaries, and month bounds. Conversion to local time always happens at the presentation layer.
 
 ---
 
@@ -100,10 +103,11 @@ Static lookup table. Predefined rows, never user-edited. No soft delete, no vers
 
 ```
 global_currencies
-  - code    text, primary key     — e.g. 'USD', 'PEN'
-  - name    text, NOT NULL        — e.g. 'US Dollar'
-  - symbol  text, NOT NULL        — e.g. '$'
+  - code    text, primary key     — 'USD', 'PEN'
+  - CHECK (code IN ('USD', 'PEN'))   — sql/015: Phase-1 currency lock
 ```
+
+`name` and `symbol` were dropped in `sql/024` — display strings are the clients' concern. Lifting the CHECK (plus cross-rate math) is the labelled scale boundary in `CLAUDE.md`.
 
 ---
 
@@ -129,29 +133,7 @@ exchange_rates
 
 **Stale-date backward scan:** The engine always queries `WHERE rate_date <= target_date ORDER BY rate_date DESC LIMIT 1`, so a weekend or one-day fetch gap transparently falls back to the most recent prior rate.
 
-**Truly missing rate:** If no row exists on or before `target_date` for the currency pair (e.g. the daily cron has never run, or the historical backfill is incomplete), the engine raises `422 RATE_UNAVAILABLE` on any write that would have needed `amount_home_cents`. There is **no silent `1.0` fallback** — the old behaviour corrupted home-currency totals and was removed. See engine-spec.md → "Exchange-rate preconditions".
-
----
-
-### sync_checkpoints
-
-Tracks each client's position in the sync history. One row per user per client device. Used to compute delta responses.
-
-A client that loses its `client_id` (e.g. app reinstall) generates a new UUID and starts a fresh sync from version 0 — re-downloading all data from the server. The server is always the source of truth.
-
-```
-sync_checkpoints
-  - id               UUID, primary key, default uuid_generate_v4()
-  - user_id          UUID, NOT NULL, FK → users
-  - client_id        text, NOT NULL
-                     — stable device or session identifier, assigned by the client on first launch
-  - last_sync_token  text, NOT NULL
-                     — opaque token returned by the last sync response
-  - last_sync_at     timestamptz, NOT NULL
-  - created_at       timestamptz, NOT NULL, default now()
-  - updated_at       timestamptz, NOT NULL, default now()
-  - UNIQUE (user_id, client_id)
-```
+**Truly missing rate:** Conversion happens only at read time (`sql/021`; `docs/currency-model-decision.md`). A row whose date has no rate on or before it converts to `null`, and every home-currency aggregate pairs its `SUM` with an `unconverted_count` so a partial total is reported as `null` rather than an understatement. **No write path performs a rate lookup**, so a stale rate table can never block recording a transaction. (The old `422 RATE_UNAVAILABLE` write precondition died with the stored columns.)
 
 ---
 
@@ -159,25 +141,25 @@ sync_checkpoints
 
 Deduplicates write operations. Clients send a unique key per intended write. If the server has already processed that key, it returns the stored response instead of creating a duplicate. Entries expire after 24 hours and are cleaned up by a background job.
 
-**Why this matters:** A CLI or app sends "create $50 Food expense" → network timeout → client retries → without idempotency, two $50 expenses are created and the balance is corrupted. With idempotency, the retry gets the original response and no duplicate is created.
+**Why this matters:** A CLI or app sends "create $50 Food expense" → network timeout → client retries → without idempotency, two $50 expenses are created. With idempotency, the retry gets the original response and no duplicate is created.
 
 ```
 idempotency_keys
   - id                 UUID, primary key, default uuid_generate_v4()
   - key                text, NOT NULL
   - user_id            UUID, NOT NULL, FK → users
-  - processed_at       timestamptz, NOT NULL
   - response_snapshot  jsonb, NOT NULL
                        — stored response BODY returned verbatim on duplicate requests
   - response_status    smallint, NOT NULL, default 200
-                       — HTTP status code captured alongside the body so replays
-                         reconstruct the full envelope verbatim (no per-route
-                         re-derivation). Added in sql/011.
+                       — HTTP status captured alongside the body so replays reconstruct
+                         the full envelope verbatim. Added in sql/011.
   - expires_at         timestamptz, NOT NULL
-                       — processed_at + 24 hours
+                       — now() + 24 hours, set when the key row is claimed
   - created_at         timestamptz, NOT NULL, default now()
   - UNIQUE (user_id, key)
 ```
+
+`processed_at` was dropped in `sql/024` — written on every claim, read never. (An earlier revision of this document claimed `expires_at` was "`processed_at` + 24 hours"; it never was — the TTL has always been anchored to claim time, `now() + 24 hours`.)
 
 **Concurrency:** Every write handler acquires a transaction-scoped Postgres advisory lock (`pg_advisory_xact_lock`) hashed from `(user_id, key)` as the first statement inside the write transaction. Two concurrent requests with the same key serialize at the DB — the second blocks until the first commits, then reads the stored snapshot and returns it. This closes the check-then-store race that would otherwise allow duplicate side effects.
 
@@ -187,7 +169,7 @@ idempotency_keys
 
 Immutable append-only audit trail. Every mutation to any mutable table produces a row here. No soft delete, no version, no updated_at — rows are never modified after creation.
 
-This table is both a correctness requirement (answers "why does my balance look wrong?") and the foundation for an Activity Feed UI feature — a stylised, human-readable log of all account changes surfaced to the user.
+This table is both a correctness requirement (answers "why does my balance look wrong?") and the foundation for an Activity Feed UI feature.
 
 ```
 activity_log
@@ -203,21 +185,18 @@ activity_log
   - after_snapshot   jsonb, nullable
                      — full row state after the change. null on deletes.
   - changed_by       UUID, NOT NULL, FK → users
-                     — the user-id anchor. Defaults to resource owner's
-                       user_id when the actor is the user themself.
-  - actor_type       text, NOT NULL, default 'user'
-                     — who performed the mutation. 'user' for direct API
-                       calls; 'system' for cron-driven writes (scheduled
-                       rate refreshes, etc.); 'admin' reserved for future
-                       back-office flows. Added in sql/013.
+                     — the user-id anchor; the resource owner's user_id when the
+                       actor is the user themself.
   - created_at       timestamptz, NOT NULL, default now()
 ```
+
+`actor_type` was dropped in `sql/024` — with one user and no admin surface, every actor is the same person. Its removal is a recorded wire change (`docs/client-breaking-changes.md`, 2026-08-06).
 
 ---
 
 ### personal_access_tokens
 
-Long-lived engine-issued credentials for CLI and scripted clients. A PAT carries the same authority as a Supabase JWT; the middleware in `app/deps.py` resolves either kind of token into an `AuthUser` and every downstream endpoint is unaware of which one was presented. Added in sql/016.
+Long-lived engine-issued credentials — the only live auth mechanism under the local profile (the JWT branch was deleted 2026-08-03; see `CLAUDE.md`). The middleware in `app/deps.py` resolves the bearer token into an `AuthUser`; downstream endpoints are unaware of the mechanism. Added in sql/016.
 
 Security model: only the SHA-256 hash is stored. The plaintext is returned once on creation and never recoverable. Revocation is a soft-delete (`revoked_at`), and the active-lookup index filters revoked rows out so a revoked PAT stops authenticating on the very next request.
 
@@ -226,28 +205,26 @@ personal_access_tokens
   - id            UUID, primary key, default uuid_generate_v4()
   - user_id       UUID, NOT NULL, FK → users
   - token_hash    text, NOT NULL, UNIQUE
-                  — SHA-256 hex digest of the plaintext token. The engine
-                    hashes incoming Authorization headers the same way and
-                    looks up by this column.
+                  — SHA-256 hex digest of the plaintext token. The engine hashes
+                    incoming Authorization headers the same way and looks up by
+                    this column.
   - token_prefix  text, NOT NULL
                   — first 12 chars of the plaintext ('ewe_pat_' + 4 random).
-                    Stored cleartext for display in a future management UI
-                    and for GitHub/GitGuardian-style leak scanners.
+                    Stored cleartext for display in a future management UI and
+                    for GitHub/GitGuardian-style leak scanners.
   - name          text, nullable
                   — optional user-supplied label ('laptop', 'render-cron').
   - created_at    timestamptz, NOT NULL, default now()
   - revoked_at    timestamptz, nullable
-                  — soft-delete marker. NULL = active. Non-null = revoked
-                    and no longer resolves in auth.
+                  — soft-delete marker. NULL = active. Non-null = revoked and no
+                    longer resolves in auth.
 
 Indexes:
   - idx_pat_token_hash_active (token_hash) WHERE revoked_at IS NULL
     Partial index backing the per-request auth lookup.
-
-RLS: auth.uid() = user_id
 ```
 
-No `version` or `updated_at`: PATs are immutable between creation and revocation; they are never edited in place.
+No `version` or `updated_at`: PATs are immutable between creation and revocation; they are never edited in place. No list endpoint and no `last_used_at` — deliberate (see `CLAUDE.md`, single-user-shaped table).
 
 ---
 
@@ -269,14 +246,16 @@ expense_bank_accounts
   - currency_code          text, NOT NULL, default 'PEN', FK → global_currencies.code
                            — immutable after creation
   - is_person              boolean, NOT NULL, default false
-                           — true for virtual accounts representing people (debt tracking)
-                           — person accounts appear in the People sidebar section, not Accounts
+                           — true for virtual accounts representing people (debt tracking).
+                             ⚠️ Currently unreachable: no endpoint can set it (the create
+                             INSERT omits the column and the schemas reject the field).
+                             Open product question — see TODO.md.
   - color                  text, NOT NULL, default '#3b82f6'
-                           — (current_balance_cents was here; dropped by sql/022. The balance is
-                              computed from the ledger and appears on responses, not on the row.)
   - is_archived            boolean, NOT NULL, default false
-                           — hides from pickers and entry flows but preserves all historical records
-                           — accounts with transactions can be archived; they cannot be hard-deleted
+                           — hides from pickers and entry flows but preserves all history.
+                             Accounts with transactions can be archived, not hard-deleted.
+                             (Categories/hashtags lost their is_archived in sql/024;
+                             accounts deliberately kept theirs.)
   - sort_order             integer, NOT NULL, default 0
   - created_at             timestamptz, NOT NULL, default now()
   - updated_at             timestamptz, NOT NULL, default now()
@@ -289,7 +268,7 @@ expense_bank_accounts
 
 ### expense_categories
 
-Flat category list. No hierarchy. No type restriction — any category can be used on any transaction type (expense, income, or transfer). System categories are auto-created and non-deletable, but can be renamed by the user (the engine identifies them by `system_key`, not by display name).
+Flat category list. No hierarchy. No type restriction — any category can be used on any transaction type. System categories are auto-created and non-deletable, but can be renamed by the user (the engine identifies them by `system_key`, not by display name).
 
 ```
 expense_categories
@@ -299,48 +278,42 @@ expense_categories
                 — display label. Free to rename, including for system categories.
   - color       text, NOT NULL, default '#6b7280'
   - is_system   boolean, NOT NULL, default false
-                — true for system-managed categories (@Transfer, @Debt). Cannot be deleted or archived.
+                — true for system-managed categories (@Transfer, @Debt, @Opening).
+                  Cannot be deleted.
   - system_key  text, nullable
-                — immutable discriminator for system categories ('debt', 'transfer').
-                  NULL for regular user-created categories. The engine looks up
-                  system rows by (user_id, system_key) so display name renames
-                  are safe — added in sql/010 to fix the bug where renaming
-                  '@Debt' caused subsequent transfers to lazily auto-create a
-                  duplicate '@Debt' row.
-  - is_archived boolean, NOT NULL, default false
-                — hides from default pickers and `GET /categories` listings;
-                  historical transactions remain attached. System categories
-                  cannot be archived. Added in sql/014.
+                — immutable discriminator for system categories ('debt', 'transfer',
+                  'opening_balance'). NULL for regular user-created categories. The
+                  engine looks up system rows by (user_id, system_key) so display
+                  renames are safe — added in sql/010.
   - sort_order  integer, NOT NULL, default 0
   - created_at  timestamptz, NOT NULL, default now()
   - updated_at  timestamptz, NOT NULL, default now()
   - version     integer, NOT NULL, default 1
   - deleted_at  timestamptz, nullable
   - PARTIAL UNIQUE INDEX (user_id, LOWER(name)) WHERE deleted_at IS NULL
-                — case-insensitive uniqueness scoped to non-deleted rows.
-                  Replaces the original case-sensitive UNIQUE (user_id, name)
-                  in sql/012. Belt-and-suspenders with the service-layer
-                  normalize_name() check. Lets a user recreate a name they
-                  previously soft-deleted.
+                — case-insensitive uniqueness scoped to non-deleted rows (sql/012).
+                  Lets a user recreate a name they previously soft-deleted.
   - PARTIAL UNIQUE INDEX (user_id, system_key) WHERE system_key IS NOT NULL AND deleted_at IS NULL
 ```
+
+`is_archived` was dropped in `sql/024` along with the archive/unarchive routes — after the dashboard's archived panels died in the read-time-currency rework, nothing displayed the state.
 
 **System categories (auto-seeded on first use, `is_system = true`):**
 - `@Transfer` (`system_key = 'transfer'`) — auto-assigned to both legs of a transfer between the user's own real accounts. Cannot be manually assigned to other transactions.
 - `@Debt` (`system_key = 'debt'`) — auto-assigned to transactions on person accounts (both the receivable entry and the settlement). Represents money owed to or from people.
-- `@Opening` (`system_key = 'opening_balance'`) — assigned to opening-balance seed transactions created via `POST /accounts/{id}/opening-balance`. Transactions under this category are excluded from flow reports (dashboard month panel + monthly report), and the category row itself is hidden from those panels.
+- `@Opening` (`system_key = 'opening_balance'`) — assigned to opening-balance seed transactions created via `POST /accounts/{id}/opening-balance`. Transactions under this category are excluded from flow reports (dashboard month panel + monthly report) but included in balances, and the category row itself is hidden from those panels.
 
 All display names are user-renameable; the engine always resolves system categories by `system_key`.
 
 **Category on transfers:** `category_id` is NOT NULL on all transactions, including transfers. Own-account transfers auto-receive `@Transfer`. Person-account transactions auto-receive `@Debt`. This enforces completeness without requiring the user to choose a category manually for these flows.
 
-**Refunds:** Use the same category as the original expense. Tag the refund as `transaction_type = 2 (income)`. The category accumulates both directions — net spend in that category across the month reflects the true cost.
+**Refunds:** Use the same category as the original expense. Tag the refund as an inflow (`transaction_type = 2`). The category accumulates both directions — net spend in that category across the month reflects the true cost.
 
 ---
 
 ### expense_transaction_inbox
 
-Incomplete transactions waiting to be promoted to the ledger. Fields are nullable — the inbox exists precisely because the user doesn't have all the information yet.
+Incomplete transactions waiting to be promoted to the ledger. Fields are nullable — the inbox exists precisely because the user doesn't have all the information yet. The inbox is a draft ledger row: looser about *which fields are null*, never about *how a field encodes its meaning* (`CLAUDE.md`, sign convention).
 
 ```
 expense_transaction_inbox
@@ -348,60 +321,53 @@ expense_transaction_inbox
   - user_id       UUID, NOT NULL, FK → users
   - title         text, nullable
   - description   text, nullable
-  - amount_cents  bigint, nullable             — always positive when set
-  - transaction_type smallint, nullable
-                  — 1=expense, 2=income, 3=transfer (same enum as expense_transactions)
-                  — inferred by engine from signed amount_cents in request (negative→expense, positive→income)
-                  — set to 3 when a `transfer` field is present in the request
-                  — nullable because inbox items may not have an amount yet
+  - amount_cents  bigint, nullable             — always positive when set (CHECK)
   - date          timestamptz, nullable
   - account_id    UUID, nullable, FK → expense_bank_accounts
   - category_id   UUID, nullable, FK → expense_categories
-  - exchange_rate numeric, default 1.0
-                  — converts account currency → user's main_currency for display
-                  — auto-filled from exchange_rates table, always user-overridable
-                  — 1.0 when account currency = main_currency
   - status        smallint, NOT NULL, default 1
                   — 1=pending (active in inbox)
                   — 2=promoted (moved to ledger; row is soft-deleted)
                   — 3=dismissed (rejected without promoting; row is soft-deleted)
                   — status distinguishes why a row was soft-deleted
+  - transaction_type smallint, nullable
+                  — 1=outflow, 2=inflow — same enum as expense_transactions, no value 3.
+                  — inferred by the engine from the signed request amount_cents.
+                  — nullable because a draft may not have an amount yet.
+                  — on a transfer draft this is the PRIMARY leg's direction; the
+                    sibling's is its inverse and is never stored.
   - transfer_account_id  UUID, nullable, FK → expense_bank_accounts
                   — destination account for the paired transfer transaction
-                  — only set when the inbox item represents a transfer
   - transfer_amount_cents bigint, nullable
-                  — amount for the paired transfer transaction, always positive
-                  — the request value is signed; the engine stores the magnitude
-  - transfer_direction smallint, nullable
-                  — 1=debit, 2=credit — same enum as expense_transactions
-                  — describes the PRIMARY leg (this inbox row); the sibling's
-                    direction is its inverse and is never stored
-                  — inferred by the engine from the signed amount_cents, or from
-                    the inverse of the signed transfer amount when the item has
-                    no amount yet
+                  — sibling leg's amount, always positive (CHECK); the request value
+                    is signed and must oppose the primary's sign (checked at POST/PUT)
   - created_at    timestamptz, NOT NULL, default now()
   - updated_at    timestamptz, NOT NULL, default now()
   - version       integer, NOT NULL, default 1
   - deleted_at    timestamptz, nullable
 ```
 
+**CHECK constraints:**
+- `inbox_amount_positive` — `amount_cents IS NULL OR amount_cents > 0`
+- `inbox_transfer_amount_positive` — same for `transfer_amount_cents`
+- `inbox_transaction_type_valid` — `transaction_type IS NULL OR transaction_type IN (1, 2)` (`sql/020`; there is no draft type 3)
+- `inbox_transfer_fields_coherent` — the transfer columns are all-present or all-absent, and a populated pair forces `transaction_type IS NOT NULL AND transaction_type IN (1, 2)`. The explicit `IS NOT NULL` matters: a CHECK that evaluates to NULL passes, so without it the constraint would silently admit the row it exists to forbid (`CLAUDE.md`).
+
+`exchange_rate` was dropped in `sql/021` (its `DEFAULT 1.0` was bug 1.4 — items promoted at a fabricated rate) and `transfer_direction` in `sql/020` (direction folded into `transaction_type`).
+
 **Promotion flow:** User-initiated. When `title`, `amount_cents`, `date`, `account_id`, and `category_id` are all present and `date ≤ now()`, the item is eligible. Promoting atomically:
-1. Creates a new row in `expense_transactions` with all validated data. `transaction_type` is copied directly from the inbox row (was inferred from the signed `amount_cents` at inbox creation time). `amount_home_cents` is computed as `amount_cents × exchange_rate`.
+1. Creates a new row in `expense_transactions` with all validated data. `transaction_type` is copied directly from the inbox row.
 2. Sets `inbox_id` on the new transaction row to link back to this item.
 3. Sets `status = 2` (promoted) on this inbox row.
 4. Sets `deleted_at` on this inbox row (soft delete).
 
-There is no balance step. Writing the ledger row in step 1 *is* the balance change — balances are computed from the rows (`sql/022`).
+There is no balance step (writing the ledger row *is* the balance change — `sql/022`) and no rate lookup (conversion happens at read time — `sql/021`).
 
-**Transfer promotion:** When the transfer columns are set, promoting creates a paired transfer instead of a single transaction. The `category_id` requirement is waived — categories are auto-assigned (`@Transfer` for real accounts, `@Debt` for person accounts), and `transfer_account_id` gets the same active/non-archived check the primary account does. Each leg's signed amount is reconstructed from `transfer_direction`: the primary takes that direction, the sibling the inverse.
+**Transfer promotion:** When the transfer columns are set, promoting creates a paired transfer instead of a single transaction. The `category_id` requirement is waived — categories are auto-assigned (`@Transfer` for real accounts, `@Debt` for person accounts) — and `transfer_account_id` gets the same active/non-archived check the primary account does. The primary leg takes the draft's `transaction_type`; the sibling takes its inverse. Opposite signs on the two amounts are validated at `POST`/`PUT`, while both signals are still available (`sql/019`/`sql/020` — the old signed `transfer_amount_cents` encoding let a same-sign draft promote with a leg silently flipped).
 
-> **Changed in `sql/019`.** This previously read *"the primary's signed amount is reconstructed from the sign of `transfer_amount_cents` (opposite signs required)"*. There was no `transfer_direction` column, so the sibling's sign was the only direction signal on the row — and because the primary's own sign was discarded by `abs()` on write, promotion *imposed* opposite signs rather than requiring them. An item saved as two outflows promoted with one leg silently flipped (WP7.2). Opposite signs are now checked at `POST`/`PUT`, while both are still available.
+**Hashtags:** The inbox has no hashtag support — no `hashtag_ids` field on its schemas, and promotion attaches none, so tags are silently lost by drafting through the inbox. Open product question — see TODO.md.
 
-**Constraints (`sql/019`):** `transaction_type IN (1,2,3)`; `amount_cents > 0`; `transfer_amount_cents > 0`; and the three transfer columns are all-present or all-absent, with a populated triple forcing `transaction_type = 3`. The last one makes the half-transfer row — transfer columns set on a row typed 1 or 2 — unrepresentable rather than merely guarded in application code.
-
-`exchange_rate` is never a blocking field — it auto-populates from the reference table and does not prevent promotion.
-
-**Deferred features:** Recurring expenses (`is_recurring`), CSV import (`source_text`), and receipt capture (`receipt_photo_url`) are not in Phase 1. These fields will be added when those phases begin.
+**Deferred features:** Recurring expenses (`is_recurring`), CSV import (`source_text`), and receipt capture (`receipt_photo_url`) are not in Phase 1.
 
 ---
 
@@ -409,7 +375,7 @@ There is no balance step. Writing the ledger row in step 1 *is* the balance chan
 
 Confirmed transactions — the clean, reliable ledger.
 
-**Balance rule:** The engine writes no balance at all. An account's balance is the signed sum of its non-deleted transactions (`sql/022`), so every row below contributes by existing. ⚠️ **This is what splits must change.** The documented split rule is that a parent row is a display container that does not move the balance and only its children do — enforced, under the old stored column, by simply not calling the balance helper for a parent. A `SUM` has no such escape hatch, so shipping splits without excluding parents double-counts every split. The exact predicate is written out in `app/helpers/account_balance.py` and `sql/022`.
+**Balance rule:** The engine writes no balance at all. An account's balance is the signed sum of its non-deleted transactions (`sql/022`), so every row below contributes by existing. A future splits feature must exclude parent container rows from that sum in the query predicate itself — the reserved column for it (`parent_transaction_id`) was dropped in `sql/024`, and the predicate a splits migration must reinstate is written out in `sql/022`'s header and `app/helpers/account_balance.py`.
 
 ```
 expense_transactions
@@ -418,39 +384,24 @@ expense_transactions
   - title                     text, NOT NULL
   - description               text, nullable
   - amount_cents              bigint, NOT NULL
-                              — always positive. Represents magnitude only.
-                              — direction is determined by transaction_type (and transfer_direction for transfers).
-                              — immutable once the transaction is part of a completed reconciliation.
-  - amount_home_cents         bigint, nullable
-                              — cached: amount_cents converted to main_currency via exchange_rate.
-                              — always positive.
-                              — not the source of truth; derivable from amount_cents × exchange_rate.
-                              — recalculated by the engine when:
-                                  (a) the transaction date changes (engine fetches historical rate for new date)
-                                  (b) the user's main_currency changes (engine recalculates all transactions)
+                              — always positive (CHECK amount_cents > 0). Magnitude only.
+                              — direction is transaction_type; no column's sign means anything.
+                              — read-only while part of a completed reconciliation.
   - transaction_type          smallint, NOT NULL
-                              — 1=expense (subtracts from account balance)
-                              — 2=income (adds to account balance)
-                              — 3=transfer (direction determined by transfer_direction)
-  - transfer_direction        smallint, nullable
-                              — only set when transaction_type = 3
-                              — 1=debit (balance decreases on this account — the outgoing leg)
-                              — 2=credit (balance increases on this account — the incoming leg)
+                              — 1=outflow (balance decreases), 2=inflow (balance increases)
+                              — CHECK (transaction_type IN (1, 2)); on EVERY row, transfers
+                                included. There is no value 3 (sql/020).
   - date                      timestamptz, NOT NULL, default now()
   - account_id                UUID, NOT NULL, FK → expense_bank_accounts
   - category_id               UUID, NOT NULL, FK → expense_categories
-  - exchange_rate             numeric, NOT NULL, default 1.0
-                              — rate at time of entry (or at transaction date for imports).
-                              — locked at entry. Only recalculated when date changes.
   - cleared                   boolean, NOT NULL, default false
-                              — true when the transaction has been confirmed on a bank statement.
-                              — drives the reconciliation flow.
+                              — true when confirmed on a bank statement; drives reconciliation.
   - transfer_transaction_id   UUID, nullable, FK → expense_transactions (self-referencing)
-                              — each row in a paired transfer points to the other row
-                              — the engine validates that paired transfers net to zero
-  - parent_transaction_id     UUID, nullable, FK → expense_transactions (self-referencing)
-                              — for split transactions: child rows point to their parent
-                              — parent rows do not update account balance (see balance rule above)
+                              — each row in a paired transfer points to the other row.
+                                This FK is the ONLY transfer discriminator: non-null means
+                                the row is a transfer leg. The pair nets to zero in native
+                                currency when both legs share a currency; a cross-currency
+                                pair records what each bank actually saw.
   - inbox_id                  UUID, nullable, FK → expense_transaction_inbox
                               — lineage back to the inbox item this was promoted from
   - reconciliation_id         UUID, nullable, FK → expense_reconciliations
@@ -460,7 +411,20 @@ expense_transactions
   - deleted_at                timestamptz, nullable
 ```
 
-**Field locking on reconciliation:** When `reconciliation_id` is set and the referenced reconciliation has `status = 2` (completed), these four fields are read-only: `amount_cents`, `account_id`, `title`, `date`. All other fields remain editable. Un-reconciling (reverting status to 1) unlocks all fields.
+Dropped by the deletion program: `transfer_direction` (`sql/020` — direction folded into `transaction_type`), `amount_home_cents` and `exchange_rate` (`sql/021` — conversion moved to read time), `parent_transaction_id` (`sql/024` — reserved for splits, never non-null; a splits migration re-adds it with the balance predicate).
+
+**Indexes (`sql/022`) — load-bearing; the computed balance depends on the first:**
+
+```
+idx_expense_transactions_user_account         (user_id, account_id)              WHERE deleted_at IS NULL
+idx_expense_transactions_user_date            (user_id, date, created_at)        WHERE deleted_at IS NULL
+idx_expense_transactions_user_category        (user_id, category_id)             WHERE deleted_at IS NULL
+idx_expense_transactions_user_reconciliation  (user_id, reconciliation_id)       WHERE reconciliation_id IS NOT NULL AND deleted_at IS NULL
+```
+
+`sql/022`'s header records the measured plans (50k seeded rows) and the deliberate omissions — no index on `transfer_transaction_id` (no query filters on it; siblings are looked up by primary key), no `hashtag_id` index on the junction (the report joins the other direction), no `INCLUDE` columns (they defeat HOT updates). The seven `(user_id, updated_at)` sync indexes died with `/sync` (`sql/023`).
+
+**Field locking on reconciliation:** When `reconciliation_id` references a completed reconciliation (`status = 2`), these four fields are read-only: `amount_cents`, `account_id`, `title`, `date`. All other fields remain editable. Reverting the reconciliation to draft unlocks them.
 
 **Deferred features:** Receipt capture (`receipt_photo_url`), raw import text (`source_text`), and bank-import approval flow (`approved`) are not in Phase 1.
 
@@ -477,52 +441,58 @@ expense_hashtags
   - id          UUID, primary key, default uuid_generate_v4()
   - user_id     UUID, NOT NULL, FK → users
   - name        text, NOT NULL
-  - is_archived boolean, NOT NULL, default false
-                — hides from default pickers and `GET /hashtags` listings;
-                  expense_transaction_hashtags junction rows are not touched.
-                  Added in sql/014.
   - sort_order  integer, NOT NULL, default 0
   - created_at  timestamptz, NOT NULL, default now()
   - updated_at  timestamptz, NOT NULL, default now()
   - version     integer, NOT NULL, default 1
   - deleted_at  timestamptz, nullable
   - PARTIAL UNIQUE INDEX (user_id, LOWER(name)) WHERE deleted_at IS NULL
-                — case-insensitive uniqueness scoped to non-deleted rows.
-                  Replaces the original UNIQUE (user_id, name) in sql/012.
+                — case-insensitive uniqueness scoped to non-deleted rows (sql/012).
                   Mirrors the expense_categories constraint.
 ```
+
+`is_archived` was dropped in `sql/024` with the archive/unarchive routes.
 
 ---
 
 ### expense_transaction_hashtags
 
-Junction table. Links hashtags to transactions in either the inbox or the ledger. `transaction_source` distinguishes which table `transaction_id` refers to (no formal FK, but always valid).
-
-A transaction with 3 hashtags produces 3 rows in this table — same `transaction_id`, three different `hashtag_id` values.
-
-**Parent version-bump rule (sync correctness):** any mutation to a junction row (insert, update, soft-delete) must, in the same DB transaction, also bump `version` and `updated_at` on the parent `expense_transactions` row. This is the bridge between junction-table storage and the embedded `hashtag_ids` array on the wire — without it, a hashtag-only edit would leave the parent transaction's `updated_at` stale and `GET /sync` would miss the change. The `DELETE /hashtags/{id}` cascade also bumps every transaction whose junction rows it soft-deletes. See `../CLAUDE.md` for the full sync model and [§N](api-design-principles.md) for the junction-vs-wire-format principle.
+Junction table linking hashtags to ledger transactions. A transaction with 3 hashtags produces 3 rows here — same `transaction_id`, three different `hashtag_id` values.
 
 ```
 expense_transaction_hashtags
   - id                  UUID, primary key, default uuid_generate_v4()
   - transaction_id      UUID, NOT NULL
-                        — references expense_transactions OR expense_transaction_inbox
+                        — references expense_transactions (no formal FK; see
+                          transaction_source)
   - transaction_source  smallint, NOT NULL
-                        — 1=inbox, 2=ledger
+                        — 1 = written by the ledger attach path. This is the only value
+                          that has ever been written, and every reader filters on it.
+                          The column was designed to let transaction_id reference either
+                          the ledger or the inbox, but the inbox writer was never built
+                          (see the inbox section — tags are lost by drafting there), and
+                          no CHECK constrains the value. ⚠️ An earlier revision of this
+                          document defined 1=inbox, 2=ledger; the implementation has
+                          always written 1 for ledger rows. Open product question — TODO.md.
   - hashtag_id          UUID, NOT NULL, FK → expense_hashtags
   - user_id             UUID, NOT NULL, FK → users
   - created_at          timestamptz, NOT NULL, default now()
   - updated_at          timestamptz, NOT NULL, default now()
-  - version             integer, NOT NULL, default 1
   - deleted_at          timestamptz, nullable
   - UNIQUE (transaction_id, hashtag_id)
+
+Indexes:
+  - idx_expense_transaction_hashtags_tx (transaction_id, transaction_source)
+    WHERE deleted_at IS NULL — backs the per-transaction hashtag read-back.
 ```
+
+`version` was dropped in `sql/024` — versioning lives on the parent. **Parent version-bump rule:** any mutation to a junction row (attach, detach, cascade soft-delete from `DELETE /hashtags/{id}`) bumps `version` and `updated_at` on the parent `expense_transactions` row in the same DB transaction. This keeps the parent's optimistic version honest for the embedded `hashtag_ids` array on the wire — a hashtag-only edit is an edit to the transaction as clients see it.
 
 ---
 
 ### expense_reconciliations
 
-Batch reconciliation records. Each batch belongs to one account and covers a date range. The user opens a reconciliation, marks transactions as `cleared`, and completes it when the cleared balance matches the bank statement.
+Batch reconciliation records. Each batch belongs to one account and covers a date range. The user opens a reconciliation, assigns transactions to it, and completes it when the batch matches the bank statement.
 
 ```
 expense_reconciliations
@@ -534,44 +504,25 @@ expense_reconciliations
   - date_end                  timestamptz, nullable
   - status                    smallint, NOT NULL, default 1
                               — 1=draft, 2=completed
-  - sort_order                integer, NOT NULL, default 0
-                              — per-(user_id, account_id) ordering integer, ASC.
-                              — user-controlled via PUT /accounts/{id}/reconciliations/order.
-                              — new rows append (max(sort_order)+1) unless an explicit
-                                position is supplied on POST.
-                              — soft-deleted rows keep their value but are skipped for
-                                ordering and chaining. Restoring a row reclaims its slot.
+                              — CHECK (status IN (1, 2)) — sql/025
   - beginning_balance_cents   bigint, NOT NULL, default 0
-                              — value depends on beginning_balance_source.
-                              — manual: user-entered, never silently rewritten.
-                              — chained: derived from the previous chained neighbor's
-                                ending_balance_cents (skipping soft-deleted), defaulting
-                                to 0 only when no neighbor exists.
-                              — recalculates automatically when an upstream
-                                ending_balance_cents changes (cascade rule, see engine-spec).
-  - beginning_balance_source  smallint, NOT NULL, default 1
-                              — 1=manual (sacred, never overwritten by the engine),
-                              — 2=chained (derived from the previous neighbor by sort_order).
-                              — set on POST from whether beginning_balance_cents was provided
-                                (provided=manual, omitted=chained). Toggleable via PUT.
-                              — backfill: existing rows are 1=manual to preserve current
-                                stored values verbatim.
+                              — always user-entered, never derived. Required on POST
+                                (omitting it is a 422; the DB default is vestigial).
   - ending_balance_cents      bigint, NOT NULL, default 0
-                              — user-entered from the bank statement. Always editable
-                                while status=draft. Edits trigger the chained-balance
-                                cascade on downstream rows.
+                              — user-entered from the bank statement. Editable while draft.
   - created_at                timestamptz, NOT NULL, default now()
   - updated_at                timestamptz, NOT NULL, default now()
   - version                   integer, NOT NULL, default 1
   - deleted_at                timestamptz, nullable
-
-  — partial index for chained-neighbor lookups:
-  - INDEX (user_id, account_id, sort_order) WHERE deleted_at IS NULL
 ```
 
-**Field locking on completion:** When `status = 2` (completed), four fields lock on every transaction in the batch: `amount_cents`, `account_id`, `title`, `date`. The reconciliation row itself locks `beginning_balance_cents`, `ending_balance_cents`, `date_start`, `date_end`, and `beginning_balance_source` on `PUT /reconciliations/{id}`. Un-reconciling (reverting to `status = 1`) unlocks all fields.
+`sort_order`, `beginning_balance_source`, and the chained-neighbor index were dropped in `sql/025`, deleting reconciliation chaining entirely — no path derives one reconciliation's balances from another's, and no cascade rewrites completed records.
 
-**Sort order is not editable via PUT /reconciliations/{id}** — the dedicated bulk endpoint `PUT /accounts/{account_id}/reconciliations/order` is the only path that mutates `sort_order`, because reordering must run the chained-balance cascade atomically across multiple rows.
+**Ordering:** account-scoped lists sort `date_start ASC NULLS LAST, created_at ASC` — the dates order the list; undated rows sort last. The cross-account list is `created_at DESC`. There is no user-controlled ordering.
+
+**`difference_cents` (read-time, never stored):** every read projects `(ending_balance_cents − beginning_balance_cents) − SUM(signed amount of assigned non-deleted transactions)` in SQL via `home_currency.signed_expr` — the same single sign-matrix rendering balances use. A zero difference means the batch adds up; completing with a non-zero difference is allowed — the figure informs, the user decides. Native currency only.
+
+**Field locking on completion:** When `status = 2`, four fields lock on every assigned transaction (`amount_cents`, `account_id`, `title`, `date`) and four on the reconciliation row itself (`beginning_balance_cents`, `ending_balance_cents`, `date_start`, `date_end`). Reverting to draft unlocks everything; revert restores only the status. Soft-deleting a reconciliation unassigns its transactions; restoring it deliberately does not re-link them.
 
 ---
 
@@ -589,94 +540,13 @@ Cross-user shared expenses. Deferred to the people and sharing phase. When imple
 
 ## Multi-Currency Model
 
-### The core problem
+**Authority: `docs/currency-model-decision.md`.** The schema-level summary:
 
-When a user has accounts in PEN and USD, every report — total spend by category, monthly summary, net worth — needs a single unified number. You can't sum PEN and USD directly. The solution is `amount_home_cents`: every transaction carries a pre-converted home-currency equivalent, computed at entry time. Reports always SUM `amount_home_cents`, never `amount_cents`.
-
-### Two amount fields, two purposes
-
-Every transaction has exactly two amount fields:
-
-| Field | Purpose | Currency | Mutable? |
-|---|---|---|---|
-| `amount_cents` | Accounting — what the bank sees | Account's native currency | Immutable once reconciled |
-| `amount_home_cents` | Reporting — unified dashboard total | User's home currency (PEN) | Recalculated when date or home currency changes |
-
-These two fields serve completely different systems and never interfere with each other.
-
-### How dashboard totals work
-
-```sql
--- Total Food spend this month, across all accounts and currencies
-SELECT SUM(amount_home_cents)
-FROM expense_transactions
-WHERE category = 'Food'
-  AND transaction_date >= start_of_month
-  AND transaction_type = 1  -- expenses only
-  AND deleted_at IS NULL
-```
-
-No currency conversion at query time. Every transaction already carries its home-currency value. Example:
-
-| Transaction | Native | Rate locked at entry | amount_home_cents |
-|---|---|---|---|
-| Netflix | $15.00 USD | 3.75 | S/ 56.25 |
-| Lunch | S/ 45.00 PEN | 1.00 | S/ 45.00 |
-| Spotify | $5.00 USD | 3.72 | S/ 18.60 |
-| **Total Food** | | | **S/ 119.85** |
-
-Each rate was locked when the transaction was entered. The total reflects what you actually spent at the rates that applied at the time — not what those amounts would be worth today.
-
-### Exchange rate lifecycle
-
-1. Daily job fetches the closing rate from currency-api (fawazahmed0) and inserts a row into `exchange_rates`.
-2. When a single-account transaction is created, the engine looks up the rate for that transaction's date. If no rate exists for that exact date, it falls back to the most recent available rate.
-3. The rate is written to `exchange_rate` on the transaction and `amount_home_cents` is computed and cached.
-4. The rate is now **locked**. It never changes unless the transaction date changes.
-5. If the transaction date is edited, the engine fetches the historical rate for the new date and recalculates `amount_home_cents`.
-
-### Cross-currency transfers
-
-Cross-currency transfers deliberately do **not** follow the single-account flow above. When the two legs of a transfer are in different currencies, the engine uses the **implied rate from the entered amounts** — the rate the user actually got at their bank — instead of doing two independent market-rate lookups. This guarantees the pair nets to zero in home currency by construction, which the naive "look up each leg's own rate" approach does not.
-
-The rule is dominant-side:
-
-1. The side whose currency matches `main_currency` is dominant. Its `amount_home_cents` equals its native amount, with `exchange_rate = 1.0`.
-2. The other side's `amount_home_cents` is **forced by direct assignment** to equal the dominant side's. Its `exchange_rate` is derived from that (`forced_home / native_amount`) and stored for audit/display.
-3. If neither side matches `main_currency` (a rare 3-currency case), the debit side falls back to a market-rate lookup, and the credit side is still forced to match.
-4. If the caller explicitly passes an `exchange_rate` on the primary leg, that overrides everything — the primary becomes dominant with the supplied rate, and the sibling is forced to match.
-
-The rationale is that the "execution rate" (what the user actually got) is the correct historical rate for that specific transaction — the ECB mid-market rate is a reference point, not the transaction's rate. This matches how Stripe, Wise, Xero, and QuickBooks Online all handle transaction-time FX: the rate stored on the row is the rate used for the conversion, not a delta against some market reference. FX gain/loss as a separate accounting event is a period-end remeasurement concern (IAS 21.23, QBO's "Home Currency Adjustment" pattern) and is out of scope for Phase 1.
-
-### User-overridable rate
-
-The `exchange_rate` field is always user-overridable. If you withdraw USD at an ATM and the actual rate was 3.65 (after fees), not the official 3.75, you enter 3.65. The `amount_home_cents` is then computed from your actual rate. Reconciliation against the bank statement still uses `amount_cents` in native currency — the override only affects home-currency reporting.
-
-### Reconciliation and exchange rates
-
-Reconciliation is **always done in the account's native currency**. You reconcile a USD account against a USD bank statement by matching `amount_cents` values. Exchange rates are completely irrelevant to reconciliation. The two systems never interfere.
-
-### Dashboard net worth
-
-Each account's `current_balance_cents` is computed in its native currency. To show a combined net worth, the dashboard converts each account balance using today's most recent rate. This value is approximate by nature and is labeled as such: "~S/ 4,250 equivalent." No one expects a cross-currency net worth to be exact to the cent.
-
-### Home currency change
-
-If the user changes `main_currency` (rare), the engine triggers a background job that recalculates `amount_home_cents` on every transaction using the historical rates already stored in `exchange_rates`. `amount_cents` is never touched.
-
-### Decision summary
-
-| Question | Decision |
-|---|---|
-| Store amounts | Native currency, always positive cents |
-| Rate source | currency-api (fawazahmed0), fetched daily |
-| Missing rate | Most recent available rate |
-| Rate locked | At entry time, per transaction |
-| Rate overridable | Yes — user enters actual rate received |
-| Recalculate when | Transaction date changes, or home currency changes |
-| Dashboard totals | SUM(amount_home_cents) — no conversion at query time |
-| Net worth display | Today's rate × account balance, labeled approximate |
-| Reconciliation | Always in native currency — rates irrelevant |
+- Amounts are stored in the account's native currency, always positive cents. **No conversion result is ever stored** (`sql/021`).
+- Conversion happens at read time, only on figures the user compares or sums across currencies (report/dashboard aggregates, `current_balance_home_cents`). Individual transactions, inbox items, and reconciliations carry native currency only.
+- A conversion is a lookup of the rate for that row's date in the user's `display_timezone`, carried forward from the most recent rate on or before it. No rate → the row converts to `null`, and every home-currency `SUM` is paired with an `unconverted_count` that nulls the total rather than understating it. `app/helpers/home_currency.py` is the single implementation.
+- The home currency is locked to `'PEN'` by a CHECK (`sql/018`); currencies are locked to USD/PEN (`sql/015`). Both are labelled scale boundaries, not defects.
+- A cross-currency transfer stores what each bank actually saw on each leg; the home-currency spread between the legs surfaces in `@Transfer` report figures (owner decision 2026-08-05 — no `@FX` category).
 
 ---
 
@@ -684,20 +554,20 @@ If the user changes `main_currency` (rare), the engine triggers a background job
 
 People are bank accounts with `is_person = true`. There is no separate people table. If someone shares expenses in multiple currencies, they have multiple accounts — one per currency — both shown in the People sidebar section.
 
+> ⚠️ **Structurally complete, functionally unreachable.** The engine reads `is_person` (accounts list filter, dashboard split, the transfer engine's `@Debt` branch, the opening-balance guard) but no endpoint can set it, so no row can currently be a person. Whether to build `POST /people` or delete the axis is an open product question — see TODO.md. The model below is the design the machinery implements.
+
 **Debt tracking model:** A person account's balance represents the financial position with that person. Positive balance = they owe you money. Negative balance = you owe them money. Transactions on person accounts use the `@Debt` system category automatically.
 
 **Full debt cycle example (you pay $100 lunch, split $50 with John):**
 
 | Step | Transaction | Account | Category | Balance effect |
 |---|---|---|---|---|
-| 1. Pay lunch | $100 expense | Checking | Food | Checking −100 |
-| 2. Register John's share | $50 income | John (person) | @Debt | John +50 (he owes you) |
-| 3. John pays you back | $50 expense | John (person) | @Debt | John −50 = 0 |
-| 4. Receive John's payment | $50 income | Checking | Food | Checking +50 |
+| 1. Pay lunch | $100 outflow | Checking | Food | Checking −100 |
+| 2. Register John's share | $50 inflow | John (person) | @Debt | John +50 (he owes you) |
+| 3. John pays you back | $50 outflow | John (person) | @Debt | John −50 = 0 |
+| 4. Receive John's payment | $50 inflow | Checking | Food | Checking +50 |
 
 End state: Checking −50 (your true out of pocket), Food −50 (your true food spend), John 0 (debt cleared).
-
-**Shortcut API flows:** Creating a split expense with a person and settling a debt are exposed as dedicated API endpoints that create both transactions atomically. See `engine-spec.md` for `/transactions` split field and `/accounts/{id}/settle`.
 
 **System category assignment:**
 
@@ -709,21 +579,9 @@ End state: Checking −50 (your true out of pocket), Food −50 (your true food 
 
 ---
 
-## Split Transactions
+## Split Transactions *(deferred — no schema support today)*
 
-Split transactions are modelled using `parent_transaction_id` (self-reference on `expense_transactions`).
-
-**Structure:** One parent row holds the original full amount. Child rows hold the split portions. `parent_transaction_id` on each child points to the parent's `id`.
-
-**Balance rule:** The parent row must **never** contribute to the account balance. Only child rows do. The parent is a display and grouping container — its amount equals the sum of its children's amounts. Since `sql/022` the balance is a `SUM` over the ledger rather than a field each write path updates, so this rule has to be enforced *in the sum's `WHERE` clause*, not by omitting a call. See `app/helpers/account_balance.py` for the predicate.
-
-**Creation:** Splits must be created atomically in a single API call (parent + all children together). Creating a parent alone and adding children later is not supported — it would cause an incorrect transient balance state.
-
-**Example:** $100 grocery receipt split into $60 Food and $40 Household:
-- Parent: $100, no category required, account=Checking — no balance update
-- Child 1: $60, Food, account=Checking, parent_id=[parent] — Checking −60
-- Child 2: $40, Household, account=Checking, parent_id=[parent] — Checking −40
-- Net: Checking −100 ✓
+The reserved column (`parent_transaction_id`, always null) was dropped in `sql/024`; with no column, a naive balance `SUM` is correct by construction. The documented rule — a parent row is a display container that does not move the balance; only its children do — survives as the predicate a splits migration must add to the balance sum, written out in `sql/022`'s header and `app/helpers/account_balance.py`. Splits must be created atomically (parent + all children in one call) when the feature ships.
 
 ---
 
