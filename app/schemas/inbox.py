@@ -2,10 +2,12 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict
+from pydantic import AwareDatetime, BaseModel
+
+from app.schemas import StrictModel
 
 
-class InboxTransferField(BaseModel):
+class InboxTransferField(StrictModel):
     """The sibling leg of a transfer draft.
 
     Deliberately NOT ``TransferField`` (``schemas/transactions.py``). That model
@@ -21,12 +23,10 @@ class InboxTransferField(BaseModel):
     amount_cents: int  # signed: negative=outflow from the sibling, positive=inflow
 
 
-class InboxCreateRequest(BaseModel):
+class InboxCreateRequest(StrictModel):
     # Unknown fields 422. The inbox is loose about WHICH fields are null, never
     # about what a field means — and `exchange_rate` no longer means anything
     # (sql/021), so accepting it silently would be the looser of the two.
-    model_config = ConfigDict(extra="forbid")
-
     id: UUID
     title: Optional[str] = None
     description: Optional[str] = None
@@ -37,9 +37,7 @@ class InboxCreateRequest(BaseModel):
     transfer: Optional[InboxTransferField] = None
 
 
-class InboxUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class InboxUpdateRequest(StrictModel):
     title: Optional[str] = None
     description: Optional[str] = None
     amount_cents: Optional[int] = None  # signed: negative=expense, positive=income
@@ -50,7 +48,7 @@ class InboxUpdateRequest(BaseModel):
     transfer: Optional[InboxTransferField] = None
 
 
-class InboxPromoteRequest(BaseModel):
+class InboxPromoteRequest(StrictModel):
     id: UUID  # target ledger transaction id (primary leg for transfer promotes)
     transfer_id: Optional[UUID] = None  # sibling ledger transaction id for transfer promotes
 

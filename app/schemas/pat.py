@@ -3,8 +3,10 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from app.schemas import StrictModel
 
-class PatCreateRequest(BaseModel):
+
+class PatCreateRequest(StrictModel):
     name: Optional[str] = None
 
 

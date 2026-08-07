@@ -4,14 +4,16 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from app.schemas import StrictModel
 
-class HashtagCreateRequest(BaseModel):
+
+class HashtagCreateRequest(StrictModel):
     id: UUID
     name: str
     sort_order: Optional[int] = None
 
 
-class HashtagUpdateRequest(BaseModel):
+class HashtagUpdateRequest(StrictModel):
     name: Optional[str] = None
     sort_order: Optional[int] = None
 

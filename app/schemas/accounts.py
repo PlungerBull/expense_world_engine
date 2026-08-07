@@ -2,14 +2,15 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict
+from pydantic import AwareDatetime, BaseModel
+
+from app.schemas import StrictModel
 
 
-class AccountCreateRequest(BaseModel):
-    # Reject unknown fields (including is_person) with 422 — person accounts
-    # are created via the dedicated People API, never through this endpoint.
-    model_config = ConfigDict(extra="forbid")
-
+class AccountCreateRequest(StrictModel):
+    # Unknown fields (including is_person) 422 via StrictModel — person
+    # accounts are created via the dedicated People API, never through this
+    # endpoint.
     id: UUID
     name: str
     currency_code: str
@@ -17,19 +18,16 @@ class AccountCreateRequest(BaseModel):
     sort_order: Optional[int] = None
 
 
-class OpeningBalanceRequest(BaseModel):
-    # Unknown fields 422 — same posture as AccountCreateRequest. The
-    # transaction id is client-supplied (UUID-first convention) so bulk
+class OpeningBalanceRequest(StrictModel):
+    # The transaction id is client-supplied (UUID-first convention) so bulk
     # importers get deterministic dedup on re-runs.
-    model_config = ConfigDict(extra="forbid")
-
     transaction_id: UUID
     amount_cents: int  # signed: positive = money you had, negative = starting debt
     date: AwareDatetime
     title: Optional[str] = None  # defaults to "Opening balance"
 
 
-class AccountUpdateRequest(BaseModel):
+class AccountUpdateRequest(StrictModel):
     name: Optional[str] = None
     color: Optional[str] = None
     sort_order: Optional[int] = None

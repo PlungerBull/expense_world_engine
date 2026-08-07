@@ -2,14 +2,13 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 
+from app.schemas import StrictModel
 from app.schemas.transactions import TransactionResponse
 
 
-class ReconciliationCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class ReconciliationCreateRequest(StrictModel):
     id: UUID
     account_id: str
     name: str
@@ -24,9 +23,7 @@ class ReconciliationCreateRequest(BaseModel):
     ending_balance_cents: Optional[int] = None
 
 
-class ReconciliationUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class ReconciliationUpdateRequest(StrictModel):
     name: Optional[str] = None
     date_start: Optional[datetime] = None
     date_end: Optional[datetime] = None

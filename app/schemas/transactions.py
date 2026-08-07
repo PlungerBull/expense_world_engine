@@ -2,24 +2,23 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, Field
 
 from app.constants import TransactionType
+from app.schemas import StrictModel
 
 
-class TransferField(BaseModel):
+class TransferField(StrictModel):
     id: UUID  # sibling transaction's client-supplied uuid
     account_id: str
     amount_cents: int  # signed: negative=outflow, positive=inflow
 
 
-class TransactionCreateRequest(BaseModel):
+class TransactionCreateRequest(StrictModel):
     # Unknown fields 422 rather than being silently dropped. This is what makes
     # the removal of `exchange_rate` (sql/021) visible to a client still sending
     # it: the engine no longer stores a rate anywhere, and a caller who believes
     # the value matters deserves to be told it does not.
-    model_config = ConfigDict(extra="forbid")
-
     id: UUID
     title: str
     amount_cents: int  # signed: negative=expense, positive=income
@@ -35,9 +34,7 @@ class TransactionCreateRequest(BaseModel):
     transfer: Optional[TransferField] = None
 
 
-class TransactionUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class TransactionUpdateRequest(StrictModel):
     title: Optional[str] = None
     amount_cents: Optional[int] = None  # signed: negative=expense, positive=income
     date: Optional[AwareDatetime] = None
@@ -49,7 +46,7 @@ class TransactionUpdateRequest(BaseModel):
     reconciliation_id: Optional[str] = None
 
 
-class TransactionBatchRequest(BaseModel):
+class TransactionBatchRequest(StrictModel):
     transactions: list[TransactionCreateRequest]
 
 

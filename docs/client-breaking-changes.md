@@ -11,6 +11,37 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-06 — every request model now fails closed: unknown fields 422 on all writes
+
+**Engine change.** Bloat audit 2026-08-06, Correctness §2. `extra="forbid"` was
+copy-pasted onto 11 request models and missing from 10; all request models now
+inherit a single `StrictModel` base (`app/schemas/__init__.py`), so every write
+endpoint rejects unknown fields with `422 VALIDATION_ERROR` instead of silently
+dropping them (fail-closed: unknown input must 422).
+
+**What breaks.** A client sending retired or misspelled keys on these
+previously-leaky shapes now 422s:
+
+- `PUT /accounts/{id}`
+- `POST /categories`, `PUT /categories/{id}`
+- `POST /hashtags`, `PUT /hashtags/{id}`
+- `POST /auth/pat`
+- `POST /inbox/{id}/promote`
+- `POST /transactions/batch` (top-level body; per-item junk already 422'd)
+- junk **inside the nested `transfer` object** on `POST /transactions`,
+  `POST /inbox`, `PUT /inbox/{id}` — Pydantic config does not propagate into
+  nested models, so `transfer.{unknown}` was dropped even where the parent
+  already forbade extras
+
+The error names the offending key in `fields`, nested keys as dotted paths
+(`transfer.bogus`, `transactions.0.bogus`).
+
+**What the client must do.** Audit payload builders for the routes above and
+stop sending anything not in the documented request shape. No well-formed
+request changes.
+
+---
+
 ## 2026-08-06 — reconciliation simplification: chaining and manual ordering deleted, beginning balance required, `difference_cents` added
 
 **Engine change.** WP6 of the deletion program (`sql/025`; program docs in git history). Reconciliation chaining rewrote a

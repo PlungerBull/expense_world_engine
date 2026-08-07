@@ -4,15 +4,17 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from app.schemas import StrictModel
 
-class CategoryCreateRequest(BaseModel):
+
+class CategoryCreateRequest(StrictModel):
     id: UUID
     name: str
     color: str
     sort_order: Optional[int] = None
 
 
-class CategoryUpdateRequest(BaseModel):
+class CategoryUpdateRequest(StrictModel):
     name: Optional[str] = None
     color: Optional[str] = None
     sort_order: Optional[int] = None

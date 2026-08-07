@@ -1,12 +1,12 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
+
+from app.schemas import StrictModel
 
 
-class BootstrapRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class BootstrapRequest(StrictModel):
     display_name: str
     timezone: str
 
@@ -33,9 +33,7 @@ class BootstrapResponse(BaseModel):
     settings: UserSettingsResponse
 
 
-class SettingsUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class SettingsUpdateRequest(StrictModel):
     # Not updatable — the home currency is locked to PEN (sql/018). Declared
     # here only so update_settings can reject it with a 422; dropping the
     # field would make Pydantic reject it as unknown with a generic message,
@@ -44,9 +42,7 @@ class SettingsUpdateRequest(BaseModel):
     display_timezone: Optional[str] = None
 
 
-class ProfileUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class ProfileUpdateRequest(StrictModel):
     display_name: Optional[str] = None
 
 
