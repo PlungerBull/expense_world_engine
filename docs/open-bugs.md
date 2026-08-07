@@ -72,25 +72,4 @@ missing `transaction_source = 1`.
 | **D7** | Person accounts uncreatable = parked feature gap, not a defect. Correct the spec's People API claims. |
 | **D8** | ~~`parent_transaction_id` stays reserved and `null`.~~ **Superseded by the 2026-08-04 audit:** the column was a placeholder, not a foundation — dropped in `sql/024` (WP5). Splits get designed fresh if they ever ship; the parent-exclusion predicate they will need is preserved in `sql/022`'s header. |
 
----
-
-## Closed since the audit
-
-`1.1` recalculation deleted · `1.6` void (repro needed a currency switch) ·
-`2.1` **JWT forgery — auth branch deleted 2026-08-03**, `tests/test_auth_over_the_wire.py`
-pins it · `2.2` JWKS fetch — `jwks.py` deleted with the branch ·
-`5.1`/`5.2`/`5.4` superseded by D3 · `7.2`/`7.3` inbox transfer direction, `sql/019` ·
-`10.2` inbox `debit_as_negative` flip · `1.3`/`1.2` transfer collapse, `sql/020` ·
-**`1.4`/`1.5`/`2.3` read-time currency, `sql/021`** — all three by deletion rather than
-repair: with no stored conversion there is no rate to default to `1.0`, nothing to go
-stale when an account changes, and no `resolve_home_rates` to read an account without
-a `user_id` filter · **`3.1` delta sync dropping committed writes — `/sync` deleted,
-`sql/023`**, along with the ⚪ `X-Client-Id` case-normalisation nit,
-both by deletion · **`6.4` settings validation — `sql/024`**:
-`display_timezone` validated on both write paths, the six echo-only preference
-fields deleted, auth schemas `extra="forbid"` · **`5.3` dead `sort_order` guard —
-`sql/025`**: the column, the guard and the reorder endpoint are
-all gone, and the reconciliation request schemas are `extra="forbid"`, so the
-field now 422s at the root.
-
-Details are in git history — `git log -- docs/open-bugs.md`.
+Closed entries are deleted, not listed — `git log -- docs/open-bugs.md` holds them.
