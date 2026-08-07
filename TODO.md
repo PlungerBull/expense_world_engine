@@ -2,7 +2,22 @@
 
 Operational / deployment tasks, plus accepted design changes awaiting scheduling — work that is not part of normal code review. Each entry describes what needs to happen, why, and when it becomes blocking. **Delete an entry when it closes — git history holds the record; do not keep tombstones here.**
 
-One parked product question and one accepted-but-unscheduled feature are the only open items.
+One parked product question, one accepted-but-unscheduled feature, and the bug burn-down are the open items.
+
+---
+
+## Bug burn-down — the remaining open defects, in fix order
+
+The 2026-08-07 verification audit confirmed every previously closed bug is genuinely fixed (each pinned by a test) and these are what remain. **Detail lives only in [docs/open-bugs.md](docs/open-bugs.md)** — this entry is the schedule, not a second copy; delete a line here when its row leaves that file.
+
+1. **6.6 + 6.7 together** — UUID-valued body fields typed `str`, and system categories accepted on ordinary transactions (three boundary call sites: create, update, batch). Paired because both are boundary-validation changes in the same schemas/helpers.
+2. **7.1** — inbox writes do no referential/ownership validation.
+3. **5.5** — the four reconciliation state-machine gaps.
+4. **8.2** — batch/transfer CREATE snapshots log `hashtag_ids: []`.
+5. **1.7 remainder** — dedicated FX-hygiene pass: rate plausibility vs prior day, negative-lookup cache TTL, archived-account currencies in the fetch list, `Decimal`/`ROUND_HALF_UP`.
+6. **Two ⚪ lows** — `restore_category` skips the reserved-name check (7.4-r); `?hashtag_id=` filter lacks `transaction_source = 1` (or fold into the inbox-hashtags feature below, whichever ships first).
+
+**When it becomes blocking:** nothing here corrupts data today — that severity tier is empty — but 7.1 and 6.6 turn typos into 500s on daily-use paths, so the burn-down should precede any new feature work.
 
 ---
 
