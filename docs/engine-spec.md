@@ -14,7 +14,7 @@
 
 **Client-supplied UUIDs:** Every `POST` that creates a resource requires an `id: UUID` field in the request body. The client generates the UUID locally (e.g., `uuid4()`) before making the call — the server never picks the id. This enables offline-first clients to reference a resource before the request completes, and makes idempotent retries trivial: a second POST with the same `id` returns `409 CONFLICT` (existing resource), not a duplicate.
 
-**Idempotency:** Write operations (`POST`, `PUT`, `DELETE`) should include `X-Idempotency-Key: <uuid>`. The engine records `(user_id, key) → (response_body, response_status)` in `idempotency_keys` and acquires a transaction-scoped advisory lock on every incoming request to serialize concurrent retries with the same key at the DB. Duplicate requests return the stored response **verbatim, including the original HTTP status code** — no per-route drift. TTL is 24 hours.
+**Idempotency:** Write operations (`POST`, `PUT`, `DELETE`) should include `X-Idempotency-Key: <uuid>`. The engine records `(user_id, key) → (response_body, response_status, request_hash)` in `idempotency_keys` and acquires a transaction-scoped advisory lock on every incoming request to serialize concurrent retries with the same key at the DB. Duplicate requests return the stored response **verbatim, including the original HTTP status code** — no per-route drift. Keys are **permanent** (`sql/026`): there is no TTL, no purge, and a replay works identically a year later. Replay requires the *same request* — each key stores a fingerprint (sha256 over method, path, query string, raw body), and reusing a key with a different request returns `409 CONFLICT` instead of the unrelated snapshot. One exception: `POST /auth/pat` responses are never snapshotted (they carry the one-time plaintext token); replaying that key returns `409 CONFLICT`.
 
 **Sign convention — requests:** `amount_cents` in request bodies uses a signed convention. The engine infers `transaction_type` from the sign — the caller never fills it in manually. Negative = expense/outflow (subtracts from balance). Positive = income/inflow (adds to balance). Transfers are identified by the presence of a `transfer` field in the request body, not by sign.
 
@@ -148,7 +148,7 @@ All fields are optional; the endpoint is forward-compatible so future identity f
 - Mutable in v1: `display_name` only. `id` and `last_login_at` are returned for context but are **read-only** — `last_login_at` is owned by the bootstrap flow.
 - Only `updated_at` and the supplied fields are touched in the UPDATE. `last_login_at` is explicitly preserved so the profile endpoint cannot masquerade as a login event.
 
-**Idempotency:** `X-Idempotency-Key` with 24h TTL. Standard replay semantics — same key returns the stored response verbatim regardless of a differing body.
+**Idempotency:** standard `X-Idempotency-Key` semantics — same key + same body returns the stored response verbatim; same key + a differing body returns `409 CONFLICT` (the request fingerprint, `sql/026`).
 
 **Activity log:** one `UPDATED` entry under `resource_type = "user"`, `resource_id = user_id`, with full `UserResponse`-shaped before/after snapshots.
 
@@ -175,6 +175,8 @@ Mints a new Personal Access Token for the authenticated caller. Long-lived, non-
 ```
 
 The plaintext `token` is returned **exactly once**. The engine stores only its SHA-256 hash; losing the plaintext means the user must mint a new token and revoke the old one. The `token_prefix` (first 12 chars) is kept in cleartext for display.
+
+**Idempotency exception (`sql/026`):** this is the one route whose response is never snapshotted into `idempotency_keys` — a stored copy would keep the plaintext in the database forever now that keys are permanent. The key is still claimed (concurrent retries stay serialized and cannot double-mint), but a replay returns `409 CONFLICT`; the client mints a fresh token with a new key instead.
 
 **Design notes:**
 - **Unlimited tokens per user.** Each device/integration can carry its own token; revoking one doesn't affect others. Matches GitHub/Stripe.

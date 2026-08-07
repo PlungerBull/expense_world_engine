@@ -120,7 +120,7 @@ Active-row: `routers/accounts.py:141`, `routers/categories.py:75`, `routers/hash
 | `'opening_balance'` | `monthly_report.py:174`, `:211`, `:278` | bind/interpolate `SystemCategoryKey.OPENING_BALANCE` (`accounts.py:186` already does it right) |
 | Status literals in SQL | `inbox.py:446`, `:632` · `reconciliations.py:150`, `:322`, `:392` · `transactions.py:459`, `:489`, `:753` (`== 2` with the enum imported in scope) | use `InboxStatus` / `ReconciliationStatus`; makes `InboxStatus.PROMOTED` live |
 | `transaction_source = 1` | `transactions.py:100,144,204,222,683,718,977,1021` | `TransactionSource(IntEnum): LEDGER = 1; INBOX = 2` in `constants.py` (confirm inbox value against schema) |
-| Idempotency TTL | `idempotency.py:103` (`interval '24 hours'` inside an SQL string) | `IDEMPOTENCY_TTL_HOURS = 24`, testable |
+| ~~Idempotency TTL~~ | ~~`idempotency.py:103` (`interval '24 hours'` inside an SQL string)~~ | ✅ Moot 2026-08-07 — `sql/026` deleted the TTL outright (keys are permanent; open-bugs 4.1); there is no interval left to name |
 | Hex color defaults | `accounts.py:119` (`#3b82f6`), `categories.py:60` (`#6b7280`) — restating `sql/003` column DEFAULTs | omit the column when caller passed nothing; let the DB default own it |
 | ~~"Today" for rate lookups~~ | ~~`helpers/accounts.py:57` · `routers/accounts.py:82` · `routers/dashboard.py:71` · `routers/exchange_rates.py:23`~~ | ✅ Done 2026-08-06 (`040f1a7`) — `rate_lookup_date()` in `exchange_rate.py`, resolving in `display_timezone` (Correctness §7) |
 

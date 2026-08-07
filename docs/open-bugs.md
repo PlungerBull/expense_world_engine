@@ -14,14 +14,7 @@ Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high
 
 ## 🔴 Critical
 
-### 4.1 — Expired idempotency keys duplicate financial writes
-`helpers/idempotency.py` — `_claim` correctly ignores rows past `expires_at`, so the
-write re-executes; but `_store`'s `ON CONFLICT DO NOTHING` then hits the surviving
-UNIQUE row and writes nothing, leaving the stale row in place forever. Any retry of
-the same request after 24 h writes a second ledger row.
-**Validate:** insert a key with `expires_at` in the past, replay twice, count rows.
-**Fix:** `ON CONFLICT ... DO UPDATE ... WHERE idempotency_keys.expires_at <= now()`.
-Add a purge job — the table grows unbounded today.
+*(none open)*
 
 ---
 
@@ -37,7 +30,6 @@ Add a purge job — the table grows unbounded today.
 ## 🟡 Medium
 
 - **1.7** Rate hygiene — provider-rate validation, negative-lookup cache TTL, archived-account currencies missing from the fetch target list, `Decimal`/`ROUND_HALF_UP` instead of float. ⚠️ **Higher stakes since `sql/021`:** `exchange_rates` is now the only source of every home-currency figure, so a bad provider row misprices reports rather than one write. The float/rounding half is why `tests/test_home_currency_parity.py` compares rates and not cents — SQL keeps full `numeric` and rounds half-away-from-zero, while `_fetch_rate_from_db` truncates to binary float and Python rounds half-to-even.
-- **2.4** PAT plaintext sits 24 h in `idempotency_keys.response_snapshot`, cancelling "only the hash is stored". Exempt `POST /auth/pat` from snapshot storage; return `409` on replay.
 - **5.5** Reconciliation state-machine gaps — all four live in `helpers/transactions.py` interactions, so they survived WP6's deletion of the chaining machinery. (Re-elaborated 2026-08-06 from the pre-compression remediation plan; the one-liner had lost the content.)
   - Unassigning a transaction from a COMPLETED reconciliation via `PUT /transactions/{id}` (`reconciliation_id: null`) is silent and unguarded — assignment *to* a completed one is refused, and DELETE at least warns. Sharper since WP6: unassignment now visibly changes a completed reconciliation's `difference_cents`. Emit the same warning, or block symmetrically with assignment.
   - `PUT` changing `reconciliation_id` alongside other fields bumps the transaction's `version` twice, breaking read-modify-write conflict detection. Single bump.

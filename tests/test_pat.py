@@ -80,7 +80,16 @@ async def test_create_pat_with_null_name(client, test_data):
 
 
 @pytest.mark.asyncio
-async def test_create_pat_replay_returns_identical_body(client, test_data):
+async def test_create_pat_replay_returns_409_and_no_stored_plaintext(client, test_data):
+    """PAT creation is deliberately NOT replayable (bug 2.4, sql/026).
+
+    The response carries the plaintext token, shown exactly once. Since
+    idempotency keys are permanent, a stored snapshot would keep the
+    plaintext forever — cancelling "only the hash is stored". So the key
+    is claimed but the snapshot is a JSON null marker: a replay gets 409
+    in the standard error shape, no second PAT row is minted, and the
+    plaintext appears nowhere in idempotency_keys.
+    """
     idempotency_key = str(uuid.uuid4())
     pat_id = None
     try:
@@ -98,18 +107,31 @@ async def test_create_pat_replay_returns_identical_body(client, test_data):
             json={"name": "replay"},
             headers={"X-Idempotency-Key": idempotency_key},
         )
-        assert second.status_code == 201
-        # Byte-for-byte equality — including the one-shot token value,
-        # which is the whole point of caching the full response.
-        assert second.json() == first_body
+        assert second.status_code == 409, (
+            f"PAT replay must refuse to re-serve the one-time secret, "
+            f"got {second.status_code}: {second.text}"
+        )
+        err = second.json()["error"]
+        assert err["code"] == "CONFLICT"
+        assert err["message"]
+        assert "fields" in err
 
-        # Exactly one PAT row — replay didn't double-insert.
         async with db.pool.acquire() as conn:
+            # Exactly one PAT row — the 409 replay didn't double-insert.
             count = await conn.fetchval(
                 "SELECT count(*) FROM personal_access_tokens WHERE user_id = $1",
                 test_data.user_id,
             )
+            # The key row exists (claimed) but its snapshot is JSON null —
+            # the plaintext is not in the DB in any form.
+            snapshot = await conn.fetchval(
+                "SELECT response_snapshot::text FROM idempotency_keys "
+                "WHERE user_id = $1 AND key = $2",
+                test_data.user_id, idempotency_key,
+            )
         assert count == 1
+        assert snapshot == "null"
+        assert first_body["token"] not in snapshot
     finally:
         await _cleanup_pat(pat_id, test_data.user_id, idempotency_keys=[idempotency_key])
 

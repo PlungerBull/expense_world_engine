@@ -40,7 +40,7 @@ These rules apply to all mutable tables unless explicitly noted as an exception.
 - `users` — managed alongside auth; no version, no deleted_at
 - `user_settings` — has `version`, has **no** `deleted_at` (`sql/024`)
 - `activity_log` — immutable append-only audit trail. No soft delete, no version, no updated_at.
-- `idempotency_keys` — expire via TTL; hard-deleted by a cleanup job after expiry.
+- `idempotency_keys` — permanent (`sql/026`); rows are never deleted. Growth at the owner's write rate is a few MB/year.
 - `expense_transaction_hashtags` — has `deleted_at`, has **no** `version` (`sql/024`); versioning lives on the parent transaction (see the table's section).
 
 ### Row-level security
@@ -139,7 +139,7 @@ exchange_rates
 
 ### idempotency_keys
 
-Deduplicates write operations. Clients send a unique key per intended write. If the server has already processed that key, it returns the stored response instead of creating a duplicate. Entries expire after 24 hours and are cleaned up by a background job.
+Deduplicates write operations. Clients send a unique key per intended write. If the server has already processed that key, it returns the stored response instead of creating a duplicate. Keys are **permanent** (`sql/026` dropped `expires_at`): a used key replays forever, and nothing deletes rows. Replay requires the same request — a reused key whose `request_hash` doesn't match answers `409`.
 
 **Why this matters:** A CLI or app sends "create $50 Food expense" → network timeout → client retries → without idempotency, two $50 expenses are created. With idempotency, the retry gets the original response and no duplicate is created.
 
@@ -149,17 +149,23 @@ idempotency_keys
   - key                text, NOT NULL
   - user_id            UUID, NOT NULL, FK → users
   - response_snapshot  jsonb, NOT NULL
-                       — stored response BODY returned verbatim on duplicate requests
+                       — stored response BODY returned verbatim on duplicate requests.
+                         JSON null (not SQL NULL) for POST /auth/pat: its response
+                         carries the one-time plaintext token and is deliberately
+                         not replayable — replays answer 409 (sql/026, bug 2.4).
   - response_status    smallint, NOT NULL, default 200
                        — HTTP status captured alongside the body so replays reconstruct
                          the full envelope verbatim. Added in sql/011.
-  - expires_at         timestamptz, NOT NULL
-                       — now() + 24 hours, set when the key row is claimed
+  - request_hash       text, NOT NULL
+                       — sha256 fingerprint of (method, path, query, raw body). A
+                         replay with a different fingerprint 409s instead of returning
+                         the unrelated snapshot. '' on rows stored before sql/026
+                         (grandfathered: comparison skipped).
   - created_at         timestamptz, NOT NULL, default now()
   - UNIQUE (user_id, key)
 ```
 
-`processed_at` was dropped in `sql/024` — written on every claim, read never. (An earlier revision of this document claimed `expires_at` was "`processed_at` + 24 hours"; it never was — the TTL has always been anchored to claim time, `now() + 24 hours`.)
+`processed_at` was dropped in `sql/024` — written on every claim, read never. `expires_at` followed in `sql/026` when the 24-hour TTL itself was deleted (while it existed, it was anchored to claim time, `now() + 24 hours` — never to `processed_at`, despite what an earlier revision of this document claimed).
 
 **Concurrency:** Every write handler acquires a transaction-scoped Postgres advisory lock (`pg_advisory_xact_lock`) hashed from `(user_id, key)` as the first statement inside the write transaction. Two concurrent requests with the same key serialize at the DB — the second blocks until the first commits, then reads the stored snapshot and returns it. This closes the check-then-store race that would otherwise allow duplicate side effects.
 

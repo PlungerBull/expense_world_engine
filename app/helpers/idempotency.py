@@ -6,6 +6,25 @@ whether the request is a first-time write or a replay.
 
 Design notes:
 
+* **Keys are permanent** (sql/026). A used ``X-Idempotency-Key`` returns
+  its stored response forever — there is no TTL, no purge job, and no
+  expired-key state. This mirrors the layer underneath it: ledger creates
+  carry client-generated UUID primary keys (UUID-first), so the PK dedup
+  never forgets either. One promise across both layers: a write you
+  already made stays made, and asking again gets the original answer.
+  (The 24h TTL this replaced never re-armed after expiry — bug 4.1 — so
+  every post-expiry retry re-ran the write with no dedup at all.)
+
+* **Replay requires the same request.** Each key stores a fingerprint —
+  sha256 over (method, path, query, raw body) — and a replay whose
+  fingerprint differs answers ``409 CONFLICT`` instead of returning a
+  snapshot that belongs to some other request (fail closed: a client bug
+  that reuses a key must be loud, not silently swallowed forever). The
+  fingerprint is captured structurally by ``capture_request_fingerprint``,
+  an app-wide dependency registered in ``main.py`` — no route passes it,
+  so no route can forget it. Rows stored before sql/026 carry
+  ``request_hash = ''`` and skip the comparison (grandfathered).
+
 * The per-(user, key) lock is a Postgres transaction-scoped advisory
   lock (``pg_advisory_xact_lock``). Two concurrent requests with the
   same key serialize at the DB: the second blocks until the first
@@ -17,6 +36,12 @@ Design notes:
   future handler that forgets to wrap the result in ``JSONResponse(...,
   status_code=201)`` can't silently downgrade replay to 200.
 
+* **One-time secrets are never snapshotted.** A route whose response
+  contains a value that must not persist (the PAT plaintext — bug 2.4)
+  passes ``store_snapshot=False``: the key row is still claimed (with its
+  fingerprint), but the snapshot is stored as JSON ``null`` and a replay
+  answers ``409 CONFLICT`` instead of re-serving the secret.
+
 * Routes supply the write work as a callable ``work(conn) -> dict``.
   The helper owns the connection + transaction + lock + store so the
   handler stays pure glue.
@@ -25,16 +50,50 @@ Design notes:
 import hashlib
 import json
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 import asyncpg
+from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from app import db
+from app.errors import conflict
 
 
 Work = Callable[[asyncpg.Connection], Awaitable[dict]]
+
+# Set per-request by capture_request_fingerprint (app-wide dependency,
+# registered in main.py). ContextVars propagate through the async call
+# chain of the request's task, so run_idempotent reads the value without
+# any route threading it through.
+_request_fingerprint: ContextVar[Optional[str]] = ContextVar(
+    "request_fingerprint", default=None
+)
+
+
+async def capture_request_fingerprint(request: Request) -> None:
+    """App-wide dependency: fingerprint the raw request for idempotency.
+
+    Hashes method, path, query string and raw body. Query params are
+    included because they can change the stored response (e.g.
+    ``?debit_as_negative=true``). Reading the body here is safe: Starlette
+    caches it on the Request, so downstream model parsing reuses the same
+    bytes. Runs on every route (GETs included, harmlessly) — registering
+    it globally is what makes the fingerprint impossible to forget.
+    """
+    body = await request.body()
+    digest = hashlib.sha256()
+    for part in (
+        request.method.encode(),
+        request.url.path.encode(),
+        request.url.query.encode(),
+    ):
+        digest.update(part)
+        digest.update(b"\x00")
+    digest.update(body)
+    _request_fingerprint.set(digest.hexdigest())
 
 
 def _lock_id(user_id: str, key: str) -> int:
@@ -53,12 +112,18 @@ async def _claim(
     conn: asyncpg.Connection,
     user_id: str,
     key: Optional[str],
+    fingerprint: Optional[str],
 ) -> Optional[_Cached]:
     """Acquire the per-key lock and return any previously stored response.
 
     Must run as the first statement inside the write transaction. Returns
     None if this is a first-time write (caller proceeds with the work);
     returns a cached envelope if a prior request already completed.
+
+    Raises:
+        conflict (409): the key exists but was used for a different
+            request (fingerprint mismatch), or its response holds a
+            one-time secret that is deliberately not replayable.
     """
     if key is None:
         return None
@@ -67,40 +132,58 @@ async def _claim(
     )
     row = await conn.fetchrow(
         """
-        SELECT response_snapshot, response_status FROM idempotency_keys
-        WHERE user_id = $1 AND key = $2 AND expires_at > now()
+        SELECT response_snapshot, response_status, request_hash
+        FROM idempotency_keys
+        WHERE user_id = $1 AND key = $2
         """,
         user_id,
         key,
     )
     if row is None:
         return None
-    return _Cached(
-        body=json.loads(row["response_snapshot"]),
-        status=int(row["response_status"]),
-    )
+    # '' = row stored before sql/026 introduced fingerprints; comparison
+    # is skipped so a legitimate pre-migration retry still replays.
+    if row["request_hash"] and row["request_hash"] != fingerprint:
+        raise conflict(
+            "This idempotency key was already used for a different request. "
+            "Send one unique key per intended write."
+        )
+    body = json.loads(row["response_snapshot"])
+    if body is None:
+        # store_snapshot=False path: the original response carried a
+        # one-time secret (PAT plaintext) and is not replayable.
+        raise conflict(
+            "This idempotency key was already used, and the original "
+            "response contained a one-time secret that cannot be replayed. "
+            "Retry with a new key to perform a new write."
+        )
+    return _Cached(body=body, status=int(row["response_status"]))
 
 
 async def _store(
     conn: asyncpg.Connection,
     user_id: str,
     key: Optional[str],
-    body: dict,
+    fingerprint: Optional[str],
+    body: Optional[dict],
     status: int,
 ) -> None:
     """Persist the final response envelope for this key.
 
     Called inside the same transaction as the write, just before commit.
-    On conflict (shouldn't happen under the advisory lock, but belt and
-    braces) the insert is a no-op.
+    ``body=None`` stores JSON ``null`` — the claimed-but-not-replayable
+    marker for one-time-secret responses. On conflict (shouldn't happen
+    under the advisory lock, but belt and braces) the insert is a no-op;
+    with permanent keys there is no expired-row state a conflict could
+    mask, so DO NOTHING is now exactly right rather than bug 4.1's trap.
     """
     if key is None:
         return
     await conn.execute(
         """
         INSERT INTO idempotency_keys
-            (id, key, user_id, response_snapshot, response_status, expires_at, created_at)
-        VALUES ($1, $2, $3, $4::jsonb, $5, now() + interval '24 hours', now())
+            (id, key, user_id, response_snapshot, response_status, request_hash, created_at)
+        VALUES ($1, $2, $3, $4::jsonb, $5, $6, now())
         ON CONFLICT (user_id, key) DO NOTHING
         """,
         str(uuid.uuid4()),
@@ -108,6 +191,7 @@ async def _store(
         user_id,
         json.dumps(body),
         status,
+        fingerprint,
     )
 
 
@@ -116,14 +200,15 @@ async def run_idempotent(
     key: Optional[str],
     status_code: int,
     work: Work,
+    store_snapshot: bool = True,
 ) -> JSONResponse:
     """Run a write under the idempotency guard.
 
     Acquires a pooled connection, opens a transaction, claims the per-key
     advisory lock, runs ``work(conn)`` inside the same transaction, stores
-    the response envelope (body + status), and returns a ``JSONResponse``.
-    Cached hits skip ``work`` entirely and return the stored envelope
-    verbatim.
+    the response envelope (body + status + request fingerprint), and
+    returns a ``JSONResponse``. Cached hits skip ``work`` entirely and
+    return the stored envelope verbatim.
 
     ## Transaction boundaries and locks — the convention for every service helper
 
@@ -160,11 +245,32 @@ async def run_idempotent(
         work: ``async def(conn) -> dict`` — the write body. Must return
             a dict that's already JSON-serializable (Pydantic's
             ``model_dump(mode="json")`` output).
+        store_snapshot: False for responses carrying a one-time secret
+            (PAT plaintext — bug 2.4). The key is still claimed and
+            fingerprinted, but replays answer 409 instead of re-serving
+            the secret.
     """
+    fingerprint = _request_fingerprint.get()
+    if key is not None and fingerprint is None:
+        # Programming error, not client error: the app-wide dependency
+        # (main.py) was not registered or this was called outside a
+        # request. Fail loudly rather than storing an unfingerprinted key.
+        raise RuntimeError(
+            "run_idempotent called with an idempotency key but no request "
+            "fingerprint; capture_request_fingerprint must be registered "
+            "as an app-wide dependency."
+        )
     async with db.pool.acquire() as conn, conn.transaction():
-        cached = await _claim(conn, user_id, key)
+        cached = await _claim(conn, user_id, key, fingerprint)
         if cached is not None:
             return JSONResponse(content=cached.body, status_code=cached.status)
         response = await work(conn)
-        await _store(conn, user_id, key, response, status_code)
+        await _store(
+            conn,
+            user_id,
+            key,
+            fingerprint,
+            response if store_snapshot else None,
+            status_code,
+        )
         return JSONResponse(content=response, status_code=status_code)

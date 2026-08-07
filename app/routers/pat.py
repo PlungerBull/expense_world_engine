@@ -36,6 +36,11 @@ async def create_pat(
         x_idempotency_key,
         status_code=201,
         work=lambda conn: pat_service.create(conn, auth_user.id, body.name),
+        # The response carries the PAT plaintext, shown exactly once. With
+        # permanent idempotency keys (sql/026) a stored snapshot would keep
+        # it forever, cancelling "only the hash is stored" (bug 2.4).
+        # Replays of this key answer 409 instead.
+        store_snapshot=False,
     )
 
 

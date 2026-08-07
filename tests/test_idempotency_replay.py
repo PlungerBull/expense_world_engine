@@ -204,3 +204,155 @@ async def test_replay_preserves_200_status_for_put(client, test_data):
                 "DELETE FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
                 account_id, test_data.user_id,
             )
+
+
+@pytest.mark.asyncio
+async def test_replay_works_forever_no_expiry(client, test_data):
+    """Idempotency keys are permanent (sql/026, bug 4.1).
+
+    Under the old 24h TTL, an expired key was invisible to the claim but
+    still blocked the re-store (`ON CONFLICT DO NOTHING`), so the key went
+    permanently dead and every later retry re-ran the write. Keys no
+    longer expire: a replay arbitrarily long after the original write must
+    return the stored response and execute nothing. Simulated by
+    backdating created_at far past the old TTL — with no expiry filter,
+    the row's age must be irrelevant.
+    """
+    idempotency_key = str(uuid.uuid4())
+    payload = {
+        "id": str(uuid.uuid4()),
+        "title": f"permanent-{uuid.uuid4()}",
+        "amount_cents": -1250,
+        "date": "2026-05-01T10:00:00Z",
+        "account_id": test_data.account_id,
+        "category_id": test_data.category_id,
+    }
+    txn_id = None
+    try:
+        first = await client.post(
+            "/v1/transactions",
+            json=payload,
+            headers={"X-Idempotency-Key": idempotency_key},
+        )
+        assert first.status_code == 201, first.text
+        first_body = first.json()
+        txn_id = first_body["id"]
+
+        # Age the key row 30 days — well past the deleted 24h TTL.
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE idempotency_keys
+                SET created_at = created_at - interval '30 days'
+                WHERE key = $1 AND user_id = $2
+                """,
+                idempotency_key, test_data.user_id,
+            )
+
+        second = await client.post(
+            "/v1/transactions",
+            json=payload,
+            headers={"X-Idempotency-Key": idempotency_key},
+        )
+        assert second.status_code == 201, (
+            f"A 30-day-old key must still replay, got {second.status_code}: {second.text}"
+        )
+        assert second.json() == first_body
+
+        async with db.pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT count(*) FROM expense_transactions WHERE id = $1 AND user_id = $2",
+                txn_id, test_data.user_id,
+            )
+        assert count == 1, f"Aged-key replay must not re-run the write, found {count} rows"
+    finally:
+        await _cleanup_transaction(txn_id, idempotency_key, test_data.user_id)
+
+
+@pytest.mark.asyncio
+async def test_key_reuse_with_different_body_is_409(client, test_data):
+    """Reusing a key for a DIFFERENT request must be loud (sql/026).
+
+    Before the request fingerprint, a reused key silently returned the
+    unrelated stored response and the new write vanished — and with
+    permanent keys that client bug would be swallowed forever. Now the
+    stored sha256(method, path, query, body) mismatches and the engine
+    answers 409 in the standard error shape, leaving the original
+    snapshot intact and executing nothing.
+    """
+    idempotency_key = str(uuid.uuid4())
+    payload = {
+        "id": str(uuid.uuid4()),
+        "title": f"fingerprint-{uuid.uuid4()}",
+        "amount_cents": -500,
+        "date": "2026-05-02T10:00:00Z",
+        "account_id": test_data.account_id,
+        "category_id": test_data.category_id,
+    }
+    txn_id = None
+    try:
+        first = await client.post(
+            "/v1/transactions",
+            json=payload,
+            headers={"X-Idempotency-Key": idempotency_key},
+        )
+        assert first.status_code == 201, first.text
+        first_body = first.json()
+        txn_id = first_body["id"]
+
+        # Same key, different request: a new id and amount.
+        different = {**payload, "id": str(uuid.uuid4()), "amount_cents": -200000}
+        second = await client.post(
+            "/v1/transactions",
+            json=different,
+            headers={"X-Idempotency-Key": idempotency_key},
+        )
+        assert second.status_code == 409, (
+            f"Key reuse with a different body must 409, "
+            f"got {second.status_code}: {second.text}"
+        )
+        err = second.json()["error"]
+        assert err["code"] == "CONFLICT"
+        assert err["message"]
+
+        async with db.pool.acquire() as conn:
+            # The mismatched request executed nothing.
+            rogue = await conn.fetchval(
+                "SELECT count(*) FROM expense_transactions WHERE id = $1",
+                different["id"],
+            )
+            # And the original snapshot survived untouched.
+            stored_status = await conn.fetchval(
+                "SELECT response_status FROM idempotency_keys WHERE key = $1 AND user_id = $2",
+                idempotency_key, test_data.user_id,
+            )
+        assert rogue == 0, "409'd request must not have written a row"
+        assert stored_status == 201
+
+        # A correct replay (original body) still works after the 409.
+        third = await client.post(
+            "/v1/transactions",
+            json=payload,
+            headers={"X-Idempotency-Key": idempotency_key},
+        )
+        assert third.status_code == 201
+        assert third.json() == first_body
+    finally:
+        await _cleanup_transaction(txn_id, idempotency_key, test_data.user_id)
+
+
+async def _cleanup_transaction(txn_id, idempotency_key, user_id):
+    async with db.pool.acquire() as conn:
+        if txn_id:
+            await conn.execute(
+                "DELETE FROM activity_log WHERE resource_id = $1 AND user_id = $2",
+                txn_id, user_id,
+            )
+            await conn.execute(
+                "DELETE FROM expense_transactions WHERE id = $1 AND user_id = $2",
+                txn_id, user_id,
+            )
+        await conn.execute(
+            "DELETE FROM idempotency_keys WHERE key = $1 AND user_id = $2",
+            idempotency_key, user_id,
+        )

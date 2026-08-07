@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -12,6 +12,7 @@ from app.errors import (
     unhandled_exception_handler,
     validation_error_handler,
 )
+from app.helpers.idempotency import capture_request_fingerprint
 from app.routers import (
     accounts,
     activity,
@@ -43,6 +44,11 @@ app = FastAPI(
     # the deployment's — bump it when the wire format changes.
     version="1.0.0",
     lifespan=lifespan,
+    # App-wide so no route can forget it: every request is fingerprinted
+    # for idempotency-key reuse detection (sql/026). See
+    # helpers/idempotency.py — same structural argument as the
+    # transaction boundary living in run_idempotent.
+    dependencies=[Depends(capture_request_fingerprint)],
 )
 
 app.add_exception_handler(AppError, app_error_handler)

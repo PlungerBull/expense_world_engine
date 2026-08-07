@@ -11,6 +11,47 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-07 — idempotency keys are permanent; key reuse with a different request is `409`; PAT-create replay is `409`
+
+**Engine change.** Bugs 4.1 (🔴) and 2.4, owner decision 2026-08-06; `sql/026`.
+The 24-hour idempotency TTL is deleted — a used `X-Idempotency-Key` returns its
+stored response forever. Each key now stores a request fingerprint
+(sha256 of method, path, query string, raw body), and the engine refuses to
+answer a reused key with a snapshot that belongs to a different request.
+(Under the old code an expired key never re-armed — every retry past 24 h
+re-executed the write with no dedup at all, and a reused key silently returned
+the unrelated stored response.)
+
+**What breaks.**
+
+1. **Same key + different request body → `409 CONFLICT`** (code `CONFLICT`),
+   where it previously returned the first request's stored response with the
+   original status. A client that reuses one key for distinct writes now gets
+   an error instead of a silent wrong answer. Correct retry behavior — resend
+   the identical request — is unaffected; note the fingerprint is over the raw
+   bytes, so a retry must not re-serialize JSON with different key order or
+   whitespace.
+2. **Replaying `POST /auth/pat` → `409 CONFLICT`**, previously `201` with the
+   full body *including the plaintext token*. The response carries a one-time
+   secret, and with permanent keys a stored snapshot would keep the plaintext
+   in the database forever (bug 2.4). The key is still claimed, so concurrent
+   retries cannot double-mint; on a `409` after a timeout, mint a fresh token
+   with a new key and revoke strays via `DELETE /auth/pat/{id}`.
+3. **Replays no longer expire.** A retry sent days later returns the original
+   stored response instead of re-executing the write. If a client deliberately
+   relied on key expiry to "re-send" an old request, it must use a new key.
+
+**What the client must do.** Nothing, if it already follows the contract (one
+fresh UUID per intended write, byte-identical retries). Otherwise: treat `409`
+on a write as "this key is spent — inspect, then re-issue with a new key", and
+handle the PAT-create case above.
+
+**Engine references.** `sql/026_permanent_idempotency_keys.sql`,
+`app/helpers/idempotency.py`, `docs/engine-spec.md` ("Idempotency" and
+`POST /auth/pat`).
+
+---
+
 ## 2026-08-06 — "today" for rate lookups is the user's `display_timezone`, not UTC
 
 **Engine change.** Bloat audit 2026-08-06, Correctness §7, owner decision.

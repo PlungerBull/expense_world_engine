@@ -115,7 +115,7 @@ All mutable *domain* tables carry `deleted_at` (nullable timestamptz). Hard dele
 Every write to any mutable table produces an immutable `activity_log` row: resource type, resource ID, action (created/updated/deleted/restored), full before/after JSON snapshots, timestamp, actor. No exceptions. This is how "why does my balance look wrong?" gets answered.
 
 **Idempotency keys on all writes**
-`POST`, `PUT`, `DELETE` operations accept `X-Idempotency-Key: <uuid>`. The engine checks `idempotency_keys` before processing. Duplicates return the stored response verbatim. TTL: 24 hours. Critical for financial writes where duplicates corrupt balances.
+`POST`, `PUT`, `DELETE` operations accept `X-Idempotency-Key: <uuid>`. The engine checks `idempotency_keys` before processing. Duplicates return the stored response verbatim. **Keys are permanent** (`sql/026`) — no TTL, no purge job. The 24h TTL this replaced never re-armed after expiry (bug 4.1), and permanence matches the layer underneath: client-generated UUID PKs mean the create-dedup never forgets either. Replay demands the *same request* — each key stores a fingerprint (sha256 of method/path/query/body, captured by an app-wide dependency so no route can skip it); a mismatch is `409`, never the unrelated snapshot. `POST /auth/pat` is the one no-snapshot route (response holds the one-time plaintext): its replays return `409`. Critical for financial writes where duplicates corrupt balances.
 
 **Auth on every route — PAT only**
 Every request requires `Authorization: Bearer ewe_pat_…`. No public endpoints except `/health`. Unauthenticated requests return `401`.

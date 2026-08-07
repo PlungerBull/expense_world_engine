@@ -203,8 +203,14 @@ async def test_update_profile_replay_returns_identical_body(client, test_data):
 
 
 @pytest.mark.asyncio
-async def test_update_profile_replay_different_body_returns_cached(client, test_data):
-    """Same key + different body → first response wins (idempotency contract)."""
+async def test_update_profile_replay_different_body_returns_409(client, test_data):
+    """Same key + different body → 409, nothing written (sql/026).
+
+    The pre-026 contract returned the first response verbatim, silently
+    swallowing the second write. With permanent keys and the request
+    fingerprint, key reuse for a different request is loud: 409 CONFLICT,
+    the stored snapshot stays intact, and the row keeps its first value.
+    """
     idempotency_key = str(uuid.uuid4())
     try:
         first = await client.put(
@@ -220,12 +226,21 @@ async def test_update_profile_replay_different_body_returns_cached(client, test_
             json={"display_name": "Second"},
             headers={"X-Idempotency-Key": idempotency_key},
         )
-        assert second.status_code == 200
-        # Cached response, NOT a fresh write.
-        assert second.json() == first_body
+        assert second.status_code == 409, second.text
+        assert second.json()["error"]["code"] == "CONFLICT"
 
+        # The mismatched request wrote nothing.
         after = await _read_user(test_data.user_id)
         assert after["display_name"] == "First"
+
+        # A true replay (same body) still returns the stored response.
+        third = await client.put(
+            "/v1/auth/profile",
+            json={"display_name": "First"},
+            headers={"X-Idempotency-Key": idempotency_key},
+        )
+        assert third.status_code == 200
+        assert third.json() == first_body
     finally:
         await _cleanup_profile_state(test_data.user_id, [idempotency_key])
 

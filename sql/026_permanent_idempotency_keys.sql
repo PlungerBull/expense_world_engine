@@ -1,0 +1,51 @@
+-- 026: Permanent idempotency keys + request fingerprint (bugs 4.1 and 2.4).
+--
+-- Bug 4.1: the 24h TTL never re-armed. `_claim` filtered on
+-- `expires_at > now()`, so an expired row was invisible and the write
+-- re-executed — but `_store`'s `ON CONFLICT DO NOTHING` then hit the
+-- surviving UNIQUE (user_id, key) row and stored nothing. The key was
+-- permanently dead: EVERY retry after expiry re-ran the write, forever,
+-- and nothing ever purged the table.
+--
+-- The fix is not re-arming the window; it is deleting the window. Owner
+-- decision 2026-08-06: a used idempotency key is used forever. Rationale:
+--
+--   * The dedup layer underneath is already permanent. Ledger creates carry
+--     a client-generated UUID primary key (UUID-first, CLAUDE.md), so a
+--     same-payload retry after expiry could never duplicate a row — it hit
+--     a PK conflict and rolled back. A replay layer that forgets after 24h
+--     sat on top of a PK layer that never forgets. Now both keep one
+--     promise: a write you already made stays made, and asking again gets
+--     the original answer.
+--   * "Never duplicates" is a simpler contract than "no duplicates within
+--     24 hours", and it deletes the purge job nobody had written along
+--     with the TTL edge cases. Growth at the owner's write rate is
+--     ~5-10 MB/year — not a constraint (single-user, CLAUDE.md).
+--   * A ledger-writes-only split was rejected: two classes of key means
+--     two code paths and a purge job that must tell them apart.
+--
+-- request_hash (fingerprint, the other half of bug 4.1's fix): reusing a
+-- key with a DIFFERENT request previously returned the unrelated stored
+-- response and silently swallowed the new write — with permanent keys that
+-- client bug would be swallowed forever. The engine now stores
+-- sha256(method, path, query, raw body) with each key and answers a
+-- mismatched replay with 409 instead of the wrong snapshot (fail closed).
+-- Single implementation: helpers/idempotency.py, captured structurally by
+-- an app-wide dependency so no route can forget it.
+--
+-- Pre-existing rows get request_hash = '' and are grandfathered: '' means
+-- "stored before fingerprinting existed" and skips the comparison, so a
+-- legitimate in-flight retry from before this migration still replays
+-- rather than 409ing. The DEFAULT is dropped immediately after the
+-- backfill — new inserts must state their fingerprint explicitly.
+--
+-- Bug 2.4 rides along in code (no schema change): POST /auth/pat no longer
+-- stores its response body — the snapshot is stored as jsonb 'null' and a
+-- replay answers 409, because the response carries the one-time PAT
+-- plaintext and a permanent snapshot would cancel "only the hash is
+-- stored" outright.
+
+ALTER TABLE idempotency_keys DROP COLUMN expires_at;
+
+ALTER TABLE idempotency_keys ADD COLUMN request_hash text NOT NULL DEFAULT '';
+ALTER TABLE idempotency_keys ALTER COLUMN request_hash DROP DEFAULT;
