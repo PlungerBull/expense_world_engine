@@ -9,11 +9,10 @@ update it, and the change applies atomically to both sides.
 
 import hashlib
 
-# Engine-scoped prefix. Enables:
-#   * O(1) discrimination between PATs and Supabase JWTs in get_current_user
-#     (no try/catch fallback chain).
-#   * Leak-scanning by GitHub/GitGuardian/etc. — secret-scanner vendors
-#     register known prefixes to alert on accidental public commits.
+# Engine-scoped prefix. Enables leak-scanning by GitHub/GitGuardian/etc. —
+# secret-scanner vendors register known prefixes to alert on accidental
+# public commits. (It formerly also discriminated PATs from Supabase JWTs
+# in get_current_user; the JWT branch was deleted 2026-08-03.)
 PAT_PREFIX = "ewe_pat_"
 
 # Length of the display prefix stored in token_prefix. Captures the

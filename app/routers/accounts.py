@@ -62,9 +62,9 @@ async def list_accounts(
             offset,
         )
 
-        # Batch home-balance conversion. Previously this loop called
-        # `_get_home_balance` once per account, which itself fired one query
-        # for user_settings and one for the exchange rate — an N+1 pattern
+        # Batch home-balance conversion. Previously each account in this loop
+        # paid its own settings read + rate lookup (the per-account path that
+        # survives as helpers/accounts.get_home_balance) — an N+1 pattern
         # that produced ~2N extra DB round-trips per list request. Now:
         #   1. Fetch user_settings ONCE outside the loop.
         #   2. Collect distinct account currencies.

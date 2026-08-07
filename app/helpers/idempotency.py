@@ -153,7 +153,7 @@ async def run_idempotent(
     owns the boundary.)
 
     Args:
-        user_id: Authenticated user id from the JWT.
+        user_id: Authenticated user id from the PAT.
         key: ``X-Idempotency-Key`` header value, or None when absent.
         status_code: HTTP status for the first-time response (stored
             alongside the body for replays).

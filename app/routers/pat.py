@@ -24,11 +24,13 @@ async def create_pat(
     auth_user: CurrentUser,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
-    # The caller must be authenticated (via JWT — a freshly-minted
-    # PAT cannot mint more PATs in v1, that's a future scoping concern
-    # if/when admin-vs-user-token distinctions become relevant). For
-    # now both token types can call this, and RLS scopes everything
-    # to the caller's user_id regardless.
+    # The caller must hold a valid PAT (the JWT branch was deleted
+    # 2026-08-03 — PATs are the only credential). Policy decision, kept
+    # from v1: any authenticated PAT can mint more PATs — no
+    # admin-vs-user token distinction exists yet; scoping becomes a
+    # concern if one appears. Isolation is the engine-side user_id
+    # passed to pat_service (RLS exists in the schema but is inert
+    # under the owner connection — see CLAUDE.md "Tenant isolation").
     return await run_idempotent(
         auth_user.id,
         x_idempotency_key,
