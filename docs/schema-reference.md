@@ -120,8 +120,12 @@ exchange_rates
   - id               UUID, primary key, default uuid_generate_v4()
   - base_currency    text, NOT NULL, FK → global_currencies.code    — always 'USD'
   - target_currency  text, NOT NULL, FK → global_currencies.code
-  - rate             numeric, NOT NULL
-                     — units of target_currency per 1 USD (e.g. 3.75 = 1 USD = 3.75 PEN)
+  - rate             numeric, NOT NULL, CHECK (rate > 0)  [sql/027]
+                     — units of target_currency per 1 USD (e.g. 3.75 = 1 USD = 3.75 PEN).
+                       The fetch/backfill jobs also refuse non-positive provider values
+                       before inserting; the CHECK is the fail-closed backstop, because
+                       since sql/021 this table is the sole source of every home-currency
+                       figure — one bad row would misprice reports, not one write.
   - rate_date        date, NOT NULL
   - created_at       timestamptz, NOT NULL, default now()
   - UNIQUE (base_currency, target_currency, rate_date)
@@ -471,15 +475,18 @@ expense_transaction_hashtags
   - transaction_id      UUID, NOT NULL
                         — references expense_transactions (no formal FK; see
                           transaction_source)
-  - transaction_source  smallint, NOT NULL
+  - transaction_source  smallint, NOT NULL, CHECK (transaction_source = 1)  [sql/027]
                         — 1 = written by the ledger attach path. This is the only value
                           that has ever been written, and every reader filters on it.
                           The column was designed to let transaction_id reference either
-                          the ledger or the inbox, but the inbox writer was never built
-                          (see the inbox section — tags are lost by drafting there), and
-                          no CHECK constrains the value. ⚠️ An earlier revision of this
-                          document defined 1=inbox, 2=ledger; the implementation has
-                          always written 1 for ledger rows. Open product question — TODO.md.
+                          the ledger or the inbox; the inbox writer was never built
+                          (see the inbox section — tags are lost by drafting there).
+                          Owner decision 2026-08-07: inbox hashtags are a wanted future
+                          feature, so the column stays and the CHECK pins today's single
+                          value — the migration shipping the inbox writer widens it to
+                          IN (1, 2). ⚠️ An earlier revision of this document defined
+                          1=inbox, 2=ledger; the implementation has always written 1 for
+                          ledger rows.
   - hashtag_id          UUID, NOT NULL, FK → expense_hashtags
   - user_id             UUID, NOT NULL, FK → users
   - created_at          timestamptz, NOT NULL, default now()

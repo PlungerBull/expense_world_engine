@@ -118,6 +118,18 @@ async def _upsert_rate(
     rate_date: date,
     rate: float,
 ) -> bool:
+    """Insert one provider rate; True if a row was written.
+
+    Raises ValueError on a non-positive rate rather than inserting it —
+    since sql/021 this table is the only source of every home-currency
+    figure, so one bad provider row misprices reports, not one write.
+    Guarded here so no caller (daily fetch, backfill) can skip it; the
+    exchange_rates_rate_positive CHECK (sql/027) is the backstop.
+    Callers catch this and count the target into the run's failures —
+    recording the rest of the day's rates is never blocked by one bad one.
+    """
+    if rate <= 0:
+        raise ValueError(f"non-positive rate for USD->{target} on {rate_date}: {rate}")
     row = await conn.fetchrow(
         """
         INSERT INTO exchange_rates (base_currency, target_currency, rate_date, rate)
@@ -179,7 +191,12 @@ async def run() -> int:
                     failed.append(target)
                     continue
 
-                did_insert = await _upsert_rate(conn, target, rate_date, float(rates[target]))
+                try:
+                    did_insert = await _upsert_rate(conn, target, rate_date, float(rates[target]))
+                except ValueError as exc:
+                    print(f"[fetch_exchange_rates] {exc}", file=sys.stderr)
+                    failed.append(target)
+                    continue
                 if did_insert:
                     inserted += 1
                     print(f"[fetch_exchange_rates] inserted USD->{target} {rate_date} = {rates[target]}")

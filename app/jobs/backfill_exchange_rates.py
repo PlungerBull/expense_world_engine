@@ -208,8 +208,11 @@ async def run(start: date, end: date, currencies: Optional[list[str]]) -> int:
                     if target not in rates:
                         missing_target.append(f"{day} {target}")
                         continue
-                    if await _upsert_rate(conn, target, day, float(rates[target])):
-                        inserted += 1
+                    try:
+                        if await _upsert_rate(conn, target, day, float(rates[target])):
+                            inserted += 1
+                    except ValueError as exc:
+                        failed.append(f"{day} ({exc})")
 
                 completed += 1
                 if completed % PROGRESS_EVERY == 0:

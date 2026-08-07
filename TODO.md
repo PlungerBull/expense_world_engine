@@ -2,7 +2,7 @@
 
 Operational / deployment tasks, plus accepted design changes awaiting scheduling — work that is not part of normal code review. Each entry describes what needs to happen, why, and when it becomes blocking. **Delete an entry when it closes — git history holds the record; do not keep tombstones here.**
 
-Two parked product questions are the only open items.
+One parked product question and one accepted-but-unscheduled feature are the only open items.
 
 ---
 
@@ -20,13 +20,14 @@ The three options, most expensive first:
 
 ---
 
-## Inbox hashtags — `transaction_source` depends on it — 🅿️ PARKED product question
+## Inbox hashtags — decided YES (2026-08-07), feature not yet scheduled
 
-**Tags are silently lost by using the inbox.** The inbox schemas have no `hashtag_ids` field and promotion attaches none — a user who drafts through the inbox cannot tag, and nothing tells them. Whether the inbox should support hashtags is the product question; the column follows from the answer:
+**Tags are silently lost by using the inbox.** The inbox schemas have no `hashtag_ids` field and promotion attaches none — a user who drafts through the inbox cannot tag, and nothing tells them. **Owner decision 2026-08-07: the inbox should support hashtags** — "the inbox is the same copy [of a transaction] but with relaxed rules", and hashtags belong to that copy. What remains is scheduling the feature, which ships as one unit:
 
-- `expense_transaction_hashtags.transaction_source` was designed to let junction rows reference either the ledger or the inbox, but only the ledger writer was ever built. Only the value `1` is ever written and every read filters on it (`app/helpers/transactions.py`). No CHECK constrains the value (bug 6.3's remainder).
-- ⚠️ The numeric mapping is muddled: the pre-WP7 schema doc said `1=inbox, 2=ledger`, but the implementation has always written `1` for **ledger** rows. If inbox support is ever built, pick the mapping deliberately — do not trust old documentation.
-- If the answer is "no inbox hashtags", the column is a one-value discriminator and can be dropped; if "yes", build the inbox writer, the promote carry-over, and the CHECK together.
-- Related ⚪ low in [docs/open-bugs.md](docs/open-bugs.md): `compute_month_flow`'s hashtag aggregation is missing a `transaction_source = 1` filter — harmless today precisely because no other value exists.
+- the inbox `hashtag_ids` field (create/update schemas + storage),
+- the promote carry-over (tags survive promotion into the ledger),
+- widening `sql/027`'s `hashtags_transaction_source_valid` CHECK from `= 1` to `IN (1, 2)` — the CHECK pins the ledger-only reality until the inbox writer exists.
+- ⚠️ The numeric mapping is muddled: the pre-WP7 schema doc said `1=inbox, 2=ledger`, but the implementation has always written `1` for **ledger** rows. Pick the mapping deliberately when building — do not trust old documentation.
+- Related ⚪ low in [docs/open-bugs.md](docs/open-bugs.md): `compute_month_flow`'s hashtag aggregation is missing a `transaction_source = 1` filter — harmless today precisely because no other value exists, and load-bearing the day the inbox writer ships.
 
 **When it becomes blocking:** the first time a tagged draft matters. Cheap while the junction table holds zero rows.
