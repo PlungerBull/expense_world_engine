@@ -296,6 +296,8 @@ Categories carry no type restriction. The same category can be used on expenses,
 - `@Opening` — auto-created the first time an account's opening balance is seeded via `POST /accounts/{id}/opening-balance`.
 All are created with `is_system = true` and a stable `system_key` column (`"debt"` / `"transfer"` / `"opening_balance"`) — the engine looks them up by `system_key`, not by display name. This means users can freely rename the display text without breaking the pipelines that depend on them (which was a bug before the `system_key` column was added).
 
+Category responses include `system_key` (`null` for user categories) — since 2026-08-07. It is the identity the rename-safety guarantee keys off, so clients get it too; without it a client wanting to label a specific system row had to string-match a renameable display name. Not an IDs-only violation: `system_key` is an immutable discriminator, not a hydrated copy of a mutable value.
+
 ### `PUT /categories/{id}`
 System categories (`is_system = true`) CAN be renamed — the engine identifies them by `system_key`, not by `name`. Any other field is also editable. Returns `404` if the category is missing. The same name normalization rules as `POST` apply: renames are trimmed, empty names return `422`, and case-insensitive conflicts return `409`. The reserved-name rule applies to renames of **non-system** categories only: a system row may take any name, including its own default back; a user row renamed to `@Debt`/`@Transfer`/`@Opening` (any casing) returns `422`.
 
@@ -401,14 +403,14 @@ Promotes a ready inbox item to the ledger.
 - `account_id` is present and references an active, non-archived account
 - `category_id` is present and references an active category (non-transfer items only — transfer items auto-assign the system category)
 - `transfer_account_id` references an active, non-archived account (transfer items only) — reported on `transfer.account_id`
-- `transfer_id` is present for a transfer item and absent for a non-transfer one
+- `transfer_id` is present for a transfer item and absent for a non-transfer one, and must differ from `id` (reported on `transfer_id`)
 
-If any condition fails, returns `422` with **all** the failing fields, not just the first. (Two edge checks sit outside the accumulation and surface on their own: a non-transfer row with an amount but a null `transaction_type` — out-of-band data only, unreachable through the API — and the transfer-engine checks `transfer.account_id ≠ account_id` / `transfer.id ≠ id`.)
+If any condition fails, returns `422` with **all** the failing fields, not just the first. (One edge check sits outside the accumulation and surfaces on its own: a non-transfer row with an amount but a null `transaction_type` — out-of-band data only, unreachable through the API. The transfer-engine checks `transfer.account_id ≠ account_id` and `transfer.id ≠ id` are accumulated like everything else since 2026-08-07.)
 
 **Other statuses:** `200` on success (promote is not a pure create — the inbox row already existed). `404` when the inbox row is missing, already promoted, or soft-deleted. `409 CONFLICT` when `id` (or `transfer_id`) already exists in the ledger.
 
 **On success (atomic):**
-1. Creates `expense_transactions` row(s) using the client-supplied `id` (and `transfer_id` for the sibling). `inbox_id` on the **primary** leg points back to this inbox item (the sibling carries no backlink — lineage is a fact about the row the draft became, and the sibling is reachable via `transfer_transaction_id`). Copies `transaction_type` from the inbox row; for transfers, the sibling takes its inverse. Both legs share the draft's title, description, and date; `cleared` starts `false`.
+1. Creates `expense_transactions` row(s) using the client-supplied `id` (and `transfer_id` for the sibling). `inbox_id` on **both** legs points back to this inbox item — the draft produced the pair, so lineage is a fact about both rows. *(Amended 2026-08-07: previously only the primary leg carried the backlink; rows promoted before then keep a null sibling `inbox_id`.)* Copies `transaction_type` from the inbox row; for transfers, the sibling takes its inverse. Both legs share the draft's title, description, and date; `cleared` starts `false`.
 2. Sets `status = 2` (promoted) on the inbox row.
 3. Sets `deleted_at` on the inbox row (soft delete).
 4. Writes `activity_log` entry (action=1 CREATED) for the new transaction(s).
@@ -555,6 +557,7 @@ Include a `transfer` object on any transaction create request:
 **Validation (all `422 VALIDATION_ERROR`, field-scoped, accumulated into one response):**
 - **The two sides must be different accounts.** A `transfer.account_id` equal to the request's own `account_id` returns `fields: {"transfer.account_id": "Must be a different account."}` — a transfer to itself moves no money and would write two rows that cancel on one balance. Checked before either account is loaded, so it fires even for an account that doesn't exist; if the same id is also missing or archived, the existence message wins the field (the checks share one key).
 - `transfer.amount_cents` must not be zero, and must carry the opposite sign to the primary `amount_cents` (see zero-sum validation below).
+- `transfer.id` must differ from the request's own `id` — the same UUID for both legs returns `fields: {"transfer.id": "Must differ from the primary transaction id."}`.
 - Both `account_id` values must reference the caller's own active, non-archived accounts.
 
 **Business logic (atomic):**
@@ -828,6 +831,8 @@ The "every mutation gets an activity_log row" rule has three deliberate exceptio
 **Query params:** `base` (default `USD`), `target`, `date` (ISO date; default: today in the user's `display_timezone` — `exchange_rate.rate_lookup_date`, the same "today" every current-date rate lookup uses since 2026-08-06; an invalid stored zone falls back to UTC)
 
 Returns the rate for the given pair and date. Falls back to the most recent available rate if no exact match exists for the requested date.
+
+**Errors:** a `base` or `target` not in `global_currencies` is a bad *input*, not a missing *resource* — `422 VALIDATION_ERROR` with the failing field(s), the same treatment the write paths give an unsupported `currency_code` (both codes are checked, both can appear in `fields`). `404 NOT_FOUND` is reserved for a supported pair with genuinely no rate row on or before the requested date. *(Amended 2026-08-07 — previously an unsupported currency also fell through to `404`.)*
 
 Used internally by the engine. Also exposed for CLI use.
 

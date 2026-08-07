@@ -26,6 +26,10 @@ class CategoryResponse(BaseModel):
     name: str
     color: str
     is_system: bool
+    # Immutable discriminator ('debt' / 'transfer' / 'opening_balance'), null for
+    # user categories. Not an IDs-only violation: it is identity, not a hydrated
+    # copy of the renameable display name.
+    system_key: Optional[str] = None
     sort_order: int
     created_at: datetime
     updated_at: datetime
@@ -40,6 +44,7 @@ def category_from_row(row) -> dict:
         name=row["name"],
         color=row["color"],
         is_system=row["is_system"],
+        system_key=row["system_key"],
         sort_order=row["sort_order"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],

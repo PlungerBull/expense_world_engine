@@ -5,9 +5,10 @@ from fastapi import APIRouter, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import not_found
+from app.errors import not_found, validation_error
 from app.helpers.exchange_rate import get_rate, rate_lookup_date
 from app.helpers.pagination import paginated_response
+from app.helpers.validation import currency_code_error
 from app.schemas.exchange_rates import ExchangeRateHistoryItem, ExchangeRateResponse
 
 router = APIRouter(prefix="/exchange-rates", tags=["exchange-rates"])
@@ -24,6 +25,17 @@ async def get_exchange_rate(
     target_upper = target.upper()
 
     async with db.pool.acquire() as conn:
+        # An unsupported currency is a bad *input*, not a missing *resource* —
+        # same 422 the write path gives it (create_account). 404 below is
+        # reserved for a supported pair with genuinely no rate row.
+        errors = {}
+        for field, code in (("base", base_upper), ("target", target_upper)):
+            message = await currency_code_error(conn, code)
+            if message is not None:
+                errors[field] = message
+        if errors:
+            raise validation_error("Invalid currency code.", errors)
+
         if date is None:
             # Default "today" resolves in the user's display_timezone, like
             # every other current-date rate lookup. Tolerate a missing

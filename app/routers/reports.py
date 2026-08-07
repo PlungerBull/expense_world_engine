@@ -82,8 +82,9 @@ async def get_monthly_report(
         raise validation_error(
             "Pass either (year, month) or (from_year, from_month, to_year, to_month), not both.",
             {
-                "year": "mutually exclusive with range form" if year is not None else None,
-                "month": "mutually exclusive with range form" if month is not None else None,
+                name: "mutually exclusive with range form"
+                for name, value in (("year", year), ("month", month))
+                if value is not None
             },
         )
     if single_count == 0 and range_count == 0:
@@ -103,16 +104,21 @@ async def get_monthly_report(
         raise validation_error(
             "Single-month form requires both year and month.",
             {
-                "year": "required" if year is None else None,
-                "month": "required" if month is None else None,
+                name: "required"
+                for name, value in (("year", year), ("month", month))
+                if value is None
             },
         )
     if 0 < range_count < 4:
         missing = {
-            "from_year": "required" if from_year is None else None,
-            "from_month": "required" if from_month is None else None,
-            "to_year": "required" if to_year is None else None,
-            "to_month": "required" if to_month is None else None,
+            name: "required"
+            for name, value in (
+                ("from_year", from_year),
+                ("from_month", from_month),
+                ("to_year", to_year),
+                ("to_month", to_month),
+            )
+            if value is None
         }
         raise validation_error(
             "Range form requires all of from_year, from_month, to_year, to_month.",

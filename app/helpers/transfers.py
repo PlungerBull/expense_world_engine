@@ -59,10 +59,13 @@ async def create_transfer_pair(
             )
 
     # ------------------------------------------------------------------
-    # 2. Same-account check
+    # 2. Same-account / same-id checks
     # ------------------------------------------------------------------
     if primary_account_id == transfer_account_id:
         errors["transfer.account_id"] = "Must be a different account."
+
+    if primary_id == sibling_id:
+        errors["transfer.id"] = "Must differ from the primary transaction id."
 
     # ------------------------------------------------------------------
     # 3. Validate both accounts
@@ -150,12 +153,6 @@ async def create_transfer_pair(
     # interpolated literal moved to monthly_report.get_user_report_settings,
     # which is where conversion actually happens.
 
-    if primary_id == sibling_id:
-        raise validation_error(
-            "Transfer id collision.",
-            {"transfer.id": "Must differ from the primary transaction id."},
-        )
-
     # ------------------------------------------------------------------
     # 7. Insert primary transaction
     # ------------------------------------------------------------------
@@ -193,8 +190,8 @@ async def create_transfer_pair(
             INSERT INTO expense_transactions
                 (id, user_id, title, description, amount_cents,
                  transaction_type, date, account_id, category_id,
-                 cleared, transfer_transaction_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
+                 cleared, transfer_transaction_id, inbox_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
             RETURNING *
             """,
             sibling_id,
@@ -208,6 +205,7 @@ async def create_transfer_pair(
             sibling_category_id,
             primary_cleared,
             primary_id,
+            inbox_id,
         )
     except asyncpg.UniqueViolationError:
         raise conflict(f"A transaction with id '{sibling_id}' already exists.")

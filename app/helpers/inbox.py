@@ -424,9 +424,10 @@ async def promote_inbox_item(
          and reference active resources (account, category).
       3. Branch on transfer vs non-transfer:
            - Transfer: delegate to ``create_transfer_pair``, passing
-             ``inbox_id`` so the primary leg links back to the inbox
-             row (the sibling carries no backlink; it is reachable via
-             ``transfer_transaction_id``).
+             ``inbox_id`` so both legs link back to the inbox row —
+             the draft produced the pair, so lineage is a fact about
+             both rows (amended 2026-08-07; the sibling previously
+             carried no backlink).
            - Non-transfer: insert a single ledger row and write an
              activity log for the new
              transaction.
@@ -533,6 +534,11 @@ async def promote_inbox_item(
         errors["transfer_id"] = "Must be present for transfer promotions."
     elif not is_transfer and target_transfer_id is not None:
         errors["transfer_id"] = "Must be null for non-transfer promotions."
+    elif is_transfer and target_transfer_id == target_id:
+        # Same reason as the sibling-account check above: create_transfer_pair
+        # rejects this too, but only after this function has committed to the
+        # transfer branch — checking here keeps it in the accumulated response.
+        errors["transfer_id"] = "Must differ from transaction_id."
 
     if errors:
         raise validation_error("Inbox item is not ready to promote.", errors)

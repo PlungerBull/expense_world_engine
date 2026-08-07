@@ -132,6 +132,26 @@ def normalize_name(name: Optional[str], field: str = "name") -> str:
     return name.strip()
 
 
+async def currency_code_error(
+    conn: asyncpg.Connection,
+    code: str,
+) -> Optional[str]:
+    """Return the field message for an unsupported currency code, else None.
+
+    Non-raising, so it serves both flow styles (see module docstring):
+    short-circuit callers wrap the message in their own ``validation_error``,
+    accumulate callers set ``errors[field]``. Single source of the
+    supported-currency check — ``global_currencies``, locked to USD/PEN
+    by ``sql/015``.
+    """
+    row = await conn.fetchrow(
+        "SELECT code FROM global_currencies WHERE code = $1", code
+    )
+    if row is None:
+        return f"'{code}' is not a valid currency code."
+    return None
+
+
 async def validate_active_category(
     conn: asyncpg.Connection,
     category_id: str,

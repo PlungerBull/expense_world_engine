@@ -28,6 +28,7 @@ from app.helpers.activity_log import write_activity_log
 from app.helpers.categories import ensure_system_category
 from app.helpers.exchange_rate import get_rate, rate_lookup_date
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
+from app.helpers.validation import currency_code_error
 from app.schemas.accounts import account_from_row
 
 
@@ -80,14 +81,9 @@ async def create_account(
             already exists.
     """
     # Validate currency_code
-    currency = await conn.fetchrow(
-        "SELECT code FROM global_currencies WHERE code = $1", currency_code
-    )
-    if currency is None:
-        raise validation_error(
-            "Invalid currency code.",
-            {"currency_code": f"'{currency_code}' is not a valid currency code."},
-        )
+    message = await currency_code_error(conn, currency_code)
+    if message is not None:
+        raise validation_error("Invalid currency code.", {"currency_code": message})
 
     # Check uniqueness
     existing = await conn.fetchrow(
