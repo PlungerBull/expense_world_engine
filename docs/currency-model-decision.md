@@ -1,6 +1,6 @@
 # Currency Model — Decision, 2026-08-01
 
-**Status: shipped 2026-08-05 as `sql/021` (`docs/rework/WP2`).** This document is
+**Status: shipped 2026-08-05 as `sql/021` (WP2 of the deletion program; program docs in git history).** This document is
 the design record and it survives the rework. It deleted audit findings 1.2, 1.4
 and 1.5 rather than fixing them; 1.3 was repaired by WP1 first and is now
 unrepresentable as well.
@@ -396,9 +396,9 @@ Two consequences to know:
 visible for the first time and the question became live rather than theoretical.**
 
 > ⚠️ Two forward-looking notes elsewhere promised the opposite — the WP1 postscript
-> in `docs/rework/README.md` and the closing bullet of the 2026-08-05 entry in
-> `docs/client-breaking-changes.md` both said WP2 would introduce `@FX`. Both are
-> superseded. The spread lands in `@Transfer`.
+> in the deletion program's README (now in git history) and the closing bullet of
+> the 2026-08-05 entry in `docs/client-breaking-changes.md` both said WP2 would
+> introduce `@FX`. Both are superseded. The spread lands in `@Transfer`.
 
 Free to add later.
 
@@ -470,10 +470,11 @@ effectively: re-categorising one leg of a pair leaves the other stranded in
   validation), returning `422`. The internal paths must keep working:
   `create_transfer_pair` assigns `@Transfer`/`@Debt`, and
   `create_opening_balance` delegates to `create_transaction` with `@Opening`.
-  Same public-boundary-plus-internal-path shape as WP7.4.
+  Same public-boundary-plus-internal-path shape as open bug 7.4.
 - Add `category_id` to the transfer edit guard's blocked set.
 
-Coordinate with **WP7.4**, which rejects reserved system-category *names* at the
+Coordinate with **open bug 7.4** (finding 7.4 of the 2026-08-01 audit — not the WP7
+documentation package), which rejects reserved system-category *names* at the
 same boundary. Together they make `@Transfer` mean exactly what this document
 says it means.
 
@@ -493,22 +494,14 @@ Three 🔴 findings and one 🟡 close by deletion rather than repair.
 
 ---
 
-## Client impact
+## Client impact *(closed — the entry landed)*
 
-**Breaking for the CLI.** `exchange_rate` becomes output-only; the write contract
-no longer accepts it.
-
-| Call site | Change |
-|---|---|
-| `expense/commands/log_cmd.py:34,94` | remove `--exchange-rate` |
-| `expense/commands/inbox_cmd.py:226,278` | remove `--exchange-rate` (add + update) |
-| `expense/commands/transactions_cmd.py:305` | remove `--exchange-rate` |
-| `expense/commands/accounts_cmd.py:248` | remove `--exchange-rate` (opening balance) |
-| `expense/import_/parse.py:206-213` | **delete the `usd-no-rate` skip.** A USD row lands on the USD account; no rate needed. |
-| `expense/import_/apply.py:198-216` | stop sending `exchange_rate` in the payload |
-
-⚠️ Append a full entry to [client-breaking-changes.md](client-breaking-changes.md)
-when the code lands, not before.
+**Breaking for the CLI.** `exchange_rate` became output-gone and the write contract
+stopped accepting it. The full wire-change record is the 2026-08-05 read-time
+currency entry in [client-breaking-changes.md](client-breaking-changes.md) — that
+entry, not this section, is the authority on what the CLI must absorb. (This
+section was written as the pre-landing worklist, enumerating the `--exchange-rate`
+options and import-path payloads to remove; the call-site table is in git history.)
 
 **On the rejected escape hatch.** Firefly III lets a user override a converted
 amount, and does it by storing a **second amount** ("this cost me S/152"), never a

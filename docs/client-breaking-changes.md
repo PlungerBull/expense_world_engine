@@ -13,7 +13,7 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ## 2026-08-06 — reconciliation simplification: chaining and manual ordering deleted, beginning balance required, `difference_cents` added
 
-**Engine change.** `docs/rework/WP6`, `sql/025`. Reconciliation chaining rewrote a
+**Engine change.** WP6 of the deletion program (`sql/025`; program docs in git history). Reconciliation chaining rewrote a
 COMPLETED row's `beginning_balance_cents` whenever an upstream draft was edited —
 the cascade had no status predicate — so the derived-beginning-balance concept was
 deleted at the root, and `sort_order` (whose second job was defining the chain)
@@ -55,7 +55,7 @@ list stays `created_at DESC`.
 
 ## 2026-08-06 — schema slimming: 16 dead columns and the 4 category/hashtag archive routes deleted
 
-**Engine change.** `docs/rework/WP5`, `sql/024`. Everything the 2026-08-04 audit
+**Engine change.** WP5 of the deletion program (`sql/024`; program docs in git history). Everything the 2026-08-04 audit
 traced to zero readers is gone. **Engine-only by owner decision** — the CLI work
 below is recorded, not yet done, so the affected CLI commands break until it lands.
 
@@ -105,7 +105,7 @@ None of these have a replacement; clients delete their references.
 
 ## 2026-08-06 — `GET /v1/sync` deleted; `sync_checkpoints` dropped; `X-Client-Id` no longer read
 
-**Engine change.** `docs/rework/WP4`. The delta-sync endpoint is gone: `app/routers/sync.py`,
+**Engine change.** WP4 of the deletion program (program docs in git history). The delta-sync endpoint is gone: `app/routers/sync.py`,
 `app/helpers/sync.py`, the `sync_checkpoints` table, the seven `(user_id, updated_at)`
 indexes that served it (`sql/023`), and the `X-Client-Id` header handling. Requesting
 `GET /v1/sync` now returns `404`. The substrate stays untouched — `version`, `updated_at`,
@@ -131,7 +131,7 @@ fall out of.
 **Engine change.** `expense_bank_accounts.current_balance_cents` was a stored running
 total, updated by hand at eleven write sites. `sql/022` drops the column. An account's
 balance is now the signed sum of its non-deleted transactions, computed at read time
-(`app/helpers/account_balance.py`). This is `docs/rework/WP3`.
+(`app/helpers/account_balance.py`). This is WP3 of the deletion program (program docs in git history).
 
 **Nothing breaks on the wire, and that is deliberate.** `current_balance_cents` appears
 on exactly the same responses, in the same place, with the same type and the same
@@ -152,7 +152,7 @@ carrying its new balance. Nothing writes the account row on a transaction now, s
 A client caching balances from `/sync` alone would show a stale figure until some
 unrelated account edit. No client is affected today — `sync_checkpoints` holds zero
 rows, no client has ever completed a sync, and the CLI reads balances from `/accounts`
-and `/dashboard`, which are always live. `docs/rework/WP4` deletes `/sync` outright and
+and `/dashboard`, which are always live. WP4 (the entry above) deletes `/sync` outright and
 retires this gap; it is written down rather than left to be rediscovered.
 
 If you do need balances from a delta in the meantime, derive them client-side — `/sync`
@@ -174,7 +174,7 @@ because the trigger keyed on `date` and the *account* decides the currency (1.5)
 row's date — carried forward from the most recent rate on or before it, cast in the
 user's `display_timezone` — implemented once in `app/helpers/home_currency.py`.
 
-This is `docs/rework/WP2`. It also closes open bug 2.3 (a cross-tenant account read)
+This is WP2 of the deletion program (program docs in git history). It also closes open bug 2.3 (a cross-tenant account read)
 by deleting the helper that had it.
 
 **Severity: breaking, and there is real work to do.** Unlike the WP1 entry, the CLI
@@ -271,7 +271,7 @@ branching on that code is branching on something unreachable.
 
 - `sql/021_read_time_currency.sql` — the migration and why a stored conversion never
   held a fact
-- `docs/rework/WP2-read-time-currency.md` — the work package
+- the WP2 work package (`WP2-read-time-currency.md`, in git history)
 - `docs/currency-model-decision.md` — the design record, amended to match what shipped
 - `CLAUDE.md` § "Home currency" — rewritten in this change
 - `docs/open-bugs.md` — 1.4, 1.5 and 2.3 deleted; 1.7 and 6.1 amended; **6.5 added**
@@ -296,7 +296,7 @@ every row, never null, with `CHECK (transaction_type IN (1, 2))` and
 ordinary rows paired by `transfer_transaction_id`** — that FK is now the only
 discriminator.
 
-This is `docs/rework/WP1`. It also closes open bugs 1.3 (every USD→USD transfer
+This is WP1 of the deletion program (program docs in git history). It also closes open bugs 1.3 (every USD→USD transfer
 returned an uncaught 500) and 6.3's `expense_transactions` half.
 
 **Severity: breaking, but nothing in the CLI to break.** Verified by reading
@@ -353,7 +353,7 @@ because there is work to do.
 - Transfer legs still cancel, and transfers are still included in dashboards and
   reports.
 - Cross-currency transfers still net to exactly zero in home currency. The FX spread
-  becomes visible in `docs/rework/WP2` — deliberately not in this change.
+  becomes visible in WP2 (the read-time currency entry above) — deliberately not in this change.
   ⚠️ *Superseded the same day:* this bullet said the spread would arrive "together
   with the `@FX` category that will hold it". It did not. The owner chose to leave the
   spread in `@Transfer`; see the entry above and `docs/currency-model-decision.md`.
@@ -362,7 +362,7 @@ because there is work to do.
 
 - `sql/020_transfer_direction_collapse.sql` — the migration, and why dropping
   `sql/019`'s column is not a reversal of it
-- `docs/rework/WP1-transfer-collapse.md` — the work package
+- the WP1 work package (`WP1-transfer-collapse.md`, in git history)
 - `CLAUDE.md` § "Sign convention" — rewritten in this change
 - `docs/open-bugs.md` — 1.2 and 1.3 deleted; 6.3 amended
 - `tests/test_wp1_transfer_collapse.py` — the new invariants, including the USD→USD
@@ -372,6 +372,12 @@ because there is work to do.
 ---
 
 ## 2026-08-03 — Inbox transfers carry `transfer_direction`; `transfer_amount_cents` is now positive
+
+> ⚠️ **Superseded 2026-08-05** — `transfer_direction` was itself deleted two days
+> later by the transfer collapse (`sql/020`; entry above). Direction now lives on
+> `transaction_type`, and a transfer is detected via `transfer_transaction_id !=
+> null`. Read this entry for the positive-amounts change only; do not build
+> against the column it introduces.
 
 **Engine change.** The inbox stored no direction column, so the *sign* of
 `transfer_amount_cents` was the only record of which way a transfer draft
@@ -542,26 +548,21 @@ response forever.
   before; USD amounts are still converted to PEN for reporting.
 - No amounts, balances, or transaction shapes changed. Nothing needs re-syncing.
 
-> ⏳ **The last bullet is scoped to this 2026-08-01 entry and does not survive the
-> deletion program.** The rework in [`rework/README.md`](rework/README.md) removes
-> `amount_home_cents` from transactions and inbox items,
-> `current_balance_home_cents` from accounts, the reconciliation home balances, the
-> native report aggregates, and the dashboard's archived category/hashtag panels —
-> and separately drops `transaction_type = 3` and `transfer_direction` entirely
-> (WP1), which *does* change how a client identifies a transfer.
-> **Response shapes change substantially.** No *values* change and nothing needs
-> re-syncing — the removed figures were derived, never stored facts — but a client
-> that reads those keys will find them absent. Each work package appends its own
-> entry here as it lands; this pointer exists so nobody plans against the sentence
-> above in the meantime.
->
-> ✅ **The WP1 half of this landed 2026-08-05** — see the entry at the top of this
-> file. The currency half (`amount_home_cents`, `current_balance_home_cents`, the
-> reconciliation home balances, the native report aggregates) is still pending in
-> WP2/WP3.
+> ✅ **Resolved 2026-08-06 — every part of this forward-looking note has landed.**
+> The deletion program (WP1–WP6, program docs in git history) removed
+> `amount_home_cents` from transactions and inbox items, the reconciliation home
+> balances, the native report aggregates, and the dashboard's archived
+> category/hashtag panels — and separately dropped `transaction_type = 3` and
+> `transfer_direction` entirely (WP1), which *does* change how a client identifies
+> a transfer. Each change has its own dated entry above: WP1 on 2026-08-05, the
+> currency half (WP2) on 2026-08-05, computed balances (WP3), `/sync` deletion
+> (WP4), schema slimming (WP5), and reconciliation simplification (WP6) on
+> 2026-08-06. (`current_balance_home_cents` on accounts survived after all —
+> the balance surfaces are the one place a home conversion is a cross-currency
+> figure.) Read those entries, not the bullets above, for the current wire shape.
 
 ### Engine references
 
 - `sql/018_lock_home_currency_to_pen.sql` — the constraint and the restoration path
 - `docs/engine-spec.md` §`PUT /auth/settings`
-- `docs/open-bugs.md` WP1.1
+- `docs/open-bugs.md` — finding 1.1 of the 2026-08-01 audit (closed; in git history)

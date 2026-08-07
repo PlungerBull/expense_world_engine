@@ -27,8 +27,8 @@ Add a purge job — the table grows unbounded today.
 
 ## 🟠 High
 
-- **6.1 `extra="forbid"` sweep** — request schemas silently drop unknown fields. Fail closed: unknown input must `422`. *Partially shipped:* the four schemas that lost `exchange_rate` in `sql/021` carry it (`TransactionCreateRequest`, `TransactionUpdateRequest`, `InboxCreateRequest`, `InboxUpdateRequest`), as does `OpeningBalanceRequest`; WP5 added the three auth schemas (`BootstrapRequest`, `SettingsUpdateRequest`, `ProfileUpdateRequest`); WP6 added the two reconciliation schemas (`ReconciliationCreateRequest`, `ReconciliationUpdateRequest`). Every other request schema is still open.
-- **6.5 The transfer-leg edit guard is a deny-list, and it forgets `category_id`** — `helpers/transactions.update_transaction` blocks `{amount_cents, account_id, date}` on a row with a `transfer_transaction_id`, so a `PUT` can still move ONE leg out of `@Transfer`, stranding the other with nothing to cancel against — indistinguishable from a loan to a person, which is the other thing a non-zero `@Transfer` means. `CLAUDE.md`'s "fix at the root" corollary already describes this guard as having been inverted to an allow-list; it has not been. Invert it: enumerate what a transfer leg may change.
+- **6.1 `extra="forbid"` sweep** — request schemas silently drop unknown fields. Fail closed: unknown input must `422`. *Partially shipped:* the four schemas that lost `exchange_rate` in `sql/021` carry it (`TransactionCreateRequest`, `TransactionUpdateRequest`, `InboxCreateRequest`, `InboxUpdateRequest`), as does `OpeningBalanceRequest`; WP5 added the three auth schemas (`BootstrapRequest`, `SettingsUpdateRequest`, `ProfileUpdateRequest`); WP6 added the two reconciliation schemas (`ReconciliationCreateRequest`, `ReconciliationUpdateRequest`). Every other request schema is still open — the WP7 spot-check (2026-08-06) confirmed `InboxPromoteRequest` accepts unknown fields silently, unlike every schema beside it.
+- **6.5 The transfer-leg edit guard is a deny-list, and it forgets `category_id`** — `helpers/transactions.update_transaction` blocks `{amount_cents, account_id, date}` on a row with a `transfer_transaction_id`, so a `PUT` can still move ONE leg out of `@Transfer`, stranding the other with nothing to cancel against — indistinguishable from a loan to a person, which is the other thing a non-zero `@Transfer` means. Invert it: enumerate what a transfer leg may change. (`CLAUDE.md`'s "fix at the root" corollary and `engine-spec.md`'s transfer-edit-guard section both cite this bug as the standing example since WP7 corrected them — they no longer claim the inversion already happened.)
 - **6.2 UUID path/query params typed `str`** — malformed input reaches SQL and 500s instead of `422`.
 - **6.3 CHECK constraints for closed enums** — *partially shipped:* `sql/019` covers `expense_transaction_inbox`, `sql/020` covers `expense_transactions` (`transaction_type IN (1,2)` plus `amount_cents > 0`), `sql/025` covers reconciliation `status` (WP6). Still open for `transaction_source` and `exchange_rates.rate > 0` (`actor_type` and the `user_settings` enums left the list with their columns, `sql/024`). ⚠️ Write these as `col IS NOT NULL AND col IN (…)` on any nullable column — a `CHECK` passes on `NULL`, so the bare `IN` admits exactly the row it was added to forbid (found while writing `sql/020`).
 - **7.4 Reserved system-category names can permanently 500 transfers** — nothing stops a user claiming `@Debt`/`@Transfer`/`@Opening`; `ensure_system_category`'s `ON CONFLICT (user_id, system_key)` arbiter does not cover the `(user_id, LOWER(name))` index, so the `UniqueViolationError` escapes uncaught. Reject reserved names at the boundary *and* wrap the seeding INSERT.
@@ -46,7 +46,7 @@ Add a purge job — the table grows unbounded today.
   - `restore()` returning `None` (delete/restore race) flows into `reconciliation_from_row(None)` → TypeError (`helpers/reconciliations.py`, restore path; same pattern in categories/hashtags). Guard.
 - **7.1** `POST`/`PUT /inbox` do no referential or ownership validation — a bad FK 500s, and another user's `account_id` is stored and only rejected at promote. Use the existing `validate_active_account` / `validate_active_category`.
 - **8.2** CREATE snapshots record `hashtag_ids: []` on the batch and transfer paths.
-- **10.1** 57 of 61 routes declare no `response_model`, so `openapi.json` documents no response shapes.
+- **10.1** 51 of 55 routes declare no `response_model` (only the four in `routers/auth.py` do), so `openapi.json` documents no response shapes.
 - **10.2** Error/shape nits: null-valued keys in `/reports/monthly` `fields`; `warnings` present on delete/restore but absent elsewhere; `system_key` missing from category responses; `GET /exchange-rates` 404 vs write paths' 422 for the same condition; transfer sibling gets no `inbox_id` on promote; `primary_id == sibling_id` checked late and outside the accumulate-errors pattern.
 
 ---
@@ -85,11 +85,11 @@ pins it · `2.2` JWKS fetch — `jwks.py` deleted with the branch ·
 repair: with no stored conversion there is no rate to default to `1.0`, nothing to go
 stale when an account changes, and no `resolve_home_rates` to read an account without
 a `user_id` filter · **`3.1` delta sync dropping committed writes — `/sync` deleted,
-`sql/023` (docs/rework/WP4)**, along with the ⚪ `X-Client-Id` case-normalisation nit,
-both by deletion · **`6.4` settings validation — `sql/024` (docs/rework/WP5)**:
+`sql/023`**, along with the ⚪ `X-Client-Id` case-normalisation nit,
+both by deletion · **`6.4` settings validation — `sql/024`**:
 `display_timezone` validated on both write paths, the six echo-only preference
 fields deleted, auth schemas `extra="forbid"` · **`5.3` dead `sort_order` guard —
-`sql/025` (docs/rework/WP6)**: the column, the guard and the reorder endpoint are
+`sql/025`**: the column, the guard and the reorder endpoint are
 all gone, and the reconciliation request schemas are `extra="forbid"`, so the
 field now 422s at the root.
 

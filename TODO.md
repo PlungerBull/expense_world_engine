@@ -6,59 +6,40 @@ Operational / deployment tasks, plus accepted design changes awaiting scheduling
 
 > **Removed 2026-08-01: "Home-currency recalculation: switch from per-row UPDATEs to bulk SQL."** Closed, not deferred — the target narrowed from 1000+ public users to the owner alone that day, which retires the entire premise. Its stated trigger was Render's HTTP timeout, and Render left the path at Step 11; the follow-on concern (a long synchronous recalc pinning a pool connection) only bites with concurrent users. At one user the recalc is fast, rare, and correct. Full original entry in git history.
 >
-> **Superseded later the same day:** the recalculation itself is now **gone**. The home currency is locked to PEN (`sql/018`), `PUT /auth/settings` rejects `main_currency` with `422`, and `app/helpers/recalculate_home_currency.py` was deleted along with its tests — it carried a silent `1.0` rate fallback (audit finding WP1.1). The sentence above claiming "nothing was deleted" no longer holds. The corresponding single-user-shaped row in CLAUDE.md is retired with it. The dominant-side zero-sum logic *does* survive, in [app/helpers/transfers.py](app/helpers/transfers.py).
+> **Superseded later the same day:** the recalculation itself is now **gone**. The home currency is locked to PEN (`sql/018`), `PUT /auth/settings` rejects `main_currency` with `422`, and `app/helpers/recalculate_home_currency.py` was deleted along with its tests — it carried a silent `1.0` rate fallback (finding 1.1 of the 2026-08-01 audit). The sentence above claiming "nothing was deleted" no longer holds. The corresponding single-user-shaped row in CLAUDE.md is retired with it. *(The dominant-side zero-sum logic survived until `sql/021`, then went with the stored home values — cross-currency legs now convert independently at read time and the spread surfaces in `@Transfer`.)*
 
-**One open item** (next up) and **one parked item**. Everything below them is a closed record, kept for the dated history.
+**Two parked product questions** (undecided design, ported from the deletion program's README before `docs/rework/` was deleted — 2026-08-06). Everything below them is a closed record, kept for the dated history.
 
----
+> **Removed 2026-08-06: "Retire reconciliation chaining — 🔵 OPEN, decided 2026-08-01" (owner decision D3).** Executed by WP6 (`sql/025`), with two owner amendments over the D3 sketch: **no prefill** — `beginning_balance_cents` is required on `POST` (omitting it is a `422`, not an invitation to derive) — and **no `continuity_gap_cents`**; the read-time figure that shipped is `difference_cents`, the add-up check `(ending − beginning) − SUM(signed assigned transactions)`, projected on every read and never stored. The cascade, `beginning_balance_source`, `sort_order`, and the reorder endpoint are gone; account-scoped lists order by `date_start ASC NULLS LAST, created_at ASC`. Full original entry in git history; annotated on D3 in [docs/open-bugs.md](docs/open-bugs.md).
 
-## Retire reconciliation chaining — replace with explicit values + a continuity check — 🔵 OPEN, decided 2026-08-01
-
-**Owner decision D3** of [docs/open-bugs.md](open-bugs.md). Tracked here rather than as an audit work package because it is a design change, not a defect fix — it *deletes* the code three audit findings were about.
-
-**What:** Remove the chained beginning-balance system. Every reconciliation stores `beginning_balance_cents` as a plain value. On `POST`, the engine prefills it from the previous row's `ending_balance_cents` as a **one-time suggestion** — no live link, no recomputation afterwards. Replace the cascade with a read-time continuity indicator on every reconciliation response:
-
-- `previous_ending_balance_cents` — `null` when the row is first in `sort_order`
-- `continuity_gap_cents` — `beginning_balance_cents − previous_ending_balance_cents`; `null` when there is no previous row
-
-`0` means the chain is continuous; any non-zero value is where the chain breaks, and the number *is* the size of the discrepancy.
-
-**Why:** today the cascade (`_cascade_chained_recalc`, `app/helpers/reconciliations.py:190`) walks downstream on every ending-balance change and rewrites `beginning_balance_cents` — with **no status predicate**. So editing an upstream draft silently rewrites the locked beginning balance of a `COMPLETED` reconciliation, doing through the back door exactly what §646's field lock refuses at the front door. A reconciliation you signed off against a real bank statement should not move because you corrected a typo three rows earlier. A discrepancy is information to surface, not to auto-repair.
-
-**What it deletes:**
-
-| Removed | Why |
-|---|---|
-| `_cascade_chained_recalc` (~90 lines) + its 5 call sites (`:467`, `:625`, `:848`, `:897`, reorder) | no chain to propagate |
-| Audit finding **WP5.1** — cascade early-stop unsound on reorder/restore | no cascade |
-| Audit finding **WP5.2** — cascade rewrites `COMPLETED` rows (this decision) | no cascade |
-| Audit finding **WP5.4** — reorder response omits cascade-affected rows | no cascade-affected rows |
-| `beginning_balance_source` column + enum + §650 ambiguity guard | every row is now an explicit value |
-| CLI chained/manual picker (`expense/tui/screens/reconciliations.py:311-330`) and `--source` flag (`expense/commands/reconcile_cmd.py:47`) | nothing left to pick |
-
-Bulk reorder becomes a pure `sort_order` write with no balance math, and the §646 completed-lock becomes real and unconditional.
-
-**Plumbing that already exists:** `_serialize_with_neighbor` (`reconciliations.py:133`) already fetches each row's neighbors, so both new fields are computed in a query that already runs. No new storage.
-
-**What you give up:** auto-correction. Fixing an upstream ending balance no longer updates downstream rows — `continuity_gap_cents` flags the break and each row is corrected deliberately. That is the intended trade: the auto-correction was corrupting signed-off batches.
-
-**When: now, before data accumulates.** `expense_reconciliations` currently holds **0 rows** and `expense_transactions` holds **0 rows** (verified 2026-08-01), so the migration that would normally have to freeze every existing chained row to its computed value is a no-op today. This is the cheapest this change will ever be.
-
-**Scope beyond code:** spec rewrite — 15 occurrences of "chained", sections §588-607, §620, §648, §650, §671-681, mostly deletion; `schema-reference.md` column removal; migration to drop `beginning_balance_source`; CLI simplification in the two files above.
+> **Removed 2026-08-06: "Split transactions (`parent_transaction_id`) — 🅿️ PARKED" (owner decision D8).** Superseded — the 2026-08-04 audit judged the column a placeholder, not a foundation, and `sql/024` dropped it (D8 annotated accordingly). Splits get designed fresh if they ever ship; the parent-exclusion predicate a future balance sum will need is preserved in `sql/022`'s header and `app/helpers/account_balance.py`. Full original entry in git history.
 
 ---
 
-## Split transactions (`parent_transaction_id`) — 🅿️ PARKED, reviewed 2026-08-01
+## People API — build `POST /people`, or delete the `is_person` axis — 🅿️ PARKED product question
 
-**Owner decision D8** of [docs/open-bugs.md](open-bugs.md). Parked here so the reserved field has a tracked home and is not rediscovered as a mystery by the next audit.
+Person accounts are **structurally complete and functionally unreachable**: `is_person` is read by the accounts list filter (`?include_people`), the dashboard `people` panel split, the transfer engine's `@Debt` branch, and the opening-balance guard — but **no endpoint can set it**. The INSERT in `app/helpers/accounts.py` omits the column entirely, and `AccountCreateRequest` rejects the field (`extra="forbid"`). No production row can ever have it true, so the `people` dashboard panel is always `[]` and the `@Debt` leg of the transfer pair is unreachable.
 
-**Status:** the column exists (`sql/003_expense_tables.sql:85`, self-referencing FK on `expense_transactions`), the field is on the wire in every transaction response (`app/schemas/transactions.py:63,114`), and it is **always `null`** — no endpoint accepts or writes it. This is an unbuilt feature, not a defect and not a vestige.
+The three options, most expensive first:
 
-**Why it stays:** unlike the People API (D7), the docs already tell the truth — spec §414 documents it as *"reserved, always `null` in v1"*, targets Phase 5, and instructs clients not to build logic on it. Nothing to correct. Retiring it would cost a migration plus a rewrite of `schema-reference.md §Split Transactions` to reclaim one nullable column and one null JSON key.
+1. **Status quo** — full machinery, no entry point. The most expensive option: every future agent re-discovers the dead axis, and every transfer-engine change must keep a branch alive that nothing can execute.
+2. **Build `POST /people`** (spec §People already sketches it: explicit creation only, never auto-created by a transfer — see decision D7 in [docs/open-bugs.md](docs/open-bugs.md) and the design rule in `engine-spec.md`).
+3. **Delete the axis** — drop `is_person`, the `@Debt` branch, the `people` panel, `?include_people`, and the `@Debt` system category.
 
-**What shipping it would mean** (recorded now so the design isn't re-derived later): one parent row holds the full amount and is a **display container that does not move the balance**; child rows hold the portions and are the only rows that touch `current_balance_cents` (`schema-reference.md:402`). Splits must be created atomically in a single API call. Both halves interact with soft-delete, the activity log and the balance rules, so this is a real work package, not a field to start populating.
+**When it becomes blocking:** the first time the owner wants to track a debt. Decide before building anything on top of the transfer engine's person branch.
 
-**When it becomes blocking:** never on its own. Revisit when you actually want to split a receipt across categories — or, if you decide splits will never ship, close this entry and retire the column and field together.
+---
+
+## Inbox hashtags — `transaction_source` depends on it — 🅿️ PARKED product question
+
+**Tags are silently lost by using the inbox.** The inbox schemas have no `hashtag_ids` field and promotion attaches none — a user who drafts through the inbox cannot tag, and nothing tells them. Whether the inbox should support hashtags is the product question; the column follows from the answer:
+
+- `expense_transaction_hashtags.transaction_source` was designed to let junction rows reference either the ledger or the inbox, but only the ledger writer was ever built. Only the value `1` is ever written and every read filters on it (`app/helpers/transactions.py`). No CHECK constrains the value (bug 6.3's remainder).
+- ⚠️ The numeric mapping is muddled: the pre-WP7 schema doc said `1=inbox, 2=ledger`, but the implementation has always written `1` for **ledger** rows. If inbox support is ever built, pick the mapping deliberately — do not trust old documentation.
+- If the answer is "no inbox hashtags", the column is a one-value discriminator and can be dropped; if "yes", build the inbox writer, the promote carry-over, and the CHECK together.
+- Related ⚪ low in [docs/open-bugs.md](docs/open-bugs.md): `compute_month_flow`'s hashtag aggregation is missing a `transaction_source = 1` filter — harmless today precisely because no other value exists.
+
+**When it becomes blocking:** the first time a tagged draft matters. Cheap while the junction table holds zero rows.
 
 ---
 
@@ -85,11 +66,11 @@ Bulk reorder becomes a pure `sort_order` write with no balance math, and the §6
 
 **What:** Populate `exchange_rates` with per-date rows going back to the earliest transaction date in the system, so historical transactions can be re-converted with accurate point-in-time rates.
 
-**Why:** The daily cron only inserts `/latest` going forward. Any historical transaction written while the old silent `1.0` fallback was in place (pre-fix; see commit that introduced `RATE_UNAVAILABLE`) will have an incorrect `amount_home_cents` and `exchange_rate` until the historical rates exist in the table and `PUT /auth/settings` (or a manual recalc) is re-run. Post-fix writes can no longer create this corruption, but any rows seeded before the fix need remediation.
+**Why:** The daily cron only inserts `/latest` going forward. *(Historical note, written under the stored-conversion model: rows written under the old silent `1.0` fallback carried a wrong stored `amount_home_cents` until a recalc ran. Since `sql/021` nothing stores a conversion — a missing rate now surfaces at read time as `null` + `unconverted_count`, and backfilled rates take effect on the next read with no remediation step.)*
 
 **Owner:** User (PlungerBull) will handle this directly against the database — not via engine code.
 
 **When:** ~~at the very end of engine work~~ **Updated 2026-07-30:** folded into local-deployment Step 11.5 (local-deployment Step 11.5) — runs right after the data migration and daily-fetch verification, followed by a home-currency recalc, so PEN/USD history converts at true point-in-time rates. Easier now: the target database is local Postgres, no pooler in the way.
 
-**Reference (provider corrected 2026-07-30):** Frankfurter **cannot** serve this — it carries ECB reference rates only, and the ECB list has no PEN (discovered when the daily job first ran for real; the 15 pre-existing `rate=3.75` rows turned out to be hand-inserted placeholders, ~10% off market, and were deleted). The provider is now **fawazahmed0/currency-api** (keyless, CDN-hosted), which the daily job uses via `app.jobs.fetch_exchange_rates`. It supports dated queries for backfill — `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@YYYY-MM-DD/v1/currencies/usd.min.json` returns all USD rates for that date (lowercase codes) — and `_fetch_currency_api(version="YYYY-MM-DD")` in the job module already wraps this. Insert rows canonically as `(base_currency='USD', target_currency=<X>, rate_date=<date>, rate=<rate>)`, matching the daily job's format. **Run the backfill before importing historical spreadsheet data** — cross-currency writes for dates without rates fail with `422 RATE_UNAVAILABLE` by design.
+**Reference (provider corrected 2026-07-30):** Frankfurter **cannot** serve this — it carries ECB reference rates only, and the ECB list has no PEN (discovered when the daily job first ran for real; the 15 pre-existing `rate=3.75` rows turned out to be hand-inserted placeholders, ~10% off market, and were deleted). The provider is now **fawazahmed0/currency-api** (keyless, CDN-hosted), which the daily job uses via `app.jobs.fetch_exchange_rates`. It supports dated queries for backfill — `https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@YYYY-MM-DD/v1/currencies/usd.min.json` returns all USD rates for that date (lowercase codes) — and `_fetch_currency_api(version="YYYY-MM-DD")` in the job module already wraps this. Insert rows canonically as `(base_currency='USD', target_currency=<X>, rate_date=<date>, rate=<rate>)`, matching the daily job's format. **Run the backfill before relying on historical reports** — since `sql/021` a missing rate never blocks a write; it shows up at read time as a `null` aggregate with a non-zero `unconverted_count` until the rate row exists.
 
