@@ -45,6 +45,23 @@ def validate_timezone(value: str, field: str) -> None:
         )
 
 
+def resolve_timezone(value: str) -> str:
+    """Return ``value`` if it is a valid IANA timezone name, else ``"UTC"``.
+
+    The read-side twin of ``validate_timezone``: writes reject a bad zone,
+    but rows stored before that guard existed may hold junk, and a read must
+    tolerate them rather than 500 (an unknown zone reaching ``AT TIME ZONE``
+    is a Postgres error). Every consumer of a stored ``display_timezone`` —
+    Python ``ZoneInfo`` construction and SQL bind parameters alike — goes
+    through this one fallback.
+    """
+    try:
+        ZoneInfo(value)
+    except Exception:
+        return "UTC"
+    return value
+
+
 def extract_update_fields(
     body: BaseModel,
     nullable: Optional[set[str]] = None,

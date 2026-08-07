@@ -59,6 +59,7 @@ import asyncpg
 
 from app.constants import HOME_CURRENCY
 from app.errors import settings_missing
+from app.helpers.validation import resolve_timezone
 from app.helpers.home_currency import (
     SIGNED_HOME_CENTS_EXPR,
     UNCONVERTIBLE_FLAG_EXPR,
@@ -122,10 +123,7 @@ def compute_month_bounds(
     end_utc is exclusive (first instant of the following month). When year/month are
     omitted, returns the current month in display_timezone.
     """
-    try:
-        tz = ZoneInfo(display_timezone)
-    except Exception:
-        tz = ZoneInfo("UTC")
+    tz = ZoneInfo(resolve_timezone(display_timezone))
 
     if year is None or month is None:
         now_local = datetime.now(tz)
@@ -166,6 +164,11 @@ async def compute_month_flow(
     Any figure derived from unconvertible rows is ``None``, never a partial total,
     and the object carrying it reports how many rows could not be converted.
     """
+    # $4 reaches AT TIME ZONE, and Postgres errors on an unknown zone — the
+    # same junk-tolerates-as-UTC fallback compute_month_bounds applies must
+    # cover the SQL binding too, or a pre-validation settings row 500s every
+    # report and dashboard read.
+    display_timezone = resolve_timezone(display_timezone)
     categories_rows = await conn.fetch(
         """
         SELECT id, name, sort_order

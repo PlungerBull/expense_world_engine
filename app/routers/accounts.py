@@ -1,6 +1,5 @@
 """HTTP handlers for /accounts — thin adapters over helpers.accounts."""
 
-from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Header, Query
@@ -10,7 +9,7 @@ from app.deps import CurrentUser
 from app.errors import not_found
 from app.helpers import accounts as accounts_service
 from app.helpers.account_balance import fetch_balance, fetch_balances
-from app.helpers.exchange_rate import batch_get_rates
+from app.helpers.exchange_rate import batch_get_rates, rate_lookup_date
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
 from app.helpers.validation import extract_update_fields
@@ -71,7 +70,7 @@ async def list_accounts(
         #   3. Resolve all rates in one deduplicated batch.
         # The loop becomes a pure in-memory transform.
         settings_row = await conn.fetchrow(
-            "SELECT main_currency FROM user_settings WHERE user_id = $1",
+            "SELECT main_currency, display_timezone FROM user_settings WHERE user_id = $1",
             auth_user.id,
         )
         main_currency = settings_row["main_currency"] if settings_row else None
@@ -79,7 +78,7 @@ async def list_accounts(
         rate_by_currency: dict[str, float] = {}
         if main_currency and rows:
             currencies = {row["currency_code"] for row in rows}
-            today = datetime.now(timezone.utc).date()
+            today = rate_lookup_date(settings_row["display_timezone"])
             rate_by_currency = await batch_get_rates(
                 conn, currencies, main_currency, today,
             )

@@ -17,11 +17,14 @@ a few thousand entries (<1MB). No LRU cap is enforced today. If
 the cache grows beyond ~10K entries in practice, an LRU cap should
 be considered.
 """
-from datetime import date as date_type
+from datetime import date as date_type, datetime
 import time
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import asyncpg
+
+from app.helpers.validation import resolve_timezone
 
 
 _RATE_CACHE_TTL_SECONDS = 3600  # 1 hour
@@ -33,6 +36,23 @@ _RATE_CACHE: dict[tuple[str, str, date_type], tuple[_RateResult, float]] = {}
 def clear_rate_cache() -> None:
     """Empty the in-process rate cache. Test helper."""
     _RATE_CACHE.clear()
+
+
+def rate_lookup_date(display_timezone: str) -> date_type:
+    """Return "today" for a current-date rate lookup, in the user's timezone.
+
+    One definition of "today" everywhere a rate is resolved at the current
+    date, so /accounts, /dashboard and /exchange-rates agree with the
+    reports about which day it is near midnight (owner decision,
+    2026-08-06 — these previously used the UTC date while reports used
+    display_timezone via compute_month_bounds).
+
+    Same fallback contract as compute_month_bounds: display_timezone is
+    validated on write (helpers/auth.py), but older rows may hold junk —
+    an unrecognised zone falls back to UTC (via ``resolve_timezone``)
+    rather than 500ing a read.
+    """
+    return datetime.now(ZoneInfo(resolve_timezone(display_timezone))).date()
 
 
 async def _fetch_rate_from_db(

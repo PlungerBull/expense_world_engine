@@ -11,6 +11,33 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-06 — "today" for rate lookups is the user's `display_timezone`, not UTC
+
+**Engine change.** Bloat audit 2026-08-06, Correctness §7, owner decision.
+Current-date exchange-rate lookups (account balances on `/accounts` and
+`/dashboard`, and the `GET /exchange-rates` default) resolved "today" as the
+UTC date, while `/reports/monthly` and the dashboard month bounds already used
+the date in the user's `display_timezone` — so between local midnight and UTC
+midnight (7pm–midnight in `America/Lima`) a balance and a report could use
+rates from different days. One helper (`exchange_rate.rate_lookup_date`) now
+owns the definition, in `display_timezone`, with the same junk-timezone → UTC
+fallback the reports use.
+
+**What breaks.** The default for the optional `date` query param on
+`GET /exchange-rates` changed: omitted `date` now means "today where the user
+is" rather than "today in UTC". Near midnight the two differ by a day and can
+resolve to a different carried-forward rate. A client wanting the old behavior
+passes `date` explicitly. Consequentially (not breaking, but visible):
+`current_balance_home_cents` on `/accounts` and `/dashboard` can shift by one
+rate-day near midnight — and now always agrees with the monthly report about
+which day "today" is. Explicit-`date` lookups and all report figures are
+unchanged.
+
+**What the client must do.** Nothing, unless it depended on the UTC default —
+then pass `?date=` explicitly.
+
+---
+
 ## 2026-08-06 — every request model now fails closed: unknown fields 422 on all writes
 
 **Engine change.** Bloat audit 2026-08-06, Correctness §2. `extra="forbid"` was

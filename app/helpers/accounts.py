@@ -16,7 +16,6 @@ Reading it twice would let a concurrent ledger write land between them and make
 the activity-log pair disagree about a value neither mutation touched.
 """
 
-from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -27,7 +26,7 @@ from app.errors import conflict, not_found, validation_error
 from app.helpers.account_balance import fetch_balance
 from app.helpers.activity_log import write_activity_log
 from app.helpers.categories import ensure_system_category
-from app.helpers.exchange_rate import get_rate
+from app.helpers.exchange_rate import get_rate, rate_lookup_date
 from app.helpers.query_builder import dynamic_update, restore, soft_delete
 from app.schemas.accounts import account_from_row
 
@@ -45,7 +44,8 @@ async def get_home_balance(
     N+1 query pattern this helper creates when called in a loop.
     """
     settings = await conn.fetchrow(
-        "SELECT main_currency FROM user_settings WHERE user_id = $1", user_id
+        "SELECT main_currency, display_timezone FROM user_settings WHERE user_id = $1",
+        user_id,
     )
     if settings is None:
         return None
@@ -54,7 +54,7 @@ async def get_home_balance(
         conn,
         from_currency=currency_code,
         to_currency=settings["main_currency"],
-        as_of=datetime.now(timezone.utc).date(),
+        as_of=rate_lookup_date(settings["display_timezone"]),
     )
     if result is None:
         return None

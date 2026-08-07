@@ -1,4 +1,4 @@
-from datetime import date as date_type, datetime, timezone
+from datetime import date as date_type
 from typing import Optional
 
 from fastapi import APIRouter, Query
@@ -6,7 +6,7 @@ from fastapi import APIRouter, Query
 from app import db
 from app.deps import CurrentUser
 from app.errors import not_found
-from app.helpers.exchange_rate import get_rate
+from app.helpers.exchange_rate import get_rate, rate_lookup_date
 from app.helpers.pagination import paginated_response
 from app.schemas.exchange_rates import ExchangeRateHistoryItem, ExchangeRateResponse
 
@@ -20,11 +20,24 @@ async def get_exchange_rate(
     base: str = Query("USD", min_length=3, max_length=3),
     date: Optional[date_type] = Query(None),
 ):
-    target_date = date or datetime.now(timezone.utc).date()
     base_upper = base.upper()
     target_upper = target.upper()
 
     async with db.pool.acquire() as conn:
+        if date is None:
+            # Default "today" resolves in the user's display_timezone, like
+            # every other current-date rate lookup. Tolerate a missing
+            # settings row — a rate lookup is not a report; 422ing it here
+            # would be a second, larger behavior change.
+            tz_row = await conn.fetchrow(
+                "SELECT display_timezone FROM user_settings WHERE user_id = $1",
+                auth_user.id,
+            )
+            target_date = rate_lookup_date(
+                tz_row["display_timezone"] if tz_row else "UTC"
+            )
+        else:
+            target_date = date
         result = await get_rate(
             conn,
             from_currency=base_upper,

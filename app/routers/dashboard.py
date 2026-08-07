@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date as date_type
 from typing import Optional
 
 import asyncpg
@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query
 from app import db
 from app.deps import CurrentUser
 from app.helpers.account_balance import fetch_balances
-from app.helpers.exchange_rate import batch_get_rates
+from app.helpers.exchange_rate import batch_get_rates, rate_lookup_date
 from app.helpers.monthly_report import (
     compute_month_bounds,
     compute_month_flow,
@@ -22,6 +22,7 @@ async def _load_accounts(
     conn: asyncpg.Connection,
     user_id: str,
     main_currency: str,
+    today: date_type,
     is_person: bool,
     archived: bool = False,
 ) -> list[dict]:
@@ -68,7 +69,6 @@ async def _load_accounts(
 
     rows = await conn.fetch(query, user_id)
     balances = await fetch_balances(conn, user_id, [r["id"] for r in rows])
-    today = datetime.now(timezone.utc).date()
 
     # Batch rate resolution — previously this loop fired one `get_rate` call
     # per account, producing an N+1 pattern on the hottest read in the app.
@@ -134,12 +134,14 @@ async def get_dashboard(
     async with db.pool.acquire() as conn:
         settings = await get_user_report_settings(conn, auth_user.id)
         year, month, start_utc, end_utc = compute_month_bounds(settings["display_timezone"])
+        # One clock read for all three account slices — no per-slice drift.
+        today = rate_lookup_date(settings["display_timezone"])
 
         bank_accounts = await _load_accounts(
-            conn, auth_user.id, settings["main_currency"], is_person=False
+            conn, auth_user.id, settings["main_currency"], today, is_person=False
         )
         people = await _load_accounts(
-            conn, auth_user.id, settings["main_currency"], is_person=True
+            conn, auth_user.id, settings["main_currency"], today, is_person=True
         )
         flow = await compute_month_flow(
             conn, auth_user.id, start_utc, end_utc, settings["display_timezone"]
@@ -148,7 +150,7 @@ async def get_dashboard(
         archived_accounts: Optional[list[dict]] = None
         if include_archived:
             archived_accounts = await _load_accounts(
-                conn, auth_user.id, settings["main_currency"],
+                conn, auth_user.id, settings["main_currency"], today,
                 is_person=False, archived=True,
             )
 
