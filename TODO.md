@@ -28,6 +28,6 @@ The three options, most expensive first:
 - the promote carry-over (tags survive promotion into the ledger),
 - widening `sql/027`'s `hashtags_transaction_source_valid` CHECK from `= 1` to `IN (1, 2)` — the CHECK pins the ledger-only reality until the inbox writer exists.
 - ⚠️ The numeric mapping is muddled: the pre-WP7 schema doc said `1=inbox, 2=ledger`, but the implementation has always written `1` for **ledger** rows. Pick the mapping deliberately when building — do not trust old documentation.
-- Related ⚪ low in [docs/open-bugs.md](docs/open-bugs.md): `compute_month_flow`'s hashtag aggregation is missing a `transaction_source = 1` filter — harmless today precisely because no other value exists, and load-bearing the day the inbox writer ships.
+- `compute_month_flow`'s hashtag aggregation now carries the `transaction_source = 1` filter (closed 2026-08-07) — load-bearing the day the inbox writer ships, since inbox junction rows must not leak into ledger reports.
 
 **When it becomes blocking:** the first time a tagged draft matters. Cheap while the junction table holds zero rows.
