@@ -456,6 +456,242 @@ async def test_restore_unlinks_completed_reconciliation(client, test_data):
 
 
 # ---------------------------------------------------------------------------
+# 4b. Reconciliation unlink on the SIBLING leg (transfer pair)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restore_unlinks_sibling_completed_reconciliation(client, test_data):
+    """The reconciliation-unlink rule applies per leg — a transfer sibling
+    assigned to a now-COMPLETED recon comes back unlinked, with the
+    warning prefixed "Transfer sibling: " so the client can tell which
+    leg it concerns. Pins the sibling arm of ``_resolve_recon_unlink``
+    (the primary arm is covered above).
+    """
+    second_account_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 is_archived, sort_order, created_at, updated_at)
+            VALUES ($1, $2, 'Restore-Sibling-Recon', 'PEN', false, '#00AA00',
+                    false, 3, now(), now())
+            """,
+            second_account_id, test_data.user_id,
+        )
+
+    primary_id = sibling_id = None
+    recon_id = str(uuid.uuid4())
+    try:
+        create_r = await client.post(
+            "/v1/transactions",
+            json={
+                "id": str(uuid.uuid4()),
+                "title": f"sibling-recon-{uuid.uuid4()}",
+                "amount_cents": -1800,
+                "date": "2026-04-12T12:00:00Z",
+                "account_id": test_data.account_id,
+                "category_id": test_data.category_id,
+                "transfer": {
+                    "id": str(uuid.uuid4()),
+                    "account_id": second_account_id,
+                    "amount_cents": 1800,
+                },
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert create_r.status_code == 201, create_r.text
+        primary_id = create_r.json()["id"]
+        sibling_id = create_r.json()["transfer_transaction_id"]
+
+        # Recon on the SIBLING's account; assign the sibling leg to it.
+        recon_create = await client.post(
+            "/v1/reconciliations",
+            json={
+                "id": recon_id,
+                "account_id": second_account_id,
+                "name": f"sibling-recon-{uuid.uuid4()}",
+                "beginning_balance_cents": 0,
+                "ending_balance_cents": 0,
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert recon_create.status_code == 201, recon_create.text
+
+        assign = await client.put(
+            f"/v1/transactions/{sibling_id}",
+            json={"reconciliation_id": recon_id},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert assign.status_code == 200, assign.text
+
+        complete = await client.post(
+            f"/v1/reconciliations/{recon_id}/complete",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert complete.status_code == 200, complete.text
+
+        # Delete the PRIMARY — cascades to the sibling, whose recon link
+        # survives on the soft-deleted row.
+        delete_r = await client.delete(
+            f"/v1/transactions/{primary_id}",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert delete_r.status_code == 200, delete_r.text
+
+        # Restore the primary — the sibling must come back unlinked.
+        restore_r = await client.post(
+            f"/v1/transactions/{primary_id}/restore",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert restore_r.status_code == 200, restore_r.text
+        body = restore_r.json()
+
+        # Primary was never assigned — its link stays null, no primary warning.
+        assert body["reconciliation_id"] is None
+        sibling_db_row = await _get_row(sibling_id)
+        assert sibling_db_row["deleted_at"] is None
+        assert sibling_db_row["reconciliation_id"] is None, (
+            "Sibling should be unlinked from its completed reconciliation on restore"
+        )
+        warnings = body.get("warnings", [])
+        assert any(w.startswith("Transfer sibling: ") for w in warnings), (
+            f"Expected a 'Transfer sibling: '-prefixed warning, got {warnings}"
+        )
+
+    finally:
+        await client.post(
+            f"/v1/reconciliations/{recon_id}/revert",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE expense_transactions SET reconciliation_id = NULL WHERE reconciliation_id = $1",
+                recon_id,
+            )
+            await conn.execute(
+                "DELETE FROM activity_log WHERE resource_id = $1 AND user_id = $2",
+                recon_id, test_data.user_id,
+            )
+            await conn.execute(
+                "DELETE FROM expense_reconciliations WHERE id = $1 AND user_id = $2",
+                recon_id, test_data.user_id,
+            )
+        await _hard_delete_txns(
+            [tid for tid in (primary_id, sibling_id) if tid], test_data.user_id,
+        )
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
+                second_account_id, test_data.user_id,
+            )
+
+
+# ---------------------------------------------------------------------------
+# 4c. Hashtag junction round-trip on BOTH legs of a transfer pair
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_transfer_pair_delete_restore_round_trips_hashtags_both_legs(
+    client, test_data,
+):
+    """Deleting a pair cascades junction soft-deletes on both legs; the
+    restore re-activates both legs' junctions by exact ``deleted_at``
+    match. Pins the marker-precision contract on the sibling leg, which
+    only had primary-leg coverage above.
+    """
+    second_account_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 is_archived, sort_order, created_at, updated_at)
+            VALUES ($1, $2, 'Restore-Pair-Hashtags', 'PEN', false, '#0000AA',
+                    false, 4, now(), now())
+            """,
+            second_account_id, test_data.user_id,
+        )
+
+    primary_id = sibling_id = None
+    try:
+        create_r = await client.post(
+            "/v1/transactions",
+            json={
+                "id": str(uuid.uuid4()),
+                "title": f"pair-hashtags-{uuid.uuid4()}",
+                "amount_cents": -900,
+                "date": "2026-04-12T12:00:00Z",
+                "account_id": test_data.account_id,
+                "category_id": test_data.category_id,
+                "hashtag_ids": [test_data.hashtag_id, test_data.hashtag2_id],
+                "transfer": {
+                    "id": str(uuid.uuid4()),
+                    "account_id": second_account_id,
+                    "amount_cents": 900,
+                },
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert create_r.status_code == 201, create_r.text
+        primary_id = create_r.json()["id"]
+        sibling_id = create_r.json()["transfer_transaction_id"]
+
+        # Hashtags are per-leg: attach one to the sibling via plain PUT.
+        tag_sibling = await client.put(
+            f"/v1/transactions/{sibling_id}",
+            json={"hashtag_ids": [test_data.hashtag_id]},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert tag_sibling.status_code == 200, tag_sibling.text
+
+        async def _active_junctions(tid: str) -> int:
+            async with db.pool.acquire() as conn:
+                return await conn.fetchval(
+                    """
+                    SELECT count(*) FROM expense_transaction_hashtags
+                    WHERE transaction_id = $1 AND deleted_at IS NULL
+                    """,
+                    tid,
+                )
+
+        assert await _active_junctions(primary_id) == 2
+        assert await _active_junctions(sibling_id) == 1
+
+        await client.delete(
+            f"/v1/transactions/{primary_id}",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert await _active_junctions(primary_id) == 0
+        assert await _active_junctions(sibling_id) == 0
+
+        restore_r = await client.post(
+            f"/v1/transactions/{primary_id}/restore",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert restore_r.status_code == 200, restore_r.text
+
+        assert await _active_junctions(primary_id) == 2, (
+            "Primary leg's junctions must round-trip through delete+restore"
+        )
+        assert await _active_junctions(sibling_id) == 1, (
+            "Sibling leg's junctions must round-trip through delete+restore"
+        )
+
+    finally:
+        await _hard_delete_txns(
+            [tid for tid in (primary_id, sibling_id) if tid], test_data.user_id,
+        )
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
+                second_account_id, test_data.user_id,
+            )
+
+
+# ---------------------------------------------------------------------------
 # 5. Validation guard — archived account blocks restore, leaves state untouched
 # ---------------------------------------------------------------------------
 

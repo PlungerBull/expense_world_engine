@@ -287,6 +287,152 @@ async def test_recon_complete_and_revert_bump_assigned_txn_version(client, test_
 
 
 @pytest.mark.asyncio
+async def test_complete_rejects_no_assigned_transactions(client, test_data):
+    """Completing a reconciliation with zero assigned transactions is a
+    422 — there is nothing to reconcile. Pins the guard message before
+    the complete/revert twin collapse (engine-spec rule, previously
+    untested)."""
+    recon_id = str(uuid.uuid4())
+    recon_create = await client.post(
+        "/v1/reconciliations",
+        json={
+            "id": recon_id,
+            "account_id": test_data.account_id,
+            "name": f"no-assigned-{uuid.uuid4()}",
+            "beginning_balance_cents": 0,
+            "ending_balance_cents": 0,
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert recon_create.status_code == 201, recon_create.text
+
+    try:
+        r = await client.post(
+            f"/v1/reconciliations/{recon_id}/complete",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 422, r.text
+        error = r.json()["error"]
+        assert error["code"] == "VALIDATION_ERROR"
+        assert (error.get("fields") or {}).get("transactions") == (
+            "At least one transaction must be assigned."
+        ), f"Guard message drifted: {error}"
+    finally:
+        await _cleanup_reconciliation(recon_id, test_data.user_id)
+
+
+async def _count_recon_activity(recon_id: str, user_id: str) -> int:
+    async with db.pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT count(*) FROM activity_log WHERE resource_id = $1 AND user_id = $2",
+            recon_id, user_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_complete_twice_is_noop_without_activity_log(client, test_data):
+    """A second complete on an already-COMPLETED reconciliation returns
+    200 with the current state and writes NO activity row — the no-op
+    early return, pinned before the twin collapse."""
+    txn_create = await client.post(
+        "/v1/transactions",
+        json={
+            "id": str(uuid.uuid4()),
+            "title": f"noop-complete-{uuid.uuid4()}",
+            "amount_cents": -150,
+            "date": "2026-04-12T10:00:00Z",
+            "account_id": test_data.account_id,
+            "category_id": test_data.category_id,
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert txn_create.status_code == 201
+    txn_id = txn_create.json()["id"]
+
+    recon_id = str(uuid.uuid4())
+    recon_create = await client.post(
+        "/v1/reconciliations",
+        json={
+            "id": recon_id,
+            "account_id": test_data.account_id,
+            "name": f"noop-complete-{uuid.uuid4()}",
+            "beginning_balance_cents": 0,
+            "ending_balance_cents": 0,
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert recon_create.status_code == 201
+    try:
+        await client.put(
+            f"/v1/transactions/{txn_id}",
+            json={"reconciliation_id": recon_id},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        first = await client.post(
+            f"/v1/reconciliations/{recon_id}/complete",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert first.status_code == 200, first.text
+
+        count_after_first = await _count_recon_activity(recon_id, test_data.user_id)
+
+        # Fresh idempotency key — this is a genuine second request, not a replay.
+        second = await client.post(
+            f"/v1/reconciliations/{recon_id}/complete",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["status"] == 2  # still COMPLETED
+
+        count_after_second = await _count_recon_activity(recon_id, test_data.user_id)
+        assert count_after_second == count_after_first, (
+            "No-op complete must not write an activity row"
+        )
+    finally:
+        await client.post(
+            f"/v1/reconciliations/{recon_id}/revert",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        await _cleanup_reconciliation(recon_id, test_data.user_id)
+        await _cleanup_transactions([txn_id], test_data.user_id)
+
+
+@pytest.mark.asyncio
+async def test_revert_draft_is_noop_without_activity_log(client, test_data):
+    """Reverting a never-completed DRAFT returns 200 with the current
+    state and writes NO activity row — the mirror-image no-op."""
+    recon_id = str(uuid.uuid4())
+    recon_create = await client.post(
+        "/v1/reconciliations",
+        json={
+            "id": recon_id,
+            "account_id": test_data.account_id,
+            "name": f"noop-revert-{uuid.uuid4()}",
+            "beginning_balance_cents": 0,
+            "ending_balance_cents": 0,
+        },
+        headers={"X-Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert recon_create.status_code == 201
+    try:
+        count_before = await _count_recon_activity(recon_id, test_data.user_id)
+
+        r = await client.post(
+            f"/v1/reconciliations/{recon_id}/revert",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == 1  # still DRAFT
+
+        count_after = await _count_recon_activity(recon_id, test_data.user_id)
+        assert count_after == count_before, (
+            "No-op revert must not write an activity row"
+        )
+    finally:
+        await _cleanup_reconciliation(recon_id, test_data.user_id)
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_transactions_paginate_and_flag_truncation(
     client, test_data,
 ):
