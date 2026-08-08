@@ -273,37 +273,38 @@ async def update_reconciliation(
 # ---------------------------------------------------------------------------
 
 
-async def complete_reconciliation(
+async def _transition_status(
     conn: asyncpg.Connection,
     user_id: str,
     reconciliation_id: str,
+    *,
+    target: ReconciliationStatus,
+    require_assigned: bool,
 ) -> dict:
-    """Transition a reconciliation from DRAFT to COMPLETED.
+    """Flip a reconciliation's status — the one body behind complete and revert.
 
-    Idempotent no-op if already COMPLETED: returns the current row without
-    writing a new activity log entry.
-
-    A non-zero ``difference_cents`` does not block completion — the figure
-    informs, the user decides. The activity-log snapshots carry it, so the
-    audit trail records what the difference was at the moment of completion.
+    Idempotent no-op if the row already holds ``target``: returns the
+    current row without writing a new activity log entry.
 
     Raises:
         not_found: no active reconciliation with that id for this user.
-        validation_error: no transactions are assigned to this reconciliation.
+        validation_error: ``require_assigned`` and no transactions are
+            assigned to this reconciliation.
     """
     row = await fetch_reconciliation(conn, user_id, reconciliation_id)
     if row is None:
         raise not_found("reconciliation")
 
-    # Already completed — return idempotently (no activity log)
-    if row["status"] == ReconciliationStatus.COMPLETED:
+    # Already at target — return idempotently (no activity log)
+    if row["status"] == target:
         return reconciliation_from_row(row)
 
-    # Lock and count assigned transactions in one shot. FOR UPDATE
-    # serializes concurrent transaction edits against this status flip —
-    # without it, a transaction could be reassigned away or edited
-    # between the count check and the status update, leaving the client's
-    # view of "what's locked" inconsistent with what actually got locked.
+    # Lock (and, for complete, count) assigned transactions in one shot.
+    # FOR UPDATE serializes concurrent transaction edits against this
+    # status flip — without it, a transaction could be reassigned away or
+    # edited between the count check and the status update, leaving the
+    # client's view of "what's locked" inconsistent with what actually
+    # got locked.
     assigned_txns = await conn.fetch(
         """
         SELECT id FROM expense_transactions
@@ -313,7 +314,7 @@ async def complete_reconciliation(
         reconciliation_id,
         user_id,
     )
-    if not assigned_txns:
+    if require_assigned and not assigned_txns:
         raise validation_error(
             "Cannot complete reconciliation with no assigned transactions.",
             {"transactions": "At least one transaction must be assigned."},
@@ -329,12 +330,12 @@ async def complete_reconciliation(
         """,
         reconciliation_id,
         user_id,
-        ReconciliationStatus.COMPLETED,
+        target,
     )
 
     # Bump version on every assigned transaction so clients and auditors
-    # see them flip into the "fields locked" state in the same tick as
-    # the reconciliation itself.
+    # see them flip into (or out of) the "fields locked" state in the
+    # same tick as the reconciliation itself.
     await conn.execute(
         """
         UPDATE expense_transactions
@@ -354,6 +355,23 @@ async def complete_reconciliation(
         after_snapshot=after,
     )
     return after
+
+
+async def complete_reconciliation(
+    conn: asyncpg.Connection,
+    user_id: str,
+    reconciliation_id: str,
+) -> dict:
+    """Transition a reconciliation from DRAFT to COMPLETED.
+
+    A non-zero ``difference_cents`` does not block completion — the figure
+    informs, the user decides. The activity-log snapshots carry it, so the
+    audit trail records what the difference was at the moment of completion.
+    """
+    return await _transition_status(
+        conn, user_id, reconciliation_id,
+        target=ReconciliationStatus.COMPLETED, require_assigned=True,
+    )
 
 
 async def revert_reconciliation(
@@ -361,67 +379,11 @@ async def revert_reconciliation(
     user_id: str,
     reconciliation_id: str,
 ) -> dict:
-    """Transition a reconciliation from COMPLETED back to DRAFT.
-
-    Idempotent no-op if already DRAFT: returns the current row without
-    writing a new activity log entry.
-
-    Raises:
-        not_found: no active reconciliation with that id for this user.
-    """
-    row = await fetch_reconciliation(conn, user_id, reconciliation_id)
-    if row is None:
-        raise not_found("reconciliation")
-
-    # Already draft — return idempotently (no activity log)
-    if row["status"] == ReconciliationStatus.DRAFT:
-        return reconciliation_from_row(row)
-
-    # Mirror complete_reconciliation: lock assigned txns before flipping
-    # state so concurrent edits serialize behind the revert, and readers
-    # see the same tick bump the txn versions.
-    await conn.fetch(
-        """
-        SELECT id FROM expense_transactions
-        WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
-        FOR UPDATE
-        """,
-        reconciliation_id,
-        user_id,
+    """Transition a reconciliation from COMPLETED back to DRAFT."""
+    return await _transition_status(
+        conn, user_id, reconciliation_id,
+        target=ReconciliationStatus.DRAFT, require_assigned=False,
     )
-
-    before = reconciliation_from_row(row)
-
-    await conn.execute(
-        """
-        UPDATE expense_reconciliations
-        SET status = $3, updated_at = now(), version = version + 1
-        WHERE id = $1 AND user_id = $2
-        """,
-        reconciliation_id,
-        user_id,
-        ReconciliationStatus.DRAFT,
-    )
-
-    await conn.execute(
-        """
-        UPDATE expense_transactions
-        SET version = version + 1, updated_at = now()
-        WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
-        """,
-        reconciliation_id,
-        user_id,
-    )
-
-    after_row = await fetch_reconciliation(conn, user_id, reconciliation_id)
-    after = reconciliation_from_row(after_row)
-
-    await write_activity_log(
-        conn, user_id, "reconciliation", reconciliation_id, ActivityAction.UPDATED,
-        before_snapshot=before,
-        after_snapshot=after,
-    )
-    return after
 
 
 # ---------------------------------------------------------------------------
