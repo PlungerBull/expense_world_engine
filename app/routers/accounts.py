@@ -7,12 +7,13 @@ from fastapi import APIRouter, Header, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import ERROR_RESPONSES, not_found
+from app.errors import ERROR_RESPONSES
 from app.helpers import accounts as accounts_service
 from app.helpers.account_balance import fetch_balance, fetch_balances
 from app.helpers.exchange_rate import batch_get_rates, rate_lookup_date
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
+from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
 from app.schemas.accounts import (
     AccountCreateRequest,
@@ -141,13 +142,9 @@ async def create_opening_balance(
 @router.get("/{account_id}", response_model=AccountResponse)
 async def get_account(account_id: UUID, auth_user: CurrentUser):
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            account_id,
-            auth_user.id,
+        row = await fetch_owned_row_or_404(
+            conn, "expense_bank_accounts", account_id, auth_user.id, "account"
         )
-        if row is None:
-            raise not_found("account")
 
         balance_cents = await fetch_balance(conn, auth_user.id, account_id)
         home = await accounts_service.get_home_balance(

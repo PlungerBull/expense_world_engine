@@ -7,10 +7,11 @@ from fastapi import APIRouter, Header, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import ERROR_RESPONSES, not_found
+from app.errors import ERROR_RESPONSES
 from app.helpers import hashtags as hashtags_service
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
+from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
 from app.schemas.hashtags import (
     HashtagCreateRequest,
@@ -78,13 +79,9 @@ async def create_hashtag(
 @router.get("/{hashtag_id}", response_model=HashtagResponse)
 async def get_hashtag(hashtag_id: UUID, auth_user: CurrentUser):
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_hashtags WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            hashtag_id,
-            auth_user.id,
+        row = await fetch_owned_row_or_404(
+            conn, "expense_hashtags", hashtag_id, auth_user.id, "hashtag"
         )
-        if row is None:
-            raise not_found("hashtag")
         return hashtag_from_row(row)
 
 

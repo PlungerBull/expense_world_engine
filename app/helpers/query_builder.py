@@ -8,6 +8,67 @@ from typing import Optional
 
 import asyncpg
 
+from app.errors import not_found
+
+
+async def fetch_owned_row(
+    conn: asyncpg.Connection,
+    table: str,
+    resource_id: str,
+    user_id: str,
+    *,
+    deleted: bool = False,
+    for_update: bool = False,
+) -> Optional[asyncpg.Record]:
+    """Fetch one row by id under the tenant-isolation predicate this module
+    already owns for writes: ``id = $1 AND user_id = $2``.
+
+    ``deleted=False`` (the default) resolves only active rows;
+    ``deleted=True`` resolves only soft-deleted rows (the restore path).
+    ``for_update=True`` takes a row lock for read-modify-write flows.
+    Returns ``None`` when no row matches.
+
+    ``table`` is always a literal at the call site, never user input.
+    Deliberate non-adopters of this helper: ``helpers/pat.py`` (soft-delete
+    column is ``revoked_at``), ``inbox.promote_inbox_item`` (extra status
+    predicate), and ``reconciliations.fetch_reconciliation`` (computed
+    ``difference_cents`` projection).
+    """
+    predicate = "IS NOT NULL" if deleted else "IS NULL"
+    suffix = " FOR UPDATE" if for_update else ""
+    return await conn.fetchrow(
+        f"""
+        SELECT * FROM {table}
+        WHERE id = $1 AND user_id = $2 AND deleted_at {predicate}{suffix}
+        """,
+        resource_id,
+        user_id,
+    )
+
+
+async def fetch_owned_row_or_404(
+    conn: asyncpg.Connection,
+    table: str,
+    resource_id: str,
+    user_id: str,
+    resource: str,
+    *,
+    deleted: bool = False,
+    for_update: bool = False,
+) -> asyncpg.Record:
+    """``fetch_owned_row`` that raises ``not_found(resource)`` on a miss.
+
+    Callers that tolerate a miss (or raise something other than 404) use
+    ``fetch_owned_row`` directly — the split keeps this return type
+    non-Optional.
+    """
+    row = await fetch_owned_row(
+        conn, table, resource_id, user_id, deleted=deleted, for_update=for_update
+    )
+    if row is None:
+        raise not_found(resource)
+    return row
+
 
 async def dynamic_update(
     conn: asyncpg.Connection,

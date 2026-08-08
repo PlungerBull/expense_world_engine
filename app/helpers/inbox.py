@@ -35,7 +35,12 @@ import asyncpg
 from app.constants import ActivityAction, InboxStatus, TransactionType
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
-from app.helpers.query_builder import dynamic_update, restore, soft_delete
+from app.helpers.query_builder import (
+    dynamic_update,
+    fetch_owned_row_or_404,
+    restore,
+    soft_delete,
+)
 from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.validation import extract_update_fields
 from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
@@ -215,13 +220,9 @@ async def update_inbox_item(
 
     # Empty update — return current
     if not fields and not transfer_given:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_transaction_inbox WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            inbox_id,
-            user_id,
+        row = await fetch_owned_row_or_404(
+            conn, "expense_transaction_inbox", inbox_id, user_id, "inbox item"
         )
-        if row is None:
-            raise not_found("inbox item")
         return inbox_from_row(row)
 
     # Collect the signed inputs. As on create, signs live only in this block.
@@ -244,13 +245,13 @@ async def update_inbox_item(
             )
         sibling_signed = transfer["amount_cents"]
 
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_transaction_inbox WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        inbox_id,
-        user_id,
+    # FOR UPDATE: the merged-state resolution below reads this row and derives
+    # transaction_type from it — same lost-update hazard as the transaction
+    # update path, which locks its row for the same reason.
+    before_row = await fetch_owned_row_or_404(
+        conn, "expense_transaction_inbox", inbox_id, user_id, "inbox item",
+        for_update=True,
     )
-    if before_row is None:
-        raise not_found("inbox item")
 
     before = inbox_from_row(before_row)
 
@@ -323,13 +324,9 @@ async def delete_inbox_item(
     ``deleted_at`` but keeps ``status = 2``. A plain delete just marks
     the row ``deleted_at`` without touching ``status``.
     """
-    row = await conn.fetchrow(
-        "SELECT * FROM expense_transaction_inbox WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        inbox_id,
-        user_id,
+    row = await fetch_owned_row_or_404(
+        conn, "expense_transaction_inbox", inbox_id, user_id, "inbox item"
     )
-    if row is None:
-        raise not_found("inbox item")
 
     before = inbox_from_row(row)
 
@@ -373,16 +370,10 @@ async def restore_inbox_item(
             not the right gesture; client should delete the ledger row
             instead.
     """
-    row = await conn.fetchrow(
-        """
-        SELECT * FROM expense_transaction_inbox
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL
-        """,
-        inbox_id,
-        user_id,
+    row = await fetch_owned_row_or_404(
+        conn, "expense_transaction_inbox", inbox_id, user_id, "inbox item",
+        deleted=True,
     )
-    if row is None:
-        raise not_found("inbox item")
 
     if row["status"] != InboxStatus.PENDING:
         raise conflict(
@@ -441,6 +432,8 @@ async def promote_inbox_item(
     # Lock the inbox row for update — prevents two concurrent
     # promotes from creating duplicate transactions from the same
     # inbox item. The lock releases when the transaction commits.
+    # Deliberately not query_builder.fetch_owned_row: the extra
+    # ``status = $3`` arm has no place in the shared predicate.
     inbox_row = await conn.fetchrow(
         """
         SELECT * FROM expense_transaction_inbox

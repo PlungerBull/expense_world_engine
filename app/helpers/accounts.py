@@ -27,7 +27,12 @@ from app.helpers.account_balance import fetch_balance
 from app.helpers.activity_log import write_activity_log
 from app.helpers.categories import ensure_system_category
 from app.helpers.exchange_rate import get_rate, rate_lookup_date
-from app.helpers.query_builder import dynamic_update, restore, soft_delete
+from app.helpers.query_builder import (
+    dynamic_update,
+    fetch_owned_row_or_404,
+    restore,
+    soft_delete,
+)
 from app.helpers.validation import currency_code_error
 from app.schemas.accounts import account_from_row
 
@@ -234,13 +239,9 @@ async def update_account(
 
     # Empty update — return current state unchanged
     if not fields:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            account_id,
-            user_id,
+        row = await fetch_owned_row_or_404(
+            conn, "expense_bank_accounts", account_id, user_id, "account"
         )
-        if row is None:
-            raise not_found("account")
         balance_cents = await fetch_balance(conn, user_id, account_id)
         home = await get_home_balance(conn, row["currency_code"], balance_cents, user_id)
         return account_from_row(row, balance_cents, home)
@@ -280,13 +281,9 @@ async def update_account(
                         f"An account named '{fields['name']}' with this currency already exists."
                     )
 
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        account_id,
-        user_id,
+    before_row = await fetch_owned_row_or_404(
+        conn, "expense_bank_accounts", account_id, user_id, "account"
     )
-    if before_row is None:
-        raise not_found("account")
 
     # Fetched once and reused for both snapshots. A PUT cannot move money, and
     # currency_code is rejected above, so both the native and the home value are
@@ -324,13 +321,9 @@ async def delete_account(
         not_found: no active account with that id for this user.
         conflict: account is still referenced by active transactions.
     """
-    row = await conn.fetchrow(
-        "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        account_id,
-        user_id,
+    row = await fetch_owned_row_or_404(
+        conn, "expense_bank_accounts", account_id, user_id, "account"
     )
-    if row is None:
-        raise not_found("account")
 
     # Check for active transactions
     has_txns = await conn.fetchval(
@@ -374,13 +367,9 @@ async def restore_account(
     Raises:
         not_found: no soft-deleted account with that id for this user.
     """
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL",
-        account_id,
-        user_id,
+    before_row = await fetch_owned_row_or_404(
+        conn, "expense_bank_accounts", account_id, user_id, "account", deleted=True
     )
-    if before_row is None:
-        raise not_found("account")
 
     # Restoring the account row does not restore any transaction, so the balance
     # is the same on both sides of the mutation.
@@ -439,13 +428,9 @@ async def _set_account_archive(
     account_id: str,
     archived: bool,
 ) -> dict:
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_bank_accounts WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        account_id,
-        user_id,
+    before_row = await fetch_owned_row_or_404(
+        conn, "expense_bank_accounts", account_id, user_id, "account"
     )
-    if before_row is None:
-        raise not_found("account")
 
     # Archiving moves no money — an archived account still holds a real balance
     # and still reports it. One fetch, both snapshots.

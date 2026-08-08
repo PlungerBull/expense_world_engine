@@ -16,7 +16,12 @@ import asyncpg
 from app.constants import ActivityAction
 from app.errors import conflict, not_found
 from app.helpers.activity_log import write_activity_log
-from app.helpers.query_builder import dynamic_update, restore, soft_delete
+from app.helpers.query_builder import (
+    dynamic_update,
+    fetch_owned_row_or_404,
+    restore,
+    soft_delete,
+)
 from app.helpers.validation import normalize_name
 from app.schemas.hashtags import hashtag_from_row
 
@@ -89,22 +94,14 @@ async def update_hashtag(
     """
     # Empty update — return current state unchanged
     if not fields:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_hashtags WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            hashtag_id,
-            user_id,
+        row = await fetch_owned_row_or_404(
+            conn, "expense_hashtags", hashtag_id, user_id, "hashtag"
         )
-        if row is None:
-            raise not_found("hashtag")
         return hashtag_from_row(row)
 
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_hashtags WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        hashtag_id,
-        user_id,
+    before_row = await fetch_owned_row_or_404(
+        conn, "expense_hashtags", hashtag_id, user_id, "hashtag"
     )
-    if before_row is None:
-        raise not_found("hashtag")
 
     before = hashtag_from_row(before_row)
 
@@ -157,13 +154,9 @@ async def delete_hashtag(
     Raises:
         not_found: no active hashtag with that id for this user.
     """
-    row = await conn.fetchrow(
-        "SELECT * FROM expense_hashtags WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        hashtag_id,
-        user_id,
+    row = await fetch_owned_row_or_404(
+        conn, "expense_hashtags", hashtag_id, user_id, "hashtag"
     )
-    if row is None:
-        raise not_found("hashtag")
 
     before = hashtag_from_row(row)
 
@@ -228,13 +221,9 @@ async def restore_hashtag(
         not_found: no soft-deleted hashtag with that id for this user.
         conflict: an active hashtag already uses the same name.
     """
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_hashtags WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL",
-        hashtag_id,
-        user_id,
+    before_row = await fetch_owned_row_or_404(
+        conn, "expense_hashtags", hashtag_id, user_id, "hashtag", deleted=True
     )
-    if before_row is None:
-        raise not_found("hashtag")
 
     dup = await conn.fetchrow(
         """

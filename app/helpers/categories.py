@@ -21,7 +21,12 @@ from app.constants import (
 )
 from app.errors import conflict, forbidden, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
-from app.helpers.query_builder import dynamic_update, restore, soft_delete
+from app.helpers.query_builder import (
+    dynamic_update,
+    fetch_owned_row_or_404,
+    restore,
+    soft_delete,
+)
 from app.helpers.validation import normalize_name
 from app.schemas.categories import category_from_row
 
@@ -194,22 +199,14 @@ async def update_category(
     """
     # Empty update — return current state unchanged
     if not fields:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            category_id,
-            user_id,
+        row = await fetch_owned_row_or_404(
+            conn, "expense_categories", category_id, user_id, "category"
         )
-        if row is None:
-            raise not_found("category")
         return category_from_row(row)
 
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        category_id,
-        user_id,
+    before_row = await fetch_owned_row_or_404(
+        conn, "expense_categories", category_id, user_id, "category"
     )
-    if before_row is None:
-        raise not_found("category")
 
     before = category_from_row(before_row)
 
@@ -259,13 +256,9 @@ async def delete_category(
         forbidden: attempting to delete a system category.
         conflict: category is still referenced by active transactions or inbox items.
     """
-    row = await conn.fetchrow(
-        "SELECT * FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-        category_id,
-        user_id,
+    row = await fetch_owned_row_or_404(
+        conn, "expense_categories", category_id, user_id, "category"
     )
-    if row is None:
-        raise not_found("category")
 
     # System categories cannot be deleted
     if row["is_system"]:
@@ -324,13 +317,9 @@ async def restore_category(
         not_found: no soft-deleted category with that id for this user.
         conflict: an active category already uses the same name.
     """
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_categories WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL",
-        category_id,
-        user_id,
+    before_row = await fetch_owned_row_or_404(
+        conn, "expense_categories", category_id, user_id, "category", deleted=True
     )
-    if before_row is None:
-        raise not_found("category")
 
     dup = await conn.fetchrow(
         """

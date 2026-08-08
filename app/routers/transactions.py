@@ -13,11 +13,12 @@ from fastapi import APIRouter, Header, Query
 
 from app import db
 from app.deps import CurrentUser
-from app.errors import ERROR_RESPONSES, not_found
+from app.errors import ERROR_RESPONSES
 from app.helpers import transactions as transactions_service
 from app.helpers.formatting import apply_debit_as_negative
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import paginated_response
+from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
 from app.schemas.pagination import Paginated
 from app.schemas.transactions import (
@@ -48,13 +49,9 @@ async def get_transaction(
     debit_as_negative: bool = Query(False),
 ):
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_transactions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            transaction_id,
-            auth_user.id,
+        row = await fetch_owned_row_or_404(
+            conn, "expense_transactions", transaction_id, auth_user.id, "transaction"
         )
-        if row is None:
-            raise not_found("transaction")
         data = transaction_from_row(row)
         await transactions_service.attach_hashtag_ids(conn, data)
         if debit_as_negative:

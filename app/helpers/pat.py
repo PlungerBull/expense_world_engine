@@ -85,6 +85,8 @@ async def revoke(
     Raises:
         not_found: no active PAT with that id for this user.
     """
+    # Deliberately not query_builder.fetch_owned_row: this table's
+    # soft-delete column is revoked_at, not deleted_at.
     before_row = await conn.fetchrow(
         """
         SELECT * FROM personal_access_tokens

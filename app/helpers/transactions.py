@@ -62,7 +62,11 @@ import asyncpg
 from app.constants import ActivityAction, ReconciliationStatus
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
-from app.helpers.query_builder import dynamic_update
+from app.helpers.query_builder import (
+    dynamic_update,
+    fetch_owned_row,
+    fetch_owned_row_or_404,
+)
 from app.helpers.validation import validate_active_account, validate_active_category
 from app.schemas.transactions import (
     TransactionBatchRequest,
@@ -455,13 +459,9 @@ async def update_transaction(
     """
     # Empty update — return current state unchanged
     if not fields and hashtag_ids is None and not recon_id_provided:
-        row = await conn.fetchrow(
-            "SELECT * FROM expense_transactions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            transaction_id,
-            user_id,
+        row = await fetch_owned_row_or_404(
+            conn, "expense_transactions", transaction_id, user_id, "transaction"
         )
-        if row is None:
-            raise not_found("transaction")
         response = transaction_from_row(row)
         await attach_hashtag_ids(conn, response)
         return response
@@ -471,13 +471,10 @@ async def update_transaction(
     # and our balance reversal below, causing a lost-update and
     # silently corrupting the account balance. The lock is released
     # automatically when the surrounding transaction commits.
-    before_row = await conn.fetchrow(
-        "SELECT * FROM expense_transactions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE",
-        transaction_id,
-        user_id,
+    before_row = await fetch_owned_row_or_404(
+        conn, "expense_transactions", transaction_id, user_id, "transaction",
+        for_update=True,
     )
-    if before_row is None:
-        raise not_found("transaction")
 
     before = transaction_from_row(before_row)
     # Capture pre-mutation hashtag_ids — activity-log before_snapshot must
@@ -683,13 +680,10 @@ async def delete_transaction(
     # outside the transaction, so a concurrent update could change
     # `amount_cents` before we reversed the balance, causing a
     # lost-update and silently corrupting the account balance.
-    row = await conn.fetchrow(
-        "SELECT * FROM expense_transactions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE",
-        transaction_id,
-        user_id,
+    row = await fetch_owned_row_or_404(
+        conn, "expense_transactions", transaction_id, user_id, "transaction",
+        for_update=True,
     )
-    if row is None:
-        raise not_found("transaction")
 
     before = transaction_from_row(row)
     # Pre-delete hashtag_ids — must be captured BEFORE the junction-row
@@ -728,10 +722,10 @@ async def delete_transaction(
     # before-snapshot and the after-snapshot written below.
     if row["transfer_transaction_id"] is not None:
         sibling_id = str(row["transfer_transaction_id"])
-        sibling_row = await conn.fetchrow(
-            "SELECT * FROM expense_transactions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE",
-            sibling_id,
-            user_id,
+        # Non-raising fetch: a missing sibling is tolerated (asymmetric pairs
+        # can exist after a one-legged delete), so no _or_404 here.
+        sibling_row = await fetch_owned_row(
+            conn, "expense_transactions", sibling_id, user_id, for_update=True
         )
         if sibling_row is not None:
             sibling_before = transaction_from_row(sibling_row)
@@ -856,16 +850,10 @@ async def restore_transaction(
             collected into one ``fields`` dict before raising.
     """
     # 1. Lock the soft-deleted primary row.
-    row = await conn.fetchrow(
-        """
-        SELECT * FROM expense_transactions
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL FOR UPDATE
-        """,
-        transaction_id,
-        user_id,
+    row = await fetch_owned_row_or_404(
+        conn, "expense_transactions", transaction_id, user_id, "transaction",
+        deleted=True, for_update=True,
     )
-    if row is None:
-        raise not_found("transaction")
 
     is_transfer = row["transfer_transaction_id"] is not None
 
@@ -876,13 +864,11 @@ async def restore_transaction(
     sibling_id: Optional[str] = None
     if is_transfer:
         sibling_id = str(row["transfer_transaction_id"])
-        sibling_row = await conn.fetchrow(
-            """
-            SELECT * FROM expense_transactions
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL FOR UPDATE
-            """,
-            sibling_id,
-            user_id,
+        # Non-raising fetch: a miss here is a pair-integrity break, which is
+        # a conflict — not a not_found — so no _or_404.
+        sibling_row = await fetch_owned_row(
+            conn, "expense_transactions", sibling_id, user_id,
+            deleted=True, for_update=True,
         )
         if sibling_row is None:
             raise conflict(
