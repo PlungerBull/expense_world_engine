@@ -33,7 +33,7 @@ from app.helpers.query_builder import (
     restore_with_audit,
     soft_delete_with_audit,
 )
-from app.helpers.reference_data import name_taken
+from app.helpers.reference_data import name_taken, next_sort_order
 from app.helpers.validation import currency_code_error, normalize_name
 from app.schemas.accounts import account_from_row
 
@@ -115,7 +115,11 @@ async def create_account(
             name,
             currency_code,
             color or "#3b82f6",
-            sort_order or 0,
+            # Omitted sort_order appends; an explicit value (including 0) is
+            # respected verbatim (the old `or 0` collapsed explicit zeros too).
+            sort_order
+            if sort_order is not None
+            else await next_sort_order(conn, "expense_bank_accounts", user_id),
         )
     except asyncpg.UniqueViolationError:
         raise conflict(f"An account with id '{account_id}' already exists.")

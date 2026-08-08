@@ -44,3 +44,20 @@ async def name_taken(
         *params,
     )
     return row is not None
+
+
+async def next_sort_order(
+    conn: asyncpg.Connection,
+    table: str,
+    user_id: str,
+) -> int:
+    """The append slot for a new row: MAX(sort_order) + 1 within the user's
+    collection, 0 when it is empty (CLAUDE.md collection ordering).
+
+    Deliberately spans soft-deleted rows — a deleted row keeps its slot and
+    reclaims it on restore, so a new row must not land on it.
+    """
+    return await conn.fetchval(
+        f"SELECT COALESCE(MAX(sort_order) + 1, 0) FROM {table} WHERE user_id = $1",
+        user_id,
+    )

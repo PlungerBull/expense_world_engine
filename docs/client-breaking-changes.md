@@ -11,6 +11,34 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-08 — omitted `sort_order` on create now appends instead of landing at 0
+
+**Engine change** (`helpers/reference_data.next_sort_order`; bloat-audit
+2026-08-06 Correctness §5, deferred by owner to this refactor). On
+`POST /accounts`, `POST /categories`, `POST /hashtags`:
+
+1. **Omitting `sort_order` now appends** — the new row gets
+   `MAX(sort_order) + 1` within the user's collection (`0` when empty),
+   implementing CLAUDE.md's collection-ordering convention. Previously every
+   new row landed at `0`, so lists sorted by `sort_order ASC, created_at ASC`
+   effectively fell back to creation order.
+2. **An explicit `sort_order: 0` is now stored as `0`, distinguishably** —
+   the old `or 0` collapsed it into the default; now only *omitted* values
+   append.
+
+A client that always sends explicit `sort_order` values sees no change. One
+that omitted it and relied on the created-at fallback ordering will see new
+rows sort after existing ones — which is what the spec always claimed.
+
+### Engine references
+
+- `app/helpers/reference_data.py` (`next_sort_order`), the three creates in
+  `app/helpers/{accounts,categories,hashtags}.py`
+- `docs/engine-spec.md` §POST /accounts, /categories, /hashtags
+- `tests/test_sort_order_append.py`
+
+---
+
 ## 2026-08-08 — account names: trimmed, blank rejected, case-insensitive uniqueness, deleted accounts release their name
 
 **Engine change** (`sql/028` + `helpers/accounts.py`; bloat-audit 2026-08-06

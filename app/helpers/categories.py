@@ -27,6 +27,7 @@ from app.helpers.query_builder import (
     restore_with_audit,
     soft_delete_with_audit,
 )
+from app.helpers.reference_data import next_sort_order
 from app.helpers.validation import normalize_name
 from app.schemas.categories import category_from_row
 
@@ -168,7 +169,11 @@ async def create_category(
             user_id,
             name,
             color,
-            sort_order or 0,
+            # Omitted sort_order appends; an explicit value (including 0) is
+            # respected verbatim (the old `or 0` collapsed explicit zeros too).
+            sort_order
+            if sort_order is not None
+            else await next_sort_order(conn, "expense_categories", user_id),
         )
     except asyncpg.UniqueViolationError:
         raise conflict(f"A category with id '{category_id}' already exists.")

@@ -215,7 +215,7 @@ Each account response includes `current_balance_cents` and `current_balance_home
 Creates a new bank account (real account only — `is_person = false`).
 
 **Required:** `id` (client-supplied UUID), `name`, `currency_code`
-**Optional:** `color`, `sort_order`
+**Optional:** `color`, `sort_order` (omitted → appends: `MAX(sort_order) + 1` within the user's collection, `0` when empty; an explicit value — including `0` — is stored verbatim)
 **Forbidden:** `is_person`, and any unknown field. Person accounts are **not** created through this endpoint; they are created explicitly via the People API (see **People / Person Accounts** below). Requests that include `is_person` (with any value) or any other unknown field return `422 VALIDATION_ERROR`.
 
 **Validation:**
@@ -292,7 +292,7 @@ Returns all active categories, sorted by `sort_order`. System categories (`is_sy
 
 ### `POST /categories`
 **Required:** `id` (client-supplied UUID), `name`, `color`
-**Optional:** `sort_order`
+**Optional:** `sort_order` (omitted → appends: `MAX(sort_order) + 1` within the user's collection; explicit values, including `0`, stored verbatim)
 
 **Name normalization:** `name` is trimmed before storage. An empty-after-trim name returns `422 VALIDATION_ERROR` with `fields: {"name": "Must not be empty."}`. Uniqueness is **case-insensitive** per user: "Food", "food", and "FOOD" collide. A conflicting name returns `409 CONFLICT`. The database enforces this with a partial unique index on `(user_id, LOWER(name)) WHERE deleted_at IS NULL`, so deleting a category and creating a new one with the same name works as expected.
 
@@ -328,7 +328,7 @@ Returns all active hashtags, sorted by `sort_order`. Supports standard paginatio
 
 ### `POST /hashtags`
 **Required:** `id` (client-supplied UUID), `name`
-**Optional:** `sort_order`
+**Optional:** `sort_order` (omitted → appends: `MAX(sort_order) + 1` within the user's collection; explicit values, including `0`, stored verbatim)
 
 **Name normalization:** `name` is trimmed before storage. An empty-after-trim name returns `422 VALIDATION_ERROR`. Uniqueness is **case-insensitive** per user and scoped to non-deleted rows via a partial unique index on `(user_id, LOWER(name)) WHERE deleted_at IS NULL`. A conflicting name returns `409 CONFLICT`.
 
