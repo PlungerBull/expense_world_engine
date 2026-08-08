@@ -8,9 +8,10 @@ from app.constants import (
     ActivityAction,
     SystemCategoryKey,
 )
-from app.errors import conflict, validation_error
+from app.errors import validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.categories import ensure_system_category
+from app.helpers.transactions import insert_transaction_row
 from app.helpers.validation import MSG_ACTIVE_ACCOUNT, active_account_row
 from app.schemas.transactions import infer_transaction_type, transaction_from_row
 
@@ -143,59 +144,37 @@ async def create_transfer_pair(
     # ------------------------------------------------------------------
     # 7. Insert primary transaction
     # ------------------------------------------------------------------
-    try:
-        primary_row = await conn.fetchrow(
-            """
-            INSERT INTO expense_transactions
-                (id, user_id, title, description, amount_cents,
-                 transaction_type, date, account_id, category_id,
-                 cleared, inbox_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
-            RETURNING *
-            """,
-            primary_id,
-            user_id,
-            primary_title,
-            primary_description,
-            primary_abs,
-            primary_type,
-            primary_date,
-            primary_account_id,
-            primary_category_id,
-            primary_cleared,
-            inbox_id,
-        )
-    except asyncpg.UniqueViolationError:
-        raise conflict(f"A transaction with id '{primary_id}' already exists.")
+    primary_row = await insert_transaction_row(
+        conn, user_id,
+        transaction_id=primary_id,
+        title=primary_title,
+        description=primary_description,
+        amount_cents=primary_abs,
+        transaction_type=primary_type,
+        date=primary_date,
+        account_id=primary_account_id,
+        category_id=primary_category_id,
+        cleared=primary_cleared,
+        inbox_id=inbox_id,
+    )
 
     # ------------------------------------------------------------------
     # 8. Insert sibling transaction (linked to primary)
     # ------------------------------------------------------------------
-    try:
-        sibling_row = await conn.fetchrow(
-            """
-            INSERT INTO expense_transactions
-                (id, user_id, title, description, amount_cents,
-                 transaction_type, date, account_id, category_id,
-                 cleared, transfer_transaction_id, inbox_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
-            RETURNING *
-            """,
-            sibling_id,
-            user_id,
-            primary_title,
-            primary_description,
-            sibling_abs,
-            sibling_type,
-            primary_date,
-            transfer_account_id,
-            sibling_category_id,
-            primary_cleared,
-            primary_id,
-            inbox_id,
-        )
-    except asyncpg.UniqueViolationError:
-        raise conflict(f"A transaction with id '{sibling_id}' already exists.")
+    sibling_row = await insert_transaction_row(
+        conn, user_id,
+        transaction_id=sibling_id,
+        title=primary_title,
+        description=primary_description,
+        amount_cents=sibling_abs,
+        transaction_type=sibling_type,
+        date=primary_date,
+        account_id=transfer_account_id,
+        category_id=sibling_category_id,
+        cleared=primary_cleared,
+        inbox_id=inbox_id,
+        transfer_transaction_id=primary_id,
+    )
 
     primary_id_str = str(primary_id)
     sibling_id_str = str(sibling_id)

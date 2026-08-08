@@ -41,7 +41,7 @@ from app.helpers.query_builder import (
     restore_with_audit,
     soft_delete_with_audit,
 )
-from app.helpers.transactions import attach_hashtag_ids
+from app.helpers.transactions import attach_hashtag_ids, insert_transaction_row
 from app.helpers.validation import (
     MSG_ACTIVE_ACCOUNT,
     MSG_ACTIVE_CATEGORY,
@@ -556,29 +556,18 @@ async def promote_inbox_item(
         # nothing else — it used to carry the draft's stored rate across, which
         # is how a 1.0 written at capture time became a permanent fact about a
         # USD ledger row (open bug 1.4).
-        try:
-            txn_row = await conn.fetchrow(
-                """
-                INSERT INTO expense_transactions
-                    (id, user_id, title, description, amount_cents,
-                     transaction_type, date, account_id, category_id,
-                     inbox_id, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
-                RETURNING *
-                """,
-                target_id,
-                user_id,
-                inbox_row["title"],
-                inbox_row["description"],
-                inbox_row["amount_cents"],
-                transaction_type,
-                inbox_row["date"],
-                inbox_row["account_id"],
-                inbox_row["category_id"],
-                inbox_row["id"],
-            )
-        except asyncpg.UniqueViolationError:
-            raise conflict(f"A transaction with id '{target_id}' already exists.")
+        txn_row = await insert_transaction_row(
+            conn, user_id,
+            transaction_id=target_id,
+            title=inbox_row["title"],
+            description=inbox_row["description"],
+            amount_cents=inbox_row["amount_cents"],
+            transaction_type=transaction_type,
+            date=inbox_row["date"],
+            account_id=inbox_row["account_id"],
+            category_id=inbox_row["category_id"],
+            inbox_id=inbox_row["id"],
+        )
 
         txn_response = transaction_from_row(txn_row)
 

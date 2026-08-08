@@ -280,6 +280,65 @@ async def _sync_hashtags(
         )
 
 
+async def insert_transaction_row(
+    conn: asyncpg.Connection,
+    user_id: str,
+    *,
+    transaction_id,
+    title: str,
+    description: Optional[str],
+    amount_cents: int,
+    transaction_type: int,
+    date,
+    account_id,
+    category_id,
+    cleared: bool = False,
+    inbox_id=None,
+    transfer_transaction_id=None,
+) -> asyncpg.Record:
+    """The one INSERT INTO expense_transactions (create, batch, promote, and
+    both transfer legs). Every column always appears in the column list —
+    absent concepts bind NULL/False — so a future column cannot be silently
+    missed at one of five sites (the create_batch sign-matrix incident's
+    failure shape). ``reconciliation_id`` is deliberately not a parameter:
+    no insert path assigns it; it is only ever set by later UPDATEs.
+
+    Values are the STORAGE forms: ``amount_cents`` positive with
+    ``transaction_type`` carrying direction, ``title`` as the caller wants
+    it stored (create/batch strip request input; promote copies the inbox
+    title verbatim — it was normalized at inbox-write time).
+
+    Owns the single UniqueViolation → 409 translation for this table.
+    """
+    try:
+        return await conn.fetchrow(
+            """
+            INSERT INTO expense_transactions
+                (id, user_id, title, description, amount_cents,
+                 transaction_type, date, account_id, category_id,
+                 cleared, inbox_id, transfer_transaction_id,
+                 created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                    now(), now())
+            RETURNING *
+            """,
+            transaction_id,
+            user_id,
+            title,
+            description,
+            amount_cents,
+            transaction_type,
+            date,
+            account_id,
+            category_id,
+            cleared,
+            inbox_id,
+            transfer_transaction_id,
+        )
+    except asyncpg.UniqueViolationError:
+        raise conflict(f"A transaction with id '{transaction_id}' already exists.")
+
+
 # ---------------------------------------------------------------------------
 # Create
 # ---------------------------------------------------------------------------
@@ -376,30 +435,18 @@ async def create_transaction(
     transaction_type = infer_transaction_type(body.amount_cents)
     amount_cents = abs(body.amount_cents)
 
-    # Insert
-    try:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO expense_transactions
-                (id, user_id, title, description, amount_cents,
-                 transaction_type, date, account_id, category_id,
-                 cleared, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
-            RETURNING *
-            """,
-            body.id,
-            user_id,
-            body.title.strip(),
-            body.description,
-            amount_cents,
-            transaction_type,
-            body.date,
-            body.account_id,
-            body.category_id,
-            body.cleared if body.cleared is not None else False,
-        )
-    except asyncpg.UniqueViolationError:
-        raise conflict(f"A transaction with id '{body.id}' already exists.")
+    row = await insert_transaction_row(
+        conn, user_id,
+        transaction_id=body.id,
+        title=body.title.strip(),
+        description=body.description,
+        amount_cents=amount_cents,
+        transaction_type=transaction_type,
+        date=body.date,
+        account_id=body.account_id,
+        category_id=body.category_id,
+        cleared=body.cleared if body.cleared is not None else False,
+    )
 
     response = transaction_from_row(row)
 
@@ -1133,29 +1180,18 @@ async def create_batch(
         # round-trip for every transaction in the batch — an N-query loop inside
         # the one path built specifically to avoid them (see the balance-delta
         # accumulation below, which does K UPDATEs for N items).
-        try:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO expense_transactions
-                    (id, user_id, title, description, amount_cents,
-                     transaction_type, date, account_id, category_id,
-                     cleared, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
-                RETURNING *
-                """,
-                item.id,
-                user_id,
-                item.title.strip(),
-                item.description,
-                amount_cents,
-                transaction_type,
-                item.date,
-                item.account_id,
-                item.category_id,
-                item.cleared if item.cleared is not None else False,
-            )
-        except asyncpg.UniqueViolationError:
-            raise conflict(f"A transaction with id '{item.id}' already exists.")
+        row = await insert_transaction_row(
+            conn, user_id,
+            transaction_id=item.id,
+            title=item.title.strip(),
+            description=item.description,
+            amount_cents=amount_cents,
+            transaction_type=transaction_type,
+            date=item.date,
+            account_id=item.account_id,
+            category_id=item.category_id,
+            cleared=item.cleared if item.cleared is not None else False,
+        )
 
         response = transaction_from_row(row)
         created.append(response)
