@@ -19,15 +19,18 @@ from app.constants import (
     ActivityAction,
     SystemCategoryKey,
 )
-from app.errors import conflict, forbidden, not_found, validation_error
+from app.errors import conflict, forbidden, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import (
-    dynamic_update,
     fetch_owned_row_or_404,
     restore_with_audit,
     soft_delete_with_audit,
 )
-from app.helpers.reference_data import next_sort_order
+from app.helpers.reference_data import (
+    name_taken,
+    next_sort_order,
+    update_named_resource,
+)
 from app.helpers.validation import normalize_name
 from app.schemas.categories import category_from_row
 
@@ -146,15 +149,7 @@ async def create_category(
     """
     name = normalize_name(name)
     _reject_reserved_name(name)
-    existing = await conn.fetchrow(
-        """
-        SELECT id FROM expense_categories
-        WHERE user_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
-        """,
-        user_id,
-        name,
-    )
-    if existing is not None:
+    if await name_taken(conn, "expense_categories", user_id, name):
         raise conflict(f"A category named '{name}' already exists.")
 
     try:
@@ -202,51 +197,20 @@ async def update_category(
         not_found: no active category with that id for this user.
         conflict: another non-deleted category already uses the new name.
     """
-    # Empty update — return current state unchanged
-    if not fields:
-        row = await fetch_owned_row_or_404(
-            conn, "expense_categories", category_id, user_id, "category"
-        )
-        return category_from_row(row)
-
-    before_row = await fetch_owned_row_or_404(
-        conn, "expense_categories", category_id, user_id, "category"
+    return await update_named_resource(
+        conn, user_id,
+        table="expense_categories",
+        resource_type="category",
+        resource_id=category_id,
+        fields=fields,
+        serialize=category_from_row,
+        # System rows skip the reserved check: they may rename freely,
+        # including back to their own default name — lookup is by
+        # system_key, never by name.
+        check_name=lambda row, name: (
+            _reject_reserved_name(name) if row["system_key"] is None else None
+        ),
     )
-
-    before = category_from_row(before_row)
-
-    # Name normalization + reserved-name guard + case-insensitive uniqueness.
-    # System rows skip the reserved check: they may rename freely, including
-    # back to their own default name — lookup is by system_key, never by name.
-    if "name" in fields:
-        fields["name"] = normalize_name(fields["name"])
-        if before_row["system_key"] is None:
-            _reject_reserved_name(fields["name"])
-        dup = await conn.fetchrow(
-            """
-            SELECT id FROM expense_categories
-            WHERE user_id = $1 AND LOWER(name) = LOWER($2)
-              AND id != $3 AND deleted_at IS NULL
-            """,
-            user_id,
-            fields["name"],
-            category_id,
-        )
-        if dup is not None:
-            raise conflict(f"A category named '{fields['name']}' already exists.")
-
-    after_row = await dynamic_update(conn, "expense_categories", fields, category_id, user_id)
-    if after_row is None:
-        raise not_found("category")
-
-    after = category_from_row(after_row)
-
-    await write_activity_log(
-        conn, user_id, "category", category_id, ActivityAction.UPDATED,
-        before_snapshot=before,
-        after_snapshot=after,
-    )
-    return after
 
 
 async def delete_category(
@@ -318,17 +282,10 @@ async def restore_category(
         conn, "expense_categories", category_id, user_id, "category", deleted=True
     )
 
-    dup = await conn.fetchrow(
-        """
-        SELECT id FROM expense_categories
-        WHERE user_id = $1 AND LOWER(name) = LOWER($2)
-          AND id != $3 AND deleted_at IS NULL
-        """,
-        user_id,
-        before_row["name"],
-        category_id,
-    )
-    if dup is not None:
+    if await name_taken(
+        conn, "expense_categories", user_id, before_row["name"],
+        exclude_id=category_id,
+    ):
         raise conflict(
             f"Cannot restore category: an active category named '{before_row['name']}' already exists."
         )

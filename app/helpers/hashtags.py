@@ -14,15 +14,18 @@ from uuid import UUID
 import asyncpg
 
 from app.constants import ActivityAction
-from app.errors import conflict, not_found
+from app.errors import conflict
 from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import (
-    dynamic_update,
     fetch_owned_row_or_404,
     restore_with_audit,
     soft_delete_with_audit,
 )
-from app.helpers.reference_data import next_sort_order
+from app.helpers.reference_data import (
+    name_taken,
+    next_sort_order,
+    update_named_resource,
+)
 from app.helpers.validation import normalize_name
 from app.schemas.hashtags import hashtag_from_row
 
@@ -42,15 +45,7 @@ async def create_hashtag(
             or id already exists.
     """
     name = normalize_name(name)
-    existing = await conn.fetchrow(
-        """
-        SELECT id FROM expense_hashtags
-        WHERE user_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL
-        """,
-        user_id,
-        name,
-    )
-    if existing is not None:
+    if await name_taken(conn, "expense_hashtags", user_id, name):
         raise conflict(f"A hashtag named '{name}' already exists.")
 
     try:
@@ -97,47 +92,14 @@ async def update_hashtag(
         not_found: no active hashtag with that id for this user.
         conflict: another non-deleted hashtag already uses the new name.
     """
-    # Empty update — return current state unchanged
-    if not fields:
-        row = await fetch_owned_row_or_404(
-            conn, "expense_hashtags", hashtag_id, user_id, "hashtag"
-        )
-        return hashtag_from_row(row)
-
-    before_row = await fetch_owned_row_or_404(
-        conn, "expense_hashtags", hashtag_id, user_id, "hashtag"
+    return await update_named_resource(
+        conn, user_id,
+        table="expense_hashtags",
+        resource_type="hashtag",
+        resource_id=hashtag_id,
+        fields=fields,
+        serialize=hashtag_from_row,
     )
-
-    before = hashtag_from_row(before_row)
-
-    # Name normalization + case-insensitive uniqueness
-    if "name" in fields:
-        fields["name"] = normalize_name(fields["name"])
-        dup = await conn.fetchrow(
-            """
-            SELECT id FROM expense_hashtags
-            WHERE user_id = $1 AND LOWER(name) = LOWER($2)
-              AND id != $3 AND deleted_at IS NULL
-            """,
-            user_id,
-            fields["name"],
-            hashtag_id,
-        )
-        if dup is not None:
-            raise conflict(f"A hashtag named '{fields['name']}' already exists.")
-
-    after_row = await dynamic_update(conn, "expense_hashtags", fields, hashtag_id, user_id)
-    if after_row is None:
-        raise not_found("hashtag")
-
-    after = hashtag_from_row(after_row)
-
-    await write_activity_log(
-        conn, user_id, "hashtag", hashtag_id, ActivityAction.UPDATED,
-        before_snapshot=before,
-        after_snapshot=after,
-    )
-    return after
 
 
 async def delete_hashtag(
@@ -222,17 +184,10 @@ async def restore_hashtag(
         conn, "expense_hashtags", hashtag_id, user_id, "hashtag", deleted=True
     )
 
-    dup = await conn.fetchrow(
-        """
-        SELECT id FROM expense_hashtags
-        WHERE user_id = $1 AND LOWER(name) = LOWER($2)
-          AND id != $3 AND deleted_at IS NULL
-        """,
-        user_id,
-        before_row["name"],
-        hashtag_id,
-    )
-    if dup is not None:
+    if await name_taken(
+        conn, "expense_hashtags", user_id, before_row["name"],
+        exclude_id=hashtag_id,
+    ):
         raise conflict(
             f"Cannot restore hashtag: an active hashtag named '{before_row['name']}' already exists."
         )

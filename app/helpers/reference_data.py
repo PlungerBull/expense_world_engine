@@ -9,9 +9,15 @@ accounts, where the scope adds currency_code). The partial unique indexes
 are the belt-and-suspenders under this check.
 """
 
-from typing import Optional
+from typing import Callable, Optional
 
 import asyncpg
+
+from app.constants import ActivityAction
+from app.errors import conflict, not_found
+from app.helpers.activity_log import write_activity_log
+from app.helpers.query_builder import dynamic_update, fetch_owned_row_or_404
+from app.helpers.validation import normalize_name
 
 
 async def name_taken(
@@ -61,3 +67,65 @@ async def next_sort_order(
         f"SELECT COALESCE(MAX(sort_order) + 1, 0) FROM {table} WHERE user_id = $1",
         user_id,
     )
+
+
+async def update_named_resource(
+    conn: asyncpg.Connection,
+    user_id: str,
+    *,
+    table: str,
+    resource_type: str,
+    resource_id: str,
+    fields: dict,
+    serialize: Callable[[asyncpg.Record], dict],
+    check_name: Optional[Callable[[asyncpg.Record, str], None]] = None,
+) -> dict:
+    """The whole of a named-resource PUT: empty-fields fetch-and-return,
+    fetch-or-404, name normalization + uniqueness on rename, dynamic
+    UPDATE, activity log.
+
+    ``update_category`` and ``update_hashtag`` were byte-identical modulo
+    the resource noun and one guard — that guard is ``check_name``, called
+    with the before-row and the normalized new name so a resource can veto
+    a rename (categories reject reserved names on non-system rows).
+    ``update_account`` deliberately does NOT use this: currency
+    immutability, currency-scoped uniqueness, and the balance-carrying
+    serializer make it a different shape, not a noun swap.
+
+    ``resource_type`` doubles as the activity-log type and the 404/409
+    noun ("category" → ``category not found.`` / ``A category named …``).
+    """
+    if not fields:
+        row = await fetch_owned_row_or_404(
+            conn, table, resource_id, user_id, resource_type
+        )
+        return serialize(row)
+
+    before_row = await fetch_owned_row_or_404(
+        conn, table, resource_id, user_id, resource_type
+    )
+    before = serialize(before_row)
+
+    if "name" in fields:
+        fields["name"] = normalize_name(fields["name"])
+        if check_name is not None:
+            check_name(before_row, fields["name"])
+        if await name_taken(
+            conn, table, user_id, fields["name"], exclude_id=resource_id
+        ):
+            raise conflict(
+                f"A {resource_type} named '{fields['name']}' already exists."
+            )
+
+    after_row = await dynamic_update(conn, table, fields, resource_id, user_id)
+    if after_row is None:
+        raise not_found(resource_type)
+
+    after = serialize(after_row)
+
+    await write_activity_log(
+        conn, user_id, resource_type, resource_id, ActivityAction.UPDATED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
