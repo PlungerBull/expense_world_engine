@@ -47,7 +47,9 @@ from app.helpers.validation import (
     MSG_ACTIVE_CATEGORY,
     active_account_row,
     active_category_row,
+    db_now,
     extract_update_fields,
+    reject_zero_amount,
 )
 from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
 from app.schemas.transactions import (
@@ -120,20 +122,12 @@ async def create_inbox_item(
     # sign is authoritative, so the two amounts can never each write it and
     # disagree.
     primary_signed = body.amount_cents
-    if primary_signed is not None and primary_signed == 0:
-        raise validation_error(
-            "amount_cents must not be zero.",
-            {"amount_cents": "Must not be zero."},
-        )
+    reject_zero_amount(primary_signed)
 
     sibling_signed: Optional[int] = None
     transfer_account_id: Optional[str] = None
     if body.transfer is not None:
-        if body.transfer.amount_cents == 0:
-            raise validation_error(
-                "transfer.amount_cents must not be zero.",
-                {"transfer.amount_cents": "Must not be zero."},
-            )
+        reject_zero_amount(body.transfer.amount_cents, "transfer.amount_cents")
         sibling_signed = body.transfer.amount_cents
         transfer_account_id = body.transfer.account_id
 
@@ -236,21 +230,13 @@ async def update_inbox_item(
     # Collect the signed inputs. As on create, signs live only in this block.
     primary_signed: Optional[int] = None
     if "amount_cents" in fields:
-        if fields["amount_cents"] == 0:
-            raise validation_error(
-                "amount_cents must not be zero.",
-                {"amount_cents": "Must not be zero."},
-            )
+        reject_zero_amount(fields["amount_cents"])
         primary_signed = fields["amount_cents"]
         fields["amount_cents"] = abs(primary_signed)
 
     sibling_signed: Optional[int] = None
     if transfer is not None:
-        if transfer["amount_cents"] == 0:
-            raise validation_error(
-                "transfer.amount_cents must not be zero.",
-                {"transfer.amount_cents": "Must not be zero."},
-            )
+        reject_zero_amount(transfer["amount_cents"], "transfer.amount_cents")
         sibling_signed = transfer["amount_cents"]
 
     # FOR UPDATE: the merged-state resolution below reads this row and derives
@@ -461,9 +447,7 @@ async def promote_inbox_item(
     if inbox_row["amount_cents"] is None or inbox_row["amount_cents"] == 0:
         errors["amount_cents"] = "Must be present and not zero."
 
-    if inbox_row["date"] is None:
-        errors["date"] = "Must be present and not in the future."
-    elif inbox_row["date"] > await conn.fetchval("SELECT now()"):
+    if inbox_row["date"] is None or inbox_row["date"] > await db_now(conn):
         errors["date"] = "Must be present and not in the future."
 
     if inbox_row["account_id"] is None or (

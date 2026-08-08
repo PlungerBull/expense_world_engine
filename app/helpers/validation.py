@@ -12,6 +12,7 @@ themselves. The raising ``validate_active_*`` twins wrap them for flows
 that short-circuit on the first bad reference (single create/update).
 """
 
+from datetime import datetime
 from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,13 @@ from app.errors import validation_error
 # helpers and every collect-all-errors flow (it was retyped 12× before).
 MSG_ACTIVE_ACCOUNT = "Must reference an active, non-archived account."
 MSG_ACTIVE_CATEGORY = "Must reference an active category."
+
+# Field messages for the small re-typed predicates (bloat-audit Tier 2 §10).
+# The collect-all-errors flows set ``errors[field] = MSG_*`` themselves;
+# the raising twins below wrap the same strings.
+MSG_NOT_EMPTY = "Must not be empty."
+MSG_NOT_ZERO = "Must not be zero."
+MSG_NOT_FUTURE = "Must not be in the future."
 
 
 def validate_timezone(value: str, field: str) -> None:
@@ -158,18 +166,54 @@ async def validate_active_account(
     return account
 
 
+def clean_name(value: Optional[str]) -> Optional[str]:
+    """Strip a name/title; ``None`` or whitespace-only becomes ``None``.
+
+    The non-raising twin of ``normalize_name`` (see module docstring):
+    collect-all-errors flows call this and set
+    ``errors[field] = MSG_NOT_EMPTY`` on ``None`` themselves.
+    """
+    if value is None or not value.strip():
+        return None
+    return value.strip()
+
+
 def normalize_name(name: Optional[str], field: str = "name") -> str:
     """Strip whitespace and reject empty names with a 422 field error.
 
     Returns the trimmed name. The caller is responsible for any
     case-insensitive uniqueness check against storage.
     """
-    if name is None or not name.strip():
+    cleaned = clean_name(name)
+    if cleaned is None:
         raise validation_error(
             f"{field.capitalize()} must not be empty.",
-            {field: "Must not be empty."},
+            {field: MSG_NOT_EMPTY},
         )
-    return name.strip()
+    return cleaned
+
+
+def reject_zero_amount(value: Optional[int], field: str = "amount_cents") -> None:
+    """Raise a 422 iff ``value == 0``. ``None`` passes — presence is a
+    separate rule (the inbox's optional amounts rely on that).
+
+    The raising twin of the ``MSG_NOT_ZERO`` constant, wording identical
+    to the collect-all-errors sites.
+    """
+    if value == 0:
+        raise validation_error(
+            f"{field} must not be zero.",
+            {field: MSG_NOT_ZERO},
+        )
+
+
+async def db_now(conn: asyncpg.Connection) -> datetime:
+    """The engine's clock — Postgres ``now()``, never the app server's.
+
+    Future-date checks compare against this one round trip (hoist it
+    outside loops in batch flows) and report ``MSG_NOT_FUTURE``.
+    """
+    return await conn.fetchval("SELECT now()")
 
 
 async def currency_code_error(

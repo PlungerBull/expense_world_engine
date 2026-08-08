@@ -43,7 +43,7 @@ from app.helpers.query_builder import (
     restore_with_audit,
     soft_delete_with_audit,
 )
-from app.helpers.validation import validate_active_account
+from app.helpers.validation import normalize_name, validate_active_account
 from app.schemas.reconciliations import reconciliation_from_row
 
 
@@ -135,12 +135,8 @@ async def create_reconciliation(
     # Validate account_id via shared helper (raises 422 on invalid).
     await validate_active_account(conn, account_id, user_id)
 
-    # Validate name
-    if not name or not name.strip():
-        raise validation_error(
-            "Name must not be empty.",
-            {"name": "Must not be empty."},
-        )
+    # Validate name via shared helper (raises 422 on empty-after-strip).
+    name = normalize_name(name)
 
     ending = ending_balance_cents if ending_balance_cents is not None else 0
 
@@ -156,7 +152,7 @@ async def create_reconciliation(
             reconciliation_id,
             user_id,
             account_id,
-            name.strip(),
+            name,
             date_start,
             date_end,
             beginning_balance_cents,
@@ -227,12 +223,7 @@ async def update_reconciliation(
 
     # Validate name if changing
     if "name" in fields:
-        if not fields["name"] or not fields["name"].strip():
-            raise validation_error(
-                "Name must not be empty.",
-                {"name": "Must not be empty."},
-            )
-        fields["name"] = fields["name"].strip()
+        fields["name"] = normalize_name(fields["name"])
 
     before_row = await fetch_reconciliation(conn, user_id, reconciliation_id)
     if before_row is None:

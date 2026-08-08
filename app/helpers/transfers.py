@@ -12,7 +12,7 @@ from app.errors import validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.categories import ensure_system_category
 from app.helpers.transactions import insert_transaction_row
-from app.helpers.validation import MSG_ACTIVE_ACCOUNT, active_account_row
+from app.helpers.validation import MSG_ACTIVE_ACCOUNT, MSG_NOT_ZERO, active_account_row
 from app.schemas.transactions import (
     MSG_OPPOSITE_SIGN,
     infer_transaction_type,
@@ -54,9 +54,9 @@ async def create_transfer_pair(
     errors: dict = {}
 
     if primary_amount_cents == 0:
-        errors["amount_cents"] = "Must not be zero."
+        errors["amount_cents"] = MSG_NOT_ZERO
     if transfer_amount_cents == 0:
-        errors["transfer.amount_cents"] = "Must not be zero."
+        errors["transfer.amount_cents"] = MSG_NOT_ZERO
 
     if primary_amount_cents != 0 and transfer_amount_cents != 0:
         if not opposite_signs(primary_amount_cents, transfer_amount_cents):

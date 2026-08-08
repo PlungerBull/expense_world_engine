@@ -11,6 +11,35 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-08 — two validation `message` strings changed (bloat-audit Tier 2)
+
+**Engine change** (`helpers/validation.py` + `schemas/transactions.py`;
+bloat-audit 2026-08-06 §§9–10). Two error-envelope **top-level `message` /
+field-message strings** changed when their duplicated validations were
+single-sourced. Field keys, error codes, status codes, and response shapes
+are unchanged — only clients that string-match these exact texts are
+affected:
+
+1. `PUT /transactions/{id}` with an empty/whitespace title: top-level
+   `message` is now `"Title must not be empty."` (was
+   `"Title validation failed."` — a drifted one-off; the field message
+   `{"title": "Must not be empty."}` is unchanged).
+2. `POST /transactions` (transfer body) with same-sign amounts: the field
+   message on `transfer.amount_cents` is now
+   `"Must have opposite sign to amount_cents."` (was `"…to primary
+   amount_cents."` — "primary" named an engine-internal parameter; the
+   inbox path already used the new wording, and the two paths are now
+   pinned identical by test).
+
+### Engine references
+
+- `app/helpers/validation.py` (`normalize_name`, `clean_name`, message constants)
+- `app/schemas/transactions.py` (`opposite_signs`, `MSG_OPPOSITE_SIGN`)
+- `tests/test_low_bug_fixes.py::test_update_title_empty_top_message`,
+  `tests/test_inbox_transfers.py::test_opposite_sign_message_identical_on_ledger_and_inbox`
+
+---
+
 ## 2026-08-08 — omitted `sort_order` on create now appends instead of landing at 0
 
 **Engine change** (`helpers/reference_data.next_sort_order`; bloat-audit

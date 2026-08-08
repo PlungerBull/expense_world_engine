@@ -212,3 +212,48 @@ async def test_report_hashtags_ignore_non_ledger_junction_rows(client, test_data
             await conn.execute(
                 "DELETE FROM expense_transactions WHERE id = $1", txn_id
             )
+
+
+# ---------------------------------------------------------------------------
+# 5. Empty-title PUT reports the normalize_name wording (bloat-audit §10)
+# ---------------------------------------------------------------------------
+
+
+async def test_update_title_empty_top_message(client, test_data):
+    """PUT with a whitespace-only title 422s with the shared
+    normalize_name top-level message ("Title must not be empty." —
+    replaced the drifted "Title validation failed." on 2026-08-08,
+    logged in client-breaking-changes.md)."""
+    txn_id = str(uuid.uuid4())
+    create_r = await client.post(
+        "/v1/transactions",
+        json={
+            "id": txn_id,
+            "title": f"title-msg-{uuid.uuid4()}",
+            "amount_cents": -100,
+            "date": "2026-04-12T12:00:00Z",
+            "account_id": test_data.account_id,
+            "category_id": test_data.category_id,
+        },
+        headers=_idem(),
+    )
+    assert create_r.status_code == 201, create_r.text
+
+    try:
+        r = await client.put(
+            f"/v1/transactions/{txn_id}",
+            json={"title": "   "},
+            headers=_idem(),
+        )
+        assert r.status_code == 422, r.text
+        error = r.json()["error"]
+        assert error["message"] == "Title must not be empty."
+        assert error["fields"]["title"] == "Must not be empty."
+    finally:
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM activity_log WHERE resource_id = $1", txn_id
+            )
+            await conn.execute(
+                "DELETE FROM expense_transactions WHERE id = $1", txn_id
+            )

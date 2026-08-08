@@ -71,10 +71,17 @@ from app.helpers.query_builder import (
 from app.helpers.validation import (
     MSG_ACTIVE_ACCOUNT,
     MSG_ACTIVE_CATEGORY,
+    MSG_NOT_EMPTY,
+    MSG_NOT_FUTURE,
+    MSG_NOT_ZERO,
     active_account_ids,
     active_account_row,
     active_category_ids,
     active_category_row,
+    clean_name,
+    db_now,
+    normalize_name,
+    reject_zero_amount,
     validate_active_account,
     validate_active_category,
 )
@@ -426,11 +433,12 @@ async def create_transaction(
     # Validate shared fields — collect all failures
     errors: dict = {}
 
-    if not body.title or not body.title.strip():
-        errors["title"] = "Must not be empty."
+    title = clean_name(body.title)
+    if title is None:
+        errors["title"] = MSG_NOT_EMPTY
 
     if body.amount_cents == 0:
-        errors["amount_cents"] = "Must not be zero."
+        errors["amount_cents"] = MSG_NOT_ZERO
 
     # category_id is required for normal transactions but ignored for
     # transfers — the transfer engine auto-assigns @Transfer/@Debt and
@@ -439,10 +447,8 @@ async def create_transaction(
     if body.transfer is None and not body.category_id:
         errors["category_id"] = "Required for non-transfer transactions."
 
-    # Date must be <= now() — use DB clock so we don't drift with app-server clock skew
-    now = await conn.fetchval("SELECT now()")
-    if body.date > now:
-        errors["date"] = "Must not be in the future."
+    if body.date > await db_now(conn):
+        errors["date"] = MSG_NOT_FUTURE
 
     if errors:
         raise validation_error("Transaction validation failed.", errors)
@@ -459,7 +465,7 @@ async def create_transaction(
             user_id=user_id,
             primary_id=body.id,
             sibling_id=body.transfer.id,
-            primary_title=body.title.strip(),
+            primary_title=title,
             primary_description=body.description,
             primary_amount_cents=body.amount_cents,
             primary_account_id=body.account_id,
@@ -494,7 +500,7 @@ async def create_transaction(
     row = await insert_transaction_row(
         conn, user_id,
         transaction_id=body.id,
-        title=body.title.strip(),
+        title=title,
         description=body.description,
         amount_cents=amount_cents,
         transaction_type=transaction_type,
@@ -664,11 +670,7 @@ async def update_transaction(
 
     # Process amount_cents change
     if "amount_cents" in fields:
-        if fields["amount_cents"] == 0:
-            raise validation_error(
-                "amount_cents must not be zero.",
-                {"amount_cents": "Must not be zero."},
-            )
+        reject_zero_amount(fields["amount_cents"])
         fields["transaction_type"] = infer_transaction_type(fields["amount_cents"])
         fields["amount_cents"] = abs(fields["amount_cents"])
 
@@ -689,21 +691,15 @@ async def update_transaction(
         await validate_active_category(conn, fields["category_id"], user_id)
 
     # Validate title if changing
-    if "title" in fields and (not fields["title"] or not fields["title"].strip()):
-        raise validation_error(
-            "Title validation failed.",
-            {"title": "Must not be empty."},
-        )
     if "title" in fields:
-        fields["title"] = fields["title"].strip()
+        fields["title"] = normalize_name(fields["title"], field="title")
 
     # Validate date if changing
     if "date" in fields:
-        now = await conn.fetchval("SELECT now()")
-        if fields["date"] > now:
+        if fields["date"] > await db_now(conn):
             raise validation_error(
                 "Date validation failed.",
-                {"date": "Must not be in the future."},
+                {"date": MSG_NOT_FUTURE},
             )
 
     # No balance step. A reverse-then-apply pair used to run here, guarded by a
@@ -1116,7 +1112,8 @@ async def create_batch(
                 {f"transactions[{i}].transfer": "Must not be present in batch."},
             )
 
-    now = await conn.fetchval("SELECT now()")
+    # One clock read for the whole batch, not one per item.
+    now = await db_now(conn)
 
     # Pre-validate all items. Account and category existence checks
     # are vectorised: instead of firing 2 queries per item (2N total),
@@ -1143,12 +1140,12 @@ async def create_batch(
     for i, item in enumerate(body.transactions):
         item_errors: dict = {}
 
-        if not item.title or not item.title.strip():
-            item_errors["title"] = "Must not be empty."
+        if clean_name(item.title) is None:
+            item_errors["title"] = MSG_NOT_EMPTY
         if item.amount_cents == 0:
-            item_errors["amount_cents"] = "Must not be zero."
+            item_errors["amount_cents"] = MSG_NOT_ZERO
         if item.date > now:
-            item_errors["date"] = "Must not be in the future."
+            item_errors["date"] = MSG_NOT_FUTURE
 
         if item.account_id not in valid_account_ids:
             item_errors["account_id"] = MSG_ACTIVE_ACCOUNT
@@ -1189,7 +1186,7 @@ async def create_batch(
         row = await insert_transaction_row(
             conn, user_id,
             transaction_id=item.id,
-            title=item.title.strip(),
+            title=clean_name(item.title),
             description=item.description,
             amount_cents=amount_cents,
             transaction_type=transaction_type,
