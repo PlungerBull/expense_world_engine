@@ -13,6 +13,7 @@ import asyncpg
 from app.constants import ActivityAction
 from app.errors import not_found, validation_error
 from app.helpers.activity_log import write_activity_log
+from app.helpers.query_builder import build_set_clause
 from app.helpers.validation import validate_timezone
 from app.schemas.auth import settings_from_row, user_from_row
 
@@ -150,19 +151,12 @@ async def update_settings(
         raise not_found("user_settings")
     before = settings_from_row(before_row)
 
-    # Build dynamic UPDATE — NOTE: user_settings uses WHERE user_id = $1
-    # (single-param), not the standard WHERE id = $1 AND user_id = $2 pattern,
-    # so the generic query_builder.dynamic_update helper cannot be used here.
-    set_clauses = []
-    params = [user_id]
-    for i, (key, value) in enumerate(fields.items(), start=2):
-        set_clauses.append(f"{key} = ${i}")
-        params.append(value)
-    set_clauses.append("version = version + 1")
-    set_clauses.append("updated_at = now()")
-
-    query = f"UPDATE user_settings SET {', '.join(set_clauses)} WHERE user_id = $1 RETURNING *"
-    after_row = await conn.fetchrow(query, *params)
+    # SET rendering is shared via build_set_clause; only the WHERE differs —
+    # user_settings keys on user_id alone (it IS the PK) and has no deleted_at,
+    # so query_builder.dynamic_update's WHERE shape doesn't fit.
+    set_sql, values = build_set_clause(fields, start=2)
+    query = f"UPDATE user_settings SET {set_sql} WHERE user_id = $1 RETURNING *"
+    after_row = await conn.fetchrow(query, user_id, *values)
     after = settings_from_row(after_row)
 
     await write_activity_log(
@@ -197,15 +191,10 @@ async def update_profile(
         raise not_found("user")
     before = user_from_row(before_row)
 
-    set_clauses = []
-    params = [user_id]
-    for i, (key, value) in enumerate(fields.items(), start=2):
-        set_clauses.append(f"{key} = ${i}")
-        params.append(value)
-    set_clauses.append("updated_at = now()")
-
-    query = f"UPDATE users SET {', '.join(set_clauses)} WHERE id = $1 RETURNING *"
-    after_row = await conn.fetchrow(query, *params)
+    # users has no version column and no deleted_at; keyed on id alone.
+    set_sql, values = build_set_clause(fields, start=2, extra=("updated_at = now()",))
+    query = f"UPDATE users SET {set_sql} WHERE id = $1 RETURNING *"
+    after_row = await conn.fetchrow(query, user_id, *values)
     after = user_from_row(after_row)
 
     await write_activity_log(

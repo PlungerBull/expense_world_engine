@@ -72,6 +72,30 @@ async def fetch_owned_row_or_404(
     return row
 
 
+def build_set_clause(
+    fields: dict,
+    *,
+    start: int,
+    extra: tuple[str, ...] = ("updated_at = now()", "version = version + 1"),
+) -> tuple[str, list]:
+    """Render a dynamic UPDATE's SET list.
+
+    ``$start``-numbered assignments for ``fields``, then the ``extra``
+    literal clauses. Returns ``(sql, params)`` where ``params`` are the
+    field values in order. Keys are schema-validated column names, never
+    raw user input.
+
+    The WHERE clause stays at the call site — that is the part that
+    genuinely differs (``id``+``user_id``+``deleted_at`` here;
+    ``user_id``-keyed ``user_settings`` and ``id``-keyed ``users`` in
+    ``helpers/auth.py``, neither of which has ``deleted_at``, and
+    ``users`` has no ``version`` either).
+    """
+    clauses = [f"{key} = ${i}" for i, key in enumerate(fields, start=start)]
+    clauses.extend(extra)
+    return ", ".join(clauses), list(fields.values())
+
+
 async def dynamic_update(
     conn: asyncpg.Connection,
     table: str,
@@ -86,21 +110,14 @@ async def dynamic_update(
 
     Returns the ``RETURNING *`` row, or ``None`` if not found.
     """
-    set_clauses = []
-    params: list = [resource_id, user_id]
-    for i, (key, value) in enumerate(fields.items(), start=3):
-        set_clauses.append(f"{key} = ${i}")
-        params.append(value)
-    set_clauses.append("updated_at = now()")
-    set_clauses.append("version = version + 1")
-
+    set_sql, values = build_set_clause(fields, start=3)
     query = f"""
         UPDATE {table}
-        SET {', '.join(set_clauses)}
+        SET {set_sql}
         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
         RETURNING *
     """
-    return await conn.fetchrow(query, *params)
+    return await conn.fetchrow(query, resource_id, user_id, *values)
 
 
 async def soft_delete(
