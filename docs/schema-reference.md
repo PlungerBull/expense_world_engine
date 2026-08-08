@@ -271,7 +271,12 @@ expense_bank_accounts
   - updated_at             timestamptz, NOT NULL, default now()
   - version                integer, NOT NULL, default 1
   - deleted_at             timestamptz, nullable
-  - UNIQUE (user_id, name, currency_code)
+  - UNIQUE partial index (user_id, LOWER(name), currency_code) WHERE deleted_at IS NULL
+                           — sql/028 replaced the original table-level
+                             UNIQUE (user_id, name, currency_code), which was
+                             case-sensitive and spanned soft-deleted rows.
+                             Same shape sql/012 gave categories/hashtags,
+                             plus the currency_code scope column.
 ```
 
 ---

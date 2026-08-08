@@ -33,7 +33,8 @@ from app.helpers.query_builder import (
     restore_with_audit,
     soft_delete_with_audit,
 )
-from app.helpers.validation import currency_code_error
+from app.helpers.reference_data import name_taken
+from app.helpers.validation import currency_code_error, normalize_name
 from app.schemas.accounts import account_from_row
 
 
@@ -80,27 +81,23 @@ async def create_account(
     """Validate currency and uniqueness, insert, and log the creation.
 
     Raises:
-        validation_error: ``currency_code`` is not in ``global_currencies``.
+        validation_error: ``currency_code`` is not in ``global_currencies``,
+            or the name is empty/whitespace.
         conflict: a non-deleted account with the same ``(name, currency_code)``
-            already exists for this user, OR a resource with the same id
-            already exists.
+            already exists for this user (case-insensitive since sql/028), OR
+            a resource with the same id already exists.
     """
+    name = normalize_name(name)
+
     # Validate currency_code
     message = await currency_code_error(conn, currency_code)
     if message is not None:
         raise validation_error("Invalid currency code.", {"currency_code": message})
 
     # Check uniqueness
-    existing = await conn.fetchrow(
-        """
-        SELECT id FROM expense_bank_accounts
-        WHERE user_id = $1 AND name = $2 AND currency_code = $3 AND deleted_at IS NULL
-        """,
-        user_id,
-        name,
-        currency_code,
-    )
-    if existing is not None:
+    if await name_taken(
+        conn, "expense_bank_accounts", user_id, name, currency_code=currency_code
+    ):
         raise conflict(
             f"An account named '{name}' with currency '{currency_code}' already exists."
         )
@@ -246,44 +243,23 @@ async def update_account(
         home = await get_home_balance(conn, row["currency_code"], balance_cents, user_id)
         return account_from_row(row, balance_cents, home)
 
-    # Check name uniqueness if name is changing. Preserve the 2-step check:
-    # first find any name match, then verify full (name, currency) uniqueness.
-    if "name" in fields:
-        existing = await conn.fetchrow(
-            """
-            SELECT id FROM expense_bank_accounts
-            WHERE user_id = $1 AND name = $2 AND id != $3 AND deleted_at IS NULL
-            """,
-            user_id,
-            fields["name"],
-            account_id,
-        )
-        if existing is not None:
-            # Need currency to check full uniqueness
-            current = await conn.fetchrow(
-                "SELECT currency_code FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
-                account_id,
-                user_id,
-            )
-            if current:
-                dup = await conn.fetchrow(
-                    """
-                    SELECT id FROM expense_bank_accounts
-                    WHERE user_id = $1 AND name = $2 AND currency_code = $3 AND id != $4 AND deleted_at IS NULL
-                    """,
-                    user_id,
-                    fields["name"],
-                    current["currency_code"],
-                    account_id,
-                )
-                if dup is not None:
-                    raise conflict(
-                        f"An account named '{fields['name']}' with this currency already exists."
-                    )
-
     before_row = await fetch_owned_row_or_404(
         conn, "expense_bank_accounts", account_id, user_id, "account"
     )
+
+    # Check name uniqueness if name is changing — one check against the row
+    # already in hand (this replaced a 3-query dance that re-read the currency
+    # it was holding). Case-insensitive within (user, currency) per sql/028.
+    if "name" in fields:
+        fields["name"] = normalize_name(fields["name"])
+        if await name_taken(
+            conn, "expense_bank_accounts", user_id, fields["name"],
+            exclude_id=account_id,
+            currency_code=before_row["currency_code"],
+        ):
+            raise conflict(
+                f"An account named '{fields['name']}' with this currency already exists."
+            )
 
     # Fetched once and reused for both snapshots. A PUT cannot move money, and
     # currency_code is rejected above, so both the native and the home value are
@@ -359,12 +335,27 @@ async def restore_account(
 ) -> dict:
     """Undo a soft-delete on an account and log the restoration.
 
+    Checks for name collisions with active accounts before clearing
+    deleted_at — since sql/028 a deleted account releases its (name,
+    currency), so an active account may have retaken it.
+
     Raises:
         not_found: no soft-deleted account with that id for this user.
+        conflict: an active account already uses the same name and currency.
     """
     before_row = await fetch_owned_row_or_404(
         conn, "expense_bank_accounts", account_id, user_id, "account", deleted=True
     )
+
+    if await name_taken(
+        conn, "expense_bank_accounts", user_id, before_row["name"],
+        exclude_id=account_id,
+        currency_code=before_row["currency_code"],
+    ):
+        raise conflict(
+            f"Cannot restore account: an active account named "
+            f"'{before_row['name']}' with this currency already exists."
+        )
 
     # Restoring the account row does not restore any transaction, so the balance
     # is the same on both sides of the mutation. Fetched once, both snapshots.

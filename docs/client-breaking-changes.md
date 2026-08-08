@@ -11,6 +11,38 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-08 — account names: trimmed, blank rejected, case-insensitive uniqueness, deleted accounts release their name
+
+**Engine change** (`sql/028` + `helpers/accounts.py`; bloat-audit 2026-08-06
+Correctness §6, owner decision 2026-08-08). Account names now follow the same
+rules categories and hashtags have had since `sql/012`:
+
+1. **Names are trimmed on create and rename**; empty or whitespace-only names
+   return `422` (`{"name": "Must not be empty."}`). Previously `"  Rent  "`
+   and `"   "` were stored verbatim.
+2. **Uniqueness is case-insensitive within (user, currency).** Creating or
+   renaming to `"RENT"` beside an active `"Rent"` in the same currency is now
+   `409`; previously both coexisted. Same name in a *different* currency is
+   still allowed.
+3. **A soft-deleted account releases its (name, currency).** Re-creating a
+   deleted account's name now succeeds (`201`); previously it failed with the
+   misleading `409 "An account with id … already exists."`.
+4. **`POST /accounts/{id}/restore` can now return `409`** when an active
+   account has retaken the deleted one's (name, currency) — same shape as the
+   category/hashtag restore collision.
+
+A client that never sends padded/duplicate names sees no difference. Clients
+must not rely on case-sensitive name pairs or on deleted names staying locked.
+
+### Engine references
+
+- `sql/028_account_name_case_insensitive.sql` (partial unique index replaces
+  the table-level `UNIQUE (user_id, name, currency_code)`)
+- `app/helpers/accounts.py`, `app/helpers/reference_data.py` (`name_taken`)
+- `docs/engine-spec.md` §Accounts; `tests/test_account_name_rules.py`
+
+---
+
 ## 2026-08-07 — `/health` failure is `503`, not `500`; `?search=` matches `%`/`_`/`\` literally
 
 **Engine change.** Two small behavior fixes (the four ⚪ Low bugs, open-bugs.md).

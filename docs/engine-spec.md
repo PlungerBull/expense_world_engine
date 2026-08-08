@@ -219,7 +219,8 @@ Creates a new bank account (real account only — `is_person = false`).
 **Forbidden:** `is_person`, and any unknown field. Person accounts are **not** created through this endpoint; they are created explicitly via the People API (see **People / Person Accounts** below). Requests that include `is_person` (with any value) or any other unknown field return `422 VALIDATION_ERROR`.
 
 **Validation:**
-- `name` must be unique per `(user_id, currency_code)`.
+- **Name normalization** (since `sql/028`, 2026-08-08 — same rules as categories/hashtags): `name` is trimmed before storage; an empty-after-trim name returns `422 VALIDATION_ERROR` with `fields: {"name": "Must not be empty."}`.
+- `name` must be unique per `(user_id, currency_code)`, **case-insensitively**: "Rent" and "rent" collide within the same currency, while the same name in a different currency is allowed. A conflicting name returns `409 CONFLICT`. The database enforces this with a partial unique index on `(user_id, LOWER(name), currency_code) WHERE deleted_at IS NULL`, so deleting an account releases its name for reuse.
 - `currency_code` must exist in `global_currencies`.
 - `currency_code` is immutable after creation — any subsequent `PUT` that includes it returns `422`.
 - `id` must not collide with an existing account — returns `409 CONFLICT` if taken.
@@ -246,12 +247,15 @@ Since `sql/022` it is also the **first term of the account's balance**, which is
 
 Fields that can be updated: `name`, `color`, `sort_order`.
 `currency_code` is immutable. Returns `422` if included in the request body.
+The same name normalization rules as `POST` apply to renames: trimmed, empty
+names return `422`, and case-insensitive conflicts within the account's own
+currency return `409`.
 
 ### `DELETE /accounts/{id}`
 Soft-deletes the account (`deleted_at = now()`). Returns `409` if the account has any non-deleted transactions — the client must archive instead.
 
 ### `POST /accounts/{id}/restore`
-Undoes a soft-delete by clearing `deleted_at`. Returns `404` if no soft-deleted account with that id exists. Writes a `RESTORED` activity log entry with before/after snapshots.
+Undoes a soft-delete by clearing `deleted_at`. Returns `404` if no soft-deleted account with that id exists. Returns `409` if an active account already uses the same `(name, currency)` — possible since `sql/028` released deleted accounts' names (same collision rule as category/hashtag restore). Writes a `RESTORED` activity log entry with before/after snapshots.
 
 ### `POST /accounts/{id}/archive`
 Sets `is_archived = true`. The account disappears from all pickers and entry flows but all historical transactions remain intact and participate in reports. Bumps `version` and writes an `UPDATED` activity log entry.

@@ -204,16 +204,88 @@ async def test_restore_category_round_trip(client, test_data):
         await _cleanup_category(category_id, test_data.user_id)
 
 
-# NOTE on the name-collision branches in restore_category and restore_hashtag:
-# Both helpers contain a defensive check that returns 409 if an active row
-# with the same display name exists when restoring. That branch is
-# CURRENTLY UNREACHABLE from the public API because expense_categories and
-# expense_hashtags both carry full UNIQUE (user_id, name) constraints
-# (no partial WHERE deleted_at IS NULL). A soft-deleted row keeps its name
-# locked, so a clash can never be created. The defensive check exists as
-# belt-and-braces in case the constraint is ever relaxed to a partial
-# unique index (e.g. to allow soft-deleted name reuse). When that happens,
-# add a regression test here. Tested-via-DB-constraint for now.
+# The name-collision branches in restore_category / restore_hashtag are LIVE:
+# sql/012 replaced the full UNIQUE (user_id, name) constraints with partial
+# unique indexes WHERE deleted_at IS NULL, so a soft-deleted row releases its
+# name and an active row can retake it before the restore. (An earlier note
+# here claimed the branches were unreachable — that predated sql/012.)
+# sql/028 gave accounts the same rule; that regression lives in
+# test_account_name_rules.py.
+
+
+@pytest.mark.asyncio
+async def test_restore_category_blocks_on_name_collision(client, test_data):
+    """create → delete → create same name → restore original ⇒ 409."""
+    original_id = str(uuid.uuid4())
+    usurper_id = str(uuid.uuid4())
+    name = f"restore-collide-{uuid.uuid4()}"
+    try:
+        r = await client.post(
+            "/v1/categories",
+            json={"id": original_id, "name": name, "color": "#abc123"},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 201, r.text
+        r = await client.delete(
+            f"/v1/categories/{original_id}",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 200, r.text
+
+        # Retake the name (different case — the rule is case-insensitive).
+        r = await client.post(
+            "/v1/categories",
+            json={"id": usurper_id, "name": name.upper(), "color": "#abc123"},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 201, r.text
+
+        r = await client.post(
+            f"/v1/categories/{original_id}/restore",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 409, r.text
+        assert "already exists" in r.json()["error"]["message"]
+    finally:
+        await _cleanup_category(original_id, test_data.user_id)
+        await _cleanup_category(usurper_id, test_data.user_id)
+
+
+@pytest.mark.asyncio
+async def test_restore_hashtag_blocks_on_name_collision(client, test_data):
+    """Same shape as the category collision, on the hashtag table."""
+    original_id = str(uuid.uuid4())
+    usurper_id = str(uuid.uuid4())
+    name = f"restore-collide-{uuid.uuid4()}"
+    try:
+        r = await client.post(
+            "/v1/hashtags",
+            json={"id": original_id, "name": name},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 201, r.text
+        r = await client.delete(
+            f"/v1/hashtags/{original_id}",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 200, r.text
+
+        r = await client.post(
+            "/v1/hashtags",
+            json={"id": usurper_id, "name": name.upper()},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 201, r.text
+
+        r = await client.post(
+            f"/v1/hashtags/{original_id}/restore",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r.status_code == 409, r.text
+        assert "already exists" in r.json()["error"]["message"]
+    finally:
+        await _cleanup_hashtag(original_id, test_data.user_id)
+        await _cleanup_hashtag(usurper_id, test_data.user_id)
 
 
 # ---------------------------------------------------------------------------
