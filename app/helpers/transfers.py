@@ -11,6 +11,7 @@ from app.constants import (
 from app.errors import conflict, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.categories import ensure_system_category
+from app.helpers.validation import MSG_ACTIVE_ACCOUNT, active_account_row
 from app.schemas.transactions import infer_transaction_type, transaction_from_row
 
 
@@ -68,29 +69,15 @@ async def create_transfer_pair(
         errors["transfer.id"] = "Must differ from the primary transaction id."
 
     # ------------------------------------------------------------------
-    # 3. Validate both accounts
+    # 3. Validate both accounts (the rows also carry is_person, read in §4)
     # ------------------------------------------------------------------
-    primary_account = await conn.fetchrow(
-        """
-        SELECT is_person FROM expense_bank_accounts
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-        """,
-        primary_account_id,
-        user_id,
-    )
+    primary_account = await active_account_row(conn, primary_account_id, user_id)
     if primary_account is None:
-        errors["account_id"] = "Must reference an active, non-archived account."
+        errors["account_id"] = MSG_ACTIVE_ACCOUNT
 
-    transfer_account = await conn.fetchrow(
-        """
-        SELECT is_person FROM expense_bank_accounts
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-        """,
-        transfer_account_id,
-        user_id,
-    )
+    transfer_account = await active_account_row(conn, transfer_account_id, user_id)
     if transfer_account is None:
-        errors["transfer.account_id"] = "Must reference an active, non-archived account."
+        errors["transfer.account_id"] = MSG_ACTIVE_ACCOUNT
 
     if errors:
         raise validation_error("Transfer validation failed.", errors)

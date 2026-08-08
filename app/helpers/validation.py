@@ -3,23 +3,27 @@
 Consolidates account/category validation that was duplicated across
 transactions.py, inbox.py, reconciliations.py, and transfers.py.
 
-These helpers RAISE ``AppError`` on failure. Use them when your flow
-wants to short-circuit on the first bad reference (e.g. single-resource
-create/update endpoints).
-
-If your flow collects multiple field errors into a dict and raises
-once at the end (e.g. ``promote_inbox_item``, ``create_transfer_pair``,
-``create_batch``'s vectorised path), do NOT use these helpers — use
-inline fetches that set ``errors[field]`` without raising.
+Two flow styles, one implementation. The non-raising helpers
+(``active_account_row`` / ``active_category_row``, and the vectorised
+``active_account_ids`` / ``active_category_ids`` for batch flows) return
+rows/sets; collect-all-errors flows check them and set
+``errors[field] = MSG_ACTIVE_ACCOUNT`` / ``MSG_ACTIVE_CATEGORY``
+themselves. The raising ``validate_active_*`` twins wrap them for flows
+that short-circuit on the first bad reference (single create/update).
 """
 
-from typing import Optional
+from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import asyncpg
 from pydantic import BaseModel
 
 from app.errors import validation_error
+
+# The single wording of the active-reference rule, shared by the raising
+# helpers and every collect-all-errors flow (it was retyped 12× before).
+MSG_ACTIVE_ACCOUNT = "Must reference an active, non-archived account."
+MSG_ACTIVE_CATEGORY = "Must reference an active category."
 
 
 def validate_timezone(value: str, field: str) -> None:
@@ -93,16 +97,16 @@ def extract_update_fields(
     return raw
 
 
-async def validate_active_account(
+async def active_account_row(
     conn: asyncpg.Connection,
     account_id: str,
     user_id: str,
-) -> asyncpg.Record:
-    """Fetch an active, non-archived account or raise 422.
-
-    Returns the account row on success.
+) -> Optional[asyncpg.Record]:
+    """The active-account reference rule: active (not soft-deleted) AND
+    non-archived, tenant-scoped. Returns the full row (transfers reads
+    ``is_person`` off it) or ``None`` — callers own their error handling.
     """
-    account = await conn.fetchrow(
+    return await conn.fetchrow(
         """
         SELECT * FROM expense_bank_accounts
         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
@@ -110,10 +114,46 @@ async def validate_active_account(
         account_id,
         user_id,
     )
+
+
+async def active_account_ids(
+    conn: asyncpg.Connection,
+    account_ids: Iterable[str],
+    user_id: str,
+) -> set[str]:
+    """Vectorised twin of ``active_account_row`` for batch flows: the subset
+    of ``account_ids`` that reference an active, non-archived account, as
+    strings. Empty input returns an empty set without querying.
+    """
+    ids = list(account_ids)
+    if not ids:
+        return set()
+    rows = await conn.fetch(
+        """
+        SELECT id FROM expense_bank_accounts
+        WHERE id = ANY($1::uuid[]) AND user_id = $2
+          AND deleted_at IS NULL AND is_archived = false
+        """,
+        ids,
+        user_id,
+    )
+    return {str(r["id"]) for r in rows}
+
+
+async def validate_active_account(
+    conn: asyncpg.Connection,
+    account_id: str,
+    user_id: str,
+) -> asyncpg.Record:
+    """Raising wrapper over ``active_account_row``: 422 on a miss.
+
+    Returns the account row on success.
+    """
+    account = await active_account_row(conn, account_id, user_id)
     if account is None:
         raise validation_error(
             "Account validation failed.",
-            {"account_id": "Must reference an active, non-archived account."},
+            {"account_id": MSG_ACTIVE_ACCOUNT},
         )
     return account
 
@@ -152,16 +192,16 @@ async def currency_code_error(
     return None
 
 
-async def validate_active_category(
+async def active_category_row(
     conn: asyncpg.Connection,
     category_id: str,
     user_id: str,
-) -> asyncpg.Record:
-    """Fetch an active category or raise 422.
-
-    Returns the category row on success.
+) -> Optional[asyncpg.Record]:
+    """The active-category reference rule: active (not soft-deleted),
+    tenant-scoped. Returns the row or ``None`` — callers own their error
+    handling. (No archived arm — categories lost ``is_archived`` in sql/024.)
     """
-    category = await conn.fetchrow(
+    return await conn.fetchrow(
         """
         SELECT * FROM expense_categories
         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
@@ -169,9 +209,41 @@ async def validate_active_category(
         category_id,
         user_id,
     )
+
+
+async def active_category_ids(
+    conn: asyncpg.Connection,
+    category_ids: Iterable[str],
+    user_id: str,
+) -> set[str]:
+    """Vectorised twin of ``active_category_row`` for batch flows."""
+    ids = list(category_ids)
+    if not ids:
+        return set()
+    rows = await conn.fetch(
+        """
+        SELECT id FROM expense_categories
+        WHERE id = ANY($1::uuid[]) AND user_id = $2 AND deleted_at IS NULL
+        """,
+        ids,
+        user_id,
+    )
+    return {str(r["id"]) for r in rows}
+
+
+async def validate_active_category(
+    conn: asyncpg.Connection,
+    category_id: str,
+    user_id: str,
+) -> asyncpg.Record:
+    """Raising wrapper over ``active_category_row``: 422 on a miss.
+
+    Returns the category row on success.
+    """
+    category = await active_category_row(conn, category_id, user_id)
     if category is None:
         raise validation_error(
             "Category validation failed.",
-            {"category_id": "Must reference an active category."},
+            {"category_id": MSG_ACTIVE_CATEGORY},
         )
     return category

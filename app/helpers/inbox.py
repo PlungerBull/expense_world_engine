@@ -42,7 +42,13 @@ from app.helpers.query_builder import (
     soft_delete_with_audit,
 )
 from app.helpers.transactions import attach_hashtag_ids
-from app.helpers.validation import extract_update_fields
+from app.helpers.validation import (
+    MSG_ACTIVE_ACCOUNT,
+    MSG_ACTIVE_CATEGORY,
+    active_account_row,
+    active_category_row,
+    extract_update_fields,
+)
 from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
 from app.schemas.transactions import (
     infer_transaction_type,
@@ -458,53 +464,29 @@ async def promote_inbox_item(
     elif inbox_row["date"] > await conn.fetchval("SELECT now()"):
         errors["date"] = "Must be present and not in the future."
 
-    if inbox_row["account_id"] is None:
-        errors["account_id"] = "Must reference an active, non-archived account."
-    else:
-        account = await conn.fetchrow(
-            """
-            SELECT id FROM expense_bank_accounts
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-            """,
-            inbox_row["account_id"],
-            user_id,
-        )
-        if account is None:
-            errors["account_id"] = "Must reference an active, non-archived account."
+    if inbox_row["account_id"] is None or (
+        await active_account_row(conn, inbox_row["account_id"], user_id) is None
+    ):
+        errors["account_id"] = MSG_ACTIVE_ACCOUNT
 
     # Category validation only for non-transfers (transfers auto-assign)
     if not is_transfer:
-        if inbox_row["category_id"] is None:
-            errors["category_id"] = "Must reference an active category."
-        else:
-            category = await conn.fetchrow(
-                """
-                SELECT id FROM expense_categories
-                WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-                """,
-                inbox_row["category_id"],
-                user_id,
-            )
-            if category is None:
-                errors["category_id"] = "Must reference an active category."
+        if inbox_row["category_id"] is None or (
+            await active_category_row(conn, inbox_row["category_id"], user_id)
+            is None
+        ):
+            errors["category_id"] = MSG_ACTIVE_CATEGORY
 
     # Transfers: the sibling account gets the same check the primary does.
     # create_transfer_pair validates it too, but only after this function has
     # committed to the transfer branch — checking here keeps the failure inside
     # the accumulate-all-errors response and matches what ?ready=true reports.
     if is_transfer:
-        transfer_account = await conn.fetchrow(
-            """
-            SELECT id FROM expense_bank_accounts
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-            """,
-            inbox_row["transfer_account_id"],
-            user_id,
-        )
-        if transfer_account is None:
-            errors["transfer.account_id"] = (
-                "Must reference an active, non-archived account."
-            )
+        if (
+            await active_account_row(conn, inbox_row["transfer_account_id"], user_id)
+            is None
+        ):
+            errors["transfer.account_id"] = MSG_ACTIVE_ACCOUNT
 
     # transfer_id must be present for a transfer and absent otherwise (spec §383).
     # The mismatch case used to be silently discarded.

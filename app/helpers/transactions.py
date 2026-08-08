@@ -68,7 +68,16 @@ from app.helpers.query_builder import (
     fetch_owned_row_or_404,
     soft_delete,
 )
-from app.helpers.validation import validate_active_account, validate_active_category
+from app.helpers.validation import (
+    MSG_ACTIVE_ACCOUNT,
+    MSG_ACTIVE_CATEGORY,
+    active_account_ids,
+    active_account_row,
+    active_category_ids,
+    active_category_row,
+    validate_active_account,
+    validate_active_category,
+)
 from app.schemas.transactions import (
     TransactionBatchRequest,
     TransactionCreateRequest,
@@ -852,50 +861,18 @@ async def restore_transaction(
     # 3. Validate prerequisites (collect-all-failures pattern).
     errors: dict = {}
 
-    primary_account = await conn.fetchrow(
-        """
-        SELECT id FROM expense_bank_accounts
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-        """,
-        row["account_id"],
-        user_id,
-    )
-    if primary_account is None:
-        errors["account_id"] = "Must reference an active, non-archived account."
+    if await active_account_row(conn, row["account_id"], user_id) is None:
+        errors["account_id"] = MSG_ACTIVE_ACCOUNT
 
-    primary_category = await conn.fetchrow(
-        """
-        SELECT id FROM expense_categories
-        WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-        """,
-        row["category_id"],
-        user_id,
-    )
-    if primary_category is None:
-        errors["category_id"] = "Must reference an active category."
+    if await active_category_row(conn, row["category_id"], user_id) is None:
+        errors["category_id"] = MSG_ACTIVE_CATEGORY
 
     if is_transfer and sibling_row is not None:
-        sibling_account = await conn.fetchrow(
-            """
-            SELECT id FROM expense_bank_accounts
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND is_archived = false
-            """,
-            sibling_row["account_id"],
-            user_id,
-        )
-        if sibling_account is None:
-            errors["transfer.account_id"] = "Must reference an active, non-archived account."
+        if await active_account_row(conn, sibling_row["account_id"], user_id) is None:
+            errors["transfer.account_id"] = MSG_ACTIVE_ACCOUNT
 
-        sibling_category = await conn.fetchrow(
-            """
-            SELECT id FROM expense_categories
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-            """,
-            sibling_row["category_id"],
-            user_id,
-        )
-        if sibling_category is None:
-            errors["transfer.category_id"] = "Must reference an active category."
+        if await active_category_row(conn, sibling_row["category_id"], user_id) is None:
+            errors["transfer.category_id"] = MSG_ACTIVE_CATEGORY
 
     if errors:
         raise validation_error(
@@ -1101,30 +1078,12 @@ async def create_batch(
         item.category_id for item in body.transactions if item.category_id
     }
 
-    valid_account_rows = await conn.fetch(
-        """
-        SELECT id FROM expense_bank_accounts
-        WHERE id = ANY($1::uuid[])
-          AND user_id = $2
-          AND deleted_at IS NULL
-          AND is_archived = false
-        """,
-        list(requested_account_ids),
-        user_id,
+    valid_account_ids = await active_account_ids(
+        conn, requested_account_ids, user_id
     )
-    valid_account_ids = {str(r["id"]) for r in valid_account_rows}
-
-    valid_category_rows = await conn.fetch(
-        """
-        SELECT id FROM expense_categories
-        WHERE id = ANY($1::uuid[])
-          AND user_id = $2
-          AND deleted_at IS NULL
-        """,
-        list(requested_category_ids),
-        user_id,
+    valid_category_ids = await active_category_ids(
+        conn, requested_category_ids, user_id
     )
-    valid_category_ids = {str(r["id"]) for r in valid_category_rows}
 
     all_errors = []
     seen_ids: set[str] = set()
@@ -1139,7 +1098,7 @@ async def create_batch(
             item_errors["date"] = "Must not be in the future."
 
         if item.account_id not in valid_account_ids:
-            item_errors["account_id"] = "Must reference an active, non-archived account."
+            item_errors["account_id"] = MSG_ACTIVE_ACCOUNT
 
         # category_id is optional on the schema (transfers waive it), but batch
         # rejects transfers, so it's always required here. Report a clean
@@ -1147,7 +1106,7 @@ async def create_batch(
         if not item.category_id:
             item_errors["category_id"] = "Required for non-transfer transactions."
         elif item.category_id not in valid_category_ids:
-            item_errors["category_id"] = "Must reference an active category."
+            item_errors["category_id"] = MSG_ACTIVE_CATEGORY
 
         item_id_str = str(item.id)
         if item_id_str in seen_ids:

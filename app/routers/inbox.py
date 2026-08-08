@@ -65,10 +65,15 @@ async def list_inbox(
             conditions.append("i.date IS NOT NULL")
             conditions.append("i.date <= now()")
             conditions.append("i.account_id IS NOT NULL")
-            # Account must be active and non-archived
+            # Account must be active and non-archived. The a.user_id arm
+            # matches the Python side's tenant scope (CLAUDE.md: engine-side
+            # user_id predicates are the only isolation) — without it a draft
+            # referencing another tenant's account showed as ready while
+            # promote 422ed.
             conditions.append(
                 "EXISTS (SELECT 1 FROM expense_bank_accounts a "
-                "WHERE a.id = i.account_id AND a.deleted_at IS NULL AND a.is_archived = false)"
+                "WHERE a.id = i.account_id AND a.user_id = i.user_id "
+                "AND a.deleted_at IS NULL AND a.is_archived = false)"
             )
             # Category must be active (an inbox row pointing at a deleted
             # category isn't promotable — promote would 422 on the same
@@ -82,15 +87,16 @@ async def list_inbox(
                 "(i.transfer_account_id IS NOT NULL OR ("
                 "i.category_id IS NOT NULL AND EXISTS ("
                 "SELECT 1 FROM expense_categories c "
-                "WHERE c.id = i.category_id AND c.deleted_at IS NULL)))"
+                "WHERE c.id = i.category_id AND c.user_id = i.user_id "
+                "AND c.deleted_at IS NULL)))"
             )
             # ...and the sibling account gets the same check the primary does,
             # for the same reason: promote 422s on an archived one.
             conditions.append(
                 "(i.transfer_account_id IS NULL OR EXISTS ("
                 "SELECT 1 FROM expense_bank_accounts ta "
-                "WHERE ta.id = i.transfer_account_id AND ta.deleted_at IS NULL "
-                "AND ta.is_archived = false))"
+                "WHERE ta.id = i.transfer_account_id AND ta.user_id = i.user_id "
+                "AND ta.deleted_at IS NULL AND ta.is_archived = false))"
             )
 
         if overdue:
