@@ -22,6 +22,7 @@ and torn down in the fixture; no exchange rates are seeded and no home value is
 asserted (reconciliations are native-only per WP2). Dates are past and outside
 other files' rate windows.
 """
+import json
 import uuid
 
 import asyncpg
@@ -390,3 +391,43 @@ async def test_status_check_constraint_rejects_unknown_values(fx, test_data):
                    VALUES ($1, $2, $3, 'wp6-bad-status', 3, 0, 0, now(), now())""",
                 str(uuid.uuid4()), test_data.user_id, fx.account_id,
             )
+
+
+# ---------------------------------------------------------------------------
+# Delete audit snapshots — difference_cents on both sides of the mutation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_delete_audit_snapshots_pin_the_unassign_ordering(
+    client, fx, test_data
+):
+    """The DELETED activity entry's before-snapshot carries the batch's
+    pre-delete difference (membership included, computed at fetch time);
+    the after-snapshot is re-fetched AFTER the cascade unassign, so its
+    difference is the emptied batch (ending − beginning). Pins the
+    refetch-after-unassign ordering in delete_reconciliation."""
+    recon_id = await _create_recon(
+        client, fx, name="wp6-audit-diff", beginning=0, ending=10_000,
+    )
+    txn_id = await _post_txn(client, fx, 4_000)
+    await _assign(client, txn_id, recon_id)
+
+    r = await client.get(f"/v1/reconciliations/{recon_id}")
+    assert r.json()["difference_cents"] == 6_000
+
+    r = await client.delete(f"/v1/reconciliations/{recon_id}", headers=_idem())
+    assert r.status_code == 200, r.text
+    assert r.json()["difference_cents"] == 10_000
+
+    async with db.pool.acquire() as conn:
+        entry = await conn.fetchrow(
+            """SELECT before_snapshot, after_snapshot FROM activity_log
+               WHERE resource_id = $1 AND user_id = $2 AND resource_type = 'reconciliation'
+               ORDER BY created_at DESC LIMIT 1""",
+            recon_id, test_data.user_id,
+        )
+    before = json.loads(entry["before_snapshot"])
+    after = json.loads(entry["after_snapshot"])
+    assert before["difference_cents"] == 6_000
+    assert after["difference_cents"] == 10_000
+    assert after["deleted_at"] is not None

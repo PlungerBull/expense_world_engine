@@ -38,8 +38,8 @@ from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import (
     dynamic_update,
     fetch_owned_row_or_404,
-    restore,
-    soft_delete,
+    restore_with_audit,
+    soft_delete_with_audit,
 )
 from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.validation import extract_update_fields
@@ -328,17 +328,9 @@ async def delete_inbox_item(
         conn, "expense_transaction_inbox", inbox_id, user_id, "inbox item"
     )
 
-    before = inbox_from_row(row)
-
-    after_row = await soft_delete(conn, "expense_transaction_inbox", inbox_id, user_id)
-    after = inbox_from_row(after_row)
-
-    await write_activity_log(
-        conn, user_id, "inbox", inbox_id, ActivityAction.DELETED,
-        before_snapshot=before,
-        after_snapshot=after,
+    return await soft_delete_with_audit(
+        conn, user_id, "expense_transaction_inbox", "inbox", row, inbox_from_row
     )
-    return after
 
 
 # ---------------------------------------------------------------------------
@@ -381,17 +373,9 @@ async def restore_inbox_item(
             "transaction to undo the promotion."
         )
 
-    before = inbox_from_row(row)
-
-    after_row = await restore(conn, "expense_transaction_inbox", inbox_id, user_id)
-    after = inbox_from_row(after_row)
-
-    await write_activity_log(
-        conn, user_id, "inbox", inbox_id, ActivityAction.RESTORED,
-        before_snapshot=before,
-        after_snapshot=after,
+    return await restore_with_audit(
+        conn, user_id, "expense_transaction_inbox", "inbox", row, inbox_from_row
     )
-    return after
 
 
 # ---------------------------------------------------------------------------

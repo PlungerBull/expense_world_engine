@@ -30,8 +30,8 @@ from app.helpers.exchange_rate import get_rate, rate_lookup_date
 from app.helpers.query_builder import (
     dynamic_update,
     fetch_owned_row_or_404,
-    restore,
-    soft_delete,
+    restore_with_audit,
+    soft_delete_with_audit,
 )
 from app.helpers.validation import currency_code_error
 from app.schemas.accounts import account_from_row
@@ -339,22 +339,17 @@ async def delete_account(
         raise conflict("Account has active transactions. Archive instead.")
 
     # Soft-deleting the account does not soft-delete its transactions, so the
-    # balance is unchanged across the mutation. Fetched once, used for both.
+    # balance is unchanged across the mutation. Fetched once, used for both
+    # snapshots via the serializer closure.
     # (It need not be zero: the guard above only rejects *active* transactions,
     # so an account whose rows were all soft-deleted can still carry a figure.)
     balance_cents = await fetch_balance(conn, user_id, account_id)
     home = await get_home_balance(conn, row["currency_code"], balance_cents, user_id)
-    before = account_from_row(row, balance_cents, home)
 
-    after_row = await soft_delete(conn, "expense_bank_accounts", account_id, user_id)
-    after = account_from_row(after_row, balance_cents, home)
-
-    await write_activity_log(
-        conn, user_id, "account", account_id, ActivityAction.DELETED,
-        before_snapshot=before,
-        after_snapshot=after,
+    return await soft_delete_with_audit(
+        conn, user_id, "expense_bank_accounts", "account", row,
+        lambda r: account_from_row(r, balance_cents, home),
     )
-    return after
 
 
 async def restore_account(
@@ -372,22 +367,16 @@ async def restore_account(
     )
 
     # Restoring the account row does not restore any transaction, so the balance
-    # is the same on both sides of the mutation.
+    # is the same on both sides of the mutation. Fetched once, both snapshots.
     balance_cents = await fetch_balance(conn, user_id, account_id)
     home = await get_home_balance(
         conn, before_row["currency_code"], balance_cents, user_id
     )
-    before = account_from_row(before_row, balance_cents, home)
 
-    after_row = await restore(conn, "expense_bank_accounts", account_id, user_id)
-    after = account_from_row(after_row, balance_cents, home)
-
-    await write_activity_log(
-        conn, user_id, "account", account_id, ActivityAction.RESTORED,
-        before_snapshot=before,
-        after_snapshot=after,
+    return await restore_with_audit(
+        conn, user_id, "expense_bank_accounts", "account", before_row,
+        lambda r: account_from_row(r, balance_cents, home),
     )
-    return after
 
 
 async def archive_account(

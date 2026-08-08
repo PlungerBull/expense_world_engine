@@ -38,7 +38,11 @@ from app.constants import ActivityAction, ReconciliationStatus
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.home_currency import SIGNED_CENTS_EXPR
-from app.helpers.query_builder import dynamic_update, restore, soft_delete
+from app.helpers.query_builder import (
+    dynamic_update,
+    restore_with_audit,
+    soft_delete_with_audit,
+)
 from app.helpers.validation import validate_active_account
 from app.schemas.reconciliations import reconciliation_from_row
 
@@ -443,11 +447,10 @@ async def delete_reconciliation(
     if row["status"] == ReconciliationStatus.COMPLETED:
         raise conflict("Cannot delete a completed reconciliation. Revert to draft first.")
 
-    before = reconciliation_from_row(row)
-
-    await soft_delete(conn, "expense_reconciliations", reconciliation_id, user_id)
-
-    # Unassign all transactions from this batch
+    # Unassign all transactions from this batch. Runs before the soft delete
+    # (the two statements touch disjoint rows, so the order is free) because
+    # the before-snapshot was materialized at fetch time above — its
+    # difference_cents cannot be contaminated by the unassignment.
     await conn.execute(
         """
         UPDATE expense_transactions
@@ -458,20 +461,16 @@ async def delete_reconciliation(
         user_id,
     )
 
-    # After-snapshot is taken AFTER the unassignment so its
-    # difference_cents reflects the emptied batch (ending − beginning),
-    # not a membership that no longer exists.
-    after_row = await fetch_reconciliation(
-        conn, user_id, reconciliation_id, deleted=True,
+    # refetch: the after-snapshot needs the computed difference_cents, taken
+    # AFTER the unassignment so it reflects the emptied batch
+    # (ending − beginning), not a membership that no longer exists.
+    return await soft_delete_with_audit(
+        conn, user_id, "expense_reconciliations", "reconciliation", row,
+        reconciliation_from_row,
+        refetch=lambda: fetch_reconciliation(
+            conn, user_id, reconciliation_id, deleted=True
+        ),
     )
-    after = reconciliation_from_row(after_row)
-
-    await write_activity_log(
-        conn, user_id, "reconciliation", reconciliation_id, ActivityAction.DELETED,
-        before_snapshot=before,
-        after_snapshot=after,
-    )
-    return after
 
 
 async def restore_reconciliation(
@@ -497,16 +496,10 @@ async def restore_reconciliation(
     if before_row is None:
         raise not_found("reconciliation")
 
-    before = reconciliation_from_row(before_row)
-
-    await restore(conn, "expense_reconciliations", reconciliation_id, user_id)
-
-    after_row = await fetch_reconciliation(conn, user_id, reconciliation_id)
-    after = reconciliation_from_row(after_row)
-
-    await write_activity_log(
-        conn, user_id, "reconciliation", reconciliation_id, ActivityAction.RESTORED,
-        before_snapshot=before,
-        after_snapshot=after,
+    # refetch: the after-snapshot needs the computed difference_cents, which
+    # the restore's RETURNING * row does not carry.
+    return await restore_with_audit(
+        conn, user_id, "expense_reconciliations", "reconciliation", before_row,
+        reconciliation_from_row,
+        refetch=lambda: fetch_reconciliation(conn, user_id, reconciliation_id),
     )
-    return after

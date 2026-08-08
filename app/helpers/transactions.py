@@ -66,6 +66,7 @@ from app.helpers.query_builder import (
     dynamic_update,
     fetch_owned_row,
     fetch_owned_row_or_404,
+    soft_delete,
 )
 from app.helpers.validation import validate_active_account, validate_active_category
 from app.schemas.transactions import (
@@ -599,24 +600,12 @@ async def update_transaction(
     # might affect a balance. Moving the row IS moving both balances now: the
     # old account stops counting it and the new one starts, in the same UPDATE.
 
-    if fields:
-        after_row = await dynamic_update(conn, "expense_transactions", fields, transaction_id, user_id)
-        if after_row is None:
-            raise not_found("transaction")
-    else:
-        # Only hashtag changes, no column updates — still bump version
-        after_row = await conn.fetchrow(
-            """
-            UPDATE expense_transactions
-            SET updated_at = now(), version = version + 1
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-            RETURNING *
-            """,
-            transaction_id,
-            user_id,
-        )
-        if after_row is None:
-            raise not_found("transaction")
+    # Empty `fields` (hashtag- or reconciliation-only change) still bumps
+    # version: dynamic_update always appends updated_at/version, so the
+    # zero-field call is exactly the bump.
+    after_row = await dynamic_update(conn, "expense_transactions", fields, transaction_id, user_id)
+    if after_row is None:
+        raise not_found("transaction")
 
     # Sync hashtags if provided
     if hashtag_ids is not None:
@@ -624,17 +613,17 @@ async def update_transaction(
 
     # Apply reconciliation_id change
     if recon_id_provided:
-        after_row = await conn.fetchrow(
-            """
-            UPDATE expense_transactions
-            SET reconciliation_id = $1, updated_at = now(), version = version + 1
-            WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL
-            RETURNING *
-            """,
-            recon_id_value,
+        after_row = await dynamic_update(
+            conn,
+            "expense_transactions",
+            {"reconciliation_id": recon_id_value},
             transaction_id,
             user_id,
         )
+        # Unreachable while the FOR UPDATE lock above holds, but fail closed
+        # rather than serialize a None row if that ever changes.
+        if after_row is None:
+            raise not_found("transaction")
 
     after = transaction_from_row(after_row)
     # Post-mutation hashtag_ids — applies whether hashtag_ids was rewritten
@@ -692,16 +681,7 @@ async def delete_transaction(
     await attach_hashtag_ids(conn, before)
 
     # Soft-delete
-    after_row = await conn.fetchrow(
-        """
-        UPDATE expense_transactions
-        SET deleted_at = now(), updated_at = now(), version = version + 1
-        WHERE id = $1 AND user_id = $2
-        RETURNING *
-        """,
-        transaction_id,
-        user_id,
-    )
+    after_row = await soft_delete(conn, "expense_transactions", transaction_id, user_id)
     after = transaction_from_row(after_row)
 
     # No balance reversal: the sum that defines the balance already excludes
@@ -731,15 +711,8 @@ async def delete_transaction(
             sibling_before = transaction_from_row(sibling_row)
             await attach_hashtag_ids(conn, sibling_before)
 
-            sibling_after_row = await conn.fetchrow(
-                """
-                UPDATE expense_transactions
-                SET deleted_at = now(), updated_at = now(), version = version + 1
-                WHERE id = $1 AND user_id = $2
-                RETURNING *
-                """,
-                sibling_id,
-                user_id,
+            sibling_after_row = await soft_delete(
+                conn, "expense_transactions", sibling_id, user_id
             )
             sibling_after = transaction_from_row(sibling_after_row)
 

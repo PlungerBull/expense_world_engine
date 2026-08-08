@@ -24,8 +24,8 @@ from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import (
     dynamic_update,
     fetch_owned_row_or_404,
-    restore,
-    soft_delete,
+    restore_with_audit,
+    soft_delete_with_audit,
 )
 from app.helpers.validation import normalize_name
 from app.schemas.categories import category_from_row
@@ -289,17 +289,9 @@ async def delete_category(
     if has_inbox:
         raise conflict("Category is referenced by active inbox items. Remove those references first.")
 
-    before = category_from_row(row)
-
-    after_row = await soft_delete(conn, "expense_categories", category_id, user_id)
-    after = category_from_row(after_row)
-
-    await write_activity_log(
-        conn, user_id, "category", category_id, ActivityAction.DELETED,
-        before_snapshot=before,
-        after_snapshot=after,
+    return await soft_delete_with_audit(
+        conn, user_id, "expense_categories", "category", row, category_from_row
     )
-    return after
 
 
 async def restore_category(
@@ -336,14 +328,6 @@ async def restore_category(
             f"Cannot restore category: an active category named '{before_row['name']}' already exists."
         )
 
-    before = category_from_row(before_row)
-
-    after_row = await restore(conn, "expense_categories", category_id, user_id)
-    after = category_from_row(after_row)
-
-    await write_activity_log(
-        conn, user_id, "category", category_id, ActivityAction.RESTORED,
-        before_snapshot=before,
-        after_snapshot=after,
+    return await restore_with_audit(
+        conn, user_id, "expense_categories", "category", before_row, category_from_row
     )
-    return after

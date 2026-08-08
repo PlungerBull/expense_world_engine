@@ -4,11 +4,13 @@ Consolidates the dynamic UPDATE and soft-delete patterns that were
 duplicated across every router.
 """
 
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import asyncpg
 
+from app.constants import ActivityAction
 from app.errors import not_found
+from app.helpers.activity_log import write_activity_log
 
 
 async def fetch_owned_row(
@@ -146,3 +148,69 @@ async def restore(
         resource_id,
         user_id,
     )
+
+
+async def soft_delete_with_audit(
+    conn: asyncpg.Connection,
+    user_id: str,
+    table: str,
+    resource_type: str,
+    row: asyncpg.Record,
+    serialize: Callable[[asyncpg.Record], dict],
+    *,
+    refetch: Optional[Callable[[], Awaitable[asyncpg.Record]]] = None,
+) -> dict:
+    """The mechanical tail every soft delete shares: before-snapshot from
+    ``row``, ``soft_delete``, after-snapshot, activity log, return after.
+
+    ``row`` is the pre-fetched ACTIVE row (``fetch_owned_row_or_404``); the
+    caller runs its guards and cascades as plain code *before* calling —
+    hoisting them into hooks would just rebuild the deleted bodies as
+    lambdas. ``serialize`` closes over any extra snapshot inputs (accounts
+    close over the once-fetched balance pair). ``refetch`` replaces the
+    ``RETURNING *`` row as the after-snapshot source when the serializer
+    needs a computed column (reconciliations' ``difference_cents``).
+    """
+    return await _mutate_with_audit(
+        conn, user_id, table, resource_type, row, serialize,
+        mutate=soft_delete, action=ActivityAction.DELETED, refetch=refetch,
+    )
+
+
+async def restore_with_audit(
+    conn: asyncpg.Connection,
+    user_id: str,
+    table: str,
+    resource_type: str,
+    row: asyncpg.Record,
+    serialize: Callable[[asyncpg.Record], dict],
+    *,
+    refetch: Optional[Callable[[], Awaitable[asyncpg.Record]]] = None,
+) -> dict:
+    """Mirror of ``soft_delete_with_audit`` for restores: ``row`` is the
+    pre-fetched SOFT-DELETED row (``deleted=True``), the mutate is
+    ``restore``, the action is RESTORED. Same caller contract.
+    """
+    return await _mutate_with_audit(
+        conn, user_id, table, resource_type, row, serialize,
+        mutate=restore, action=ActivityAction.RESTORED, refetch=refetch,
+    )
+
+
+async def _mutate_with_audit(
+    conn, user_id, table, resource_type, row, serialize, *, mutate, action, refetch
+) -> dict:
+    resource_id = str(row["id"])
+    before = serialize(row)
+
+    after_row = await mutate(conn, table, resource_id, user_id)
+    if refetch is not None:
+        after_row = await refetch()
+    after = serialize(after_row)
+
+    await write_activity_log(
+        conn, user_id, resource_type, resource_id, action,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
