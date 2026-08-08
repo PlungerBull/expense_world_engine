@@ -150,10 +150,12 @@ def infer_transaction_type(amount_cents: int) -> TransactionType:
 
     Negative = OUTFLOW (money leaves the account), positive = INFLOW.
 
-    **This is the only place in the engine a sign is read.** Every write path
-    — ordinary transactions, batch, both transfer legs, and the inbox — routes
-    through here, so there is exactly one answer to "what does the sign mean".
-    Adding a second reader is the bug, not the fix.
+    **Signs are read only in this module** — this function for direction,
+    ``opposite_signs`` below for the transfer pairing rule. Every write
+    path — ordinary transactions, batch, both transfer legs, and the
+    inbox — routes through here, so there is exactly one answer to "what
+    does the sign mean". Adding a reader anywhere else is the bug, not
+    the fix.
 
     Until WP1 there was a second, byte-identical copy of this rule named
     ``infer_transfer_direction``, because transfers encoded their direction in
@@ -162,3 +164,19 @@ def infer_transaction_type(amount_cents: int) -> TransactionType:
     Callers must reject zero first; ``0`` maps to INFLOW here.
     """
     return TransactionType.OUTFLOW if amount_cents < 0 else TransactionType.INFLOW
+
+
+MSG_OPPOSITE_SIGN = "Must have opposite sign to amount_cents."
+
+
+def opposite_signs(a: int, b: int) -> bool:
+    """True when the two signed amounts point opposite ways.
+
+    The transfer pairing rule: one leg flows out, the other flows in.
+    Non-raising by design — the ledger path accumulates the failure into
+    its errors dict (multi-error responses are pinned) while the inbox
+    path raises immediately; both report ``MSG_OPPOSITE_SIGN``.
+
+    Callers must reject zero first; zero has no sign.
+    """
+    return (a > 0) != (b > 0)

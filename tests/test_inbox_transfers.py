@@ -217,6 +217,53 @@ async def test_same_sign_transfer_draft_is_rejected(client, test_data):
 
 
 @pytest.mark.asyncio
+async def test_opposite_sign_message_identical_on_ledger_and_inbox(client, test_data):
+    """The same-sign guard exists on two write paths (ledger create and
+    inbox draft); both must report the identical field message. Pins
+    MSG_OPPOSITE_SIGN against re-drift (bloat-audit Tier 2 §9 — the two
+    copies had drifted before the extraction)."""
+    sibling = await _make_account(test_data.user_id, "msg-parity")
+    try:
+        inbox_r, _ = await _post_inbox(
+            client,
+            title=f"inbox-msg-parity-{uuid.uuid4()}",
+            amount_cents=-6000,
+            date=PAST_DATE,
+            account_id=test_data.account_id,
+            transfer={"account_id": sibling, "amount_cents": -1500},
+        )
+        assert inbox_r.status_code == 422, inbox_r.text
+        inbox_msg = inbox_r.json()["error"]["fields"]["transfer.amount_cents"]
+
+        ledger_r = await client.post(
+            "/v1/transactions",
+            json={
+                "id": str(uuid.uuid4()),
+                "title": f"ledger-msg-parity-{uuid.uuid4()}",
+                "amount_cents": -6000,
+                "date": PAST_DATE,
+                "account_id": test_data.account_id,
+                "category_id": test_data.category_id,
+                "transfer": {
+                    "id": str(uuid.uuid4()),
+                    "account_id": sibling,
+                    "amount_cents": -1500,
+                },
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert ledger_r.status_code == 422, ledger_r.text
+        ledger_msg = ledger_r.json()["error"]["fields"]["transfer.amount_cents"]
+
+        assert inbox_msg == ledger_msg, (
+            f"Opposite-sign message drifted between paths: "
+            f"inbox={inbox_msg!r} ledger={ledger_msg!r}"
+        )
+    finally:
+        await _cleanup_account(sibling)
+
+
+@pytest.mark.asyncio
 async def test_same_sign_transfer_rejected_on_update(client, test_data):
     """The same guard applies to PUT, against the merged row state."""
     sibling = await _make_account(test_data.user_id, "same-sign-put")

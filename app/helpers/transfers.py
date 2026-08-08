@@ -13,7 +13,12 @@ from app.helpers.activity_log import write_activity_log
 from app.helpers.categories import ensure_system_category
 from app.helpers.transactions import insert_transaction_row
 from app.helpers.validation import MSG_ACTIVE_ACCOUNT, active_account_row
-from app.schemas.transactions import infer_transaction_type, transaction_from_row
+from app.schemas.transactions import (
+    MSG_OPPOSITE_SIGN,
+    infer_transaction_type,
+    opposite_signs,
+    transaction_from_row,
+)
 
 
 async def create_transfer_pair(
@@ -54,11 +59,8 @@ async def create_transfer_pair(
         errors["transfer.amount_cents"] = "Must not be zero."
 
     if primary_amount_cents != 0 and transfer_amount_cents != 0:
-        same_sign = (primary_amount_cents > 0) == (transfer_amount_cents > 0)
-        if same_sign:
-            errors["transfer.amount_cents"] = (
-                "Must have opposite sign to primary amount_cents."
-            )
+        if not opposite_signs(primary_amount_cents, transfer_amount_cents):
+            errors["transfer.amount_cents"] = MSG_OPPOSITE_SIGN
 
     # ------------------------------------------------------------------
     # 2. Same-account / same-id checks

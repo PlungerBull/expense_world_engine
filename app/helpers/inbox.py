@@ -51,7 +51,9 @@ from app.helpers.validation import (
 )
 from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
 from app.schemas.transactions import (
+    MSG_OPPOSITE_SIGN,
     infer_transaction_type,
+    opposite_signs,
     transaction_from_row,
 )
 
@@ -81,10 +83,10 @@ def _resolve_transfer_type(
 
     Callers must reject zero amounts first.
     """
-    if primary_signed is not None and (primary_signed > 0) == (sibling_signed > 0):
+    if primary_signed is not None and not opposite_signs(primary_signed, sibling_signed):
         raise validation_error(
             "Transfer validation failed.",
-            {"transfer.amount_cents": "Must have opposite sign to amount_cents."},
+            {"transfer.amount_cents": MSG_OPPOSITE_SIGN},
         )
     if primary_signed is not None:
         return infer_transaction_type(primary_signed)
