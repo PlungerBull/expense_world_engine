@@ -589,6 +589,122 @@ async def test_restore_unlinks_sibling_completed_reconciliation(client, test_dat
 
 
 # ---------------------------------------------------------------------------
+# 4b-ii. Delete warns when the SIBLING leg sits in a completed reconciliation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_warns_when_sibling_in_completed_reconciliation(
+    client, test_data,
+):
+    """Deleting a transfer pair whose SIBLING leg belongs to a completed
+    reconciliation emits a "Transfer sibling: "-prefixed warning — the
+    per-leg check delete shares with restore (bloat-audit Tier 2 §6,
+    Branch A: previously only the deleted leg was checked).
+    """
+    second_account_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 is_archived, sort_order, created_at, updated_at)
+            VALUES ($1, $2, 'Delete-Sibling-Warning', 'PEN', false, '#AA0000',
+                    false, 5, now(), now())
+            """,
+            second_account_id, test_data.user_id,
+        )
+
+    primary_id = sibling_id = None
+    recon_id = str(uuid.uuid4())
+    try:
+        create_r = await client.post(
+            "/v1/transactions",
+            json={
+                "id": str(uuid.uuid4()),
+                "title": f"delete-sibling-warn-{uuid.uuid4()}",
+                "amount_cents": -1200,
+                "date": "2026-04-12T12:00:00Z",
+                "account_id": test_data.account_id,
+                "category_id": test_data.category_id,
+                "transfer": {
+                    "id": str(uuid.uuid4()),
+                    "account_id": second_account_id,
+                    "amount_cents": 1200,
+                },
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert create_r.status_code == 201, create_r.text
+        primary_id = create_r.json()["id"]
+        sibling_id = create_r.json()["transfer_transaction_id"]
+
+        recon_create = await client.post(
+            "/v1/reconciliations",
+            json={
+                "id": recon_id,
+                "account_id": second_account_id,
+                "name": f"delete-sibling-warn-{uuid.uuid4()}",
+                "beginning_balance_cents": 0,
+                "ending_balance_cents": 0,
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert recon_create.status_code == 201, recon_create.text
+
+        assign = await client.put(
+            f"/v1/transactions/{sibling_id}",
+            json={"reconciliation_id": recon_id},
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert assign.status_code == 200, assign.text
+
+        complete = await client.post(
+            f"/v1/reconciliations/{recon_id}/complete",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert complete.status_code == 200, complete.text
+
+        # Delete the PRIMARY — the sibling's completed recon must warn.
+        delete_r = await client.delete(
+            f"/v1/transactions/{primary_id}",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert delete_r.status_code == 200, delete_r.text
+        warnings = delete_r.json()["warnings"]
+        assert any(w.startswith("Transfer sibling: ") for w in warnings), (
+            f"Expected a 'Transfer sibling: '-prefixed warning on delete, got {warnings}"
+        )
+
+    finally:
+        await client.post(
+            f"/v1/reconciliations/{recon_id}/revert",
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE expense_transactions SET reconciliation_id = NULL WHERE reconciliation_id = $1",
+                recon_id,
+            )
+            await conn.execute(
+                "DELETE FROM activity_log WHERE resource_id = $1 AND user_id = $2",
+                recon_id, test_data.user_id,
+            )
+            await conn.execute(
+                "DELETE FROM expense_reconciliations WHERE id = $1 AND user_id = $2",
+                recon_id, test_data.user_id,
+            )
+        await _hard_delete_txns(
+            [tid for tid in (primary_id, sibling_id) if tid], test_data.user_id,
+        )
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
+                second_account_id, test_data.user_id,
+            )
+
+
+# ---------------------------------------------------------------------------
 # 4c. Hashtag junction round-trip on BOTH legs of a transfer pair
 # ---------------------------------------------------------------------------
 

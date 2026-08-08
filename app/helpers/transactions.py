@@ -178,6 +178,77 @@ async def fetch_recon_status(
 # Private helpers
 # ---------------------------------------------------------------------------
 
+async def _cascade_junctions_delete(
+    conn: asyncpg.Connection,
+    user_id: str,
+    transaction_id: str,
+    *,
+    keep_hashtag_ids: Optional[list[str]] = None,
+) -> None:
+    """Soft-delete the transaction's active ledger junction rows.
+
+    The single producer of junction ``deleted_at`` markers — used by the
+    delete cascade (both transfer legs) and by ``_sync_hashtags`` step 1.
+
+    **The marker is load-bearing.** Postgres ``now()`` returns
+    ``transaction_timestamp()`` — one value per DB transaction — so every
+    junction row soft-deleted here carries the exact timestamp the parent
+    row got in the same transaction. ``_cascade_junctions_restore``
+    re-activates by exact ``deleted_at`` match against the parent's
+    marker, which catches precisely the rows this cascade dropped and not
+    soft-deleted junctions left by earlier ``_sync_hashtags`` runs.
+
+    ``keep_hashtag_ids`` narrows the cascade to rows *leaving* the active
+    set (rows staying attached get no updated_at bump for nothing). An
+    empty or omitted list makes ``<> ALL`` vacuously TRUE — everything
+    active is dropped.
+
+    Deliberate non-adopter: ``hashtags.delete_hashtag`` pivots on
+    ``hashtag_id`` across all transactions, skips the
+    ``transaction_source`` filter, and needs ``RETURNING transaction_id``
+    — a different operation, not another copy of this one.
+    """
+    await conn.execute(
+        """
+        UPDATE expense_transaction_hashtags
+        SET deleted_at = now(), updated_at = now()
+        WHERE transaction_id = $1
+          AND transaction_source = 1
+          AND user_id = $2
+          AND deleted_at IS NULL
+          AND hashtag_id <> ALL($3::uuid[])
+        """,
+        transaction_id,
+        user_id,
+        keep_hashtag_ids or [],
+    )
+
+
+async def _cascade_junctions_restore(
+    conn: asyncpg.Connection,
+    user_id: str,
+    transaction_id: str,
+    deleted_at_marker,
+) -> None:
+    """Re-activate the junction rows cascaded by THIS transaction's delete.
+
+    Matches ``deleted_at = $marker`` exactly, with ``$marker`` bound to
+    the parent's pre-restore ``deleted_at`` — see
+    ``_cascade_junctions_delete`` for why the equality is precise.
+    """
+    await conn.execute(
+        """
+        UPDATE expense_transaction_hashtags
+        SET deleted_at = NULL, updated_at = now()
+        WHERE transaction_id = $1 AND transaction_source = 1
+          AND user_id = $2 AND deleted_at = $3
+        """,
+        transaction_id,
+        user_id,
+        deleted_at_marker,
+    )
+
+
 async def _sync_hashtags(
     conn: asyncpg.Connection,
     transaction_id: str,
@@ -239,23 +310,8 @@ async def _sync_hashtags(
             )
 
     # Step 1: soft-delete the junctions *leaving* the active set.
-    # ``hashtag_id <> ALL($3)`` skips rows that should stay attached,
-    # so they don't get an updated_at bump for nothing. An empty
-    # array makes ``<> ALL`` vacuously TRUE for every row — clearing all
-    # hashtags still works (the original "soft-delete everything" case).
-    await conn.execute(
-        """
-        UPDATE expense_transaction_hashtags
-        SET deleted_at = now(), updated_at = now()
-        WHERE transaction_id = $1
-          AND transaction_source = 1
-          AND user_id = $2
-          AND deleted_at IS NULL
-          AND hashtag_id <> ALL($3::uuid[])
-        """,
-        transaction_id,
-        user_id,
-        hashtag_ids or [],
+    await _cascade_junctions_delete(
+        conn, user_id, transaction_id, keep_hashtag_ids=hashtag_ids,
     )
 
     # Step 2: upsert the new set in one statement. ON CONFLICT re-activates
@@ -700,6 +756,117 @@ async def update_transaction(
 # Delete
 # ---------------------------------------------------------------------------
 
+async def _recon_warning(conn: asyncpg.Connection, user_id: str, recon_id) -> Optional[str]:
+    """Warning text when a deleted leg belonged to a COMPLETED reconciliation.
+
+    Deletion is never blocked by the reconciliation — the warning tells
+    the client the reconciliation's totals may now be stale.
+    """
+    if recon_id is None:
+        return None
+    recon = await fetch_recon_status(conn, user_id, recon_id)
+    if recon and recon["status"] == ReconciliationStatus.COMPLETED:
+        return (
+            "Transaction belonged to a completed reconciliation. "
+            "Reconciliation totals may be stale."
+        )
+    return None
+
+
+async def _delete_leg(
+    conn: asyncpg.Connection,
+    user_id: str,
+    row: asyncpg.Record,
+) -> dict:
+    """Soft-delete one transaction row: snapshot, delete, cascade junctions, log.
+
+    Runs once per leg of a transfer pair (and once for a plain
+    transaction). The caller holds the row's ``FOR UPDATE`` lock.
+
+    Not routed through ``query_builder.soft_delete_with_audit``: the
+    after-snapshot needs the *async* ``attach_hashtag_ids``, and it must
+    run after the junction cascade so the snapshot shows the post-delete
+    wire state (``[]``) — ``_mutate_with_audit``'s sync ``serialize`` can
+    express neither.
+    """
+    transaction_id = str(row["id"])
+    before = transaction_from_row(row)
+    # Pre-delete hashtag_ids — captured BEFORE the junction cascade below,
+    # otherwise the snapshot is empty and the audit trail can't tell what
+    # was attached prior to delete.
+    await attach_hashtag_ids(conn, before)
+
+    after_row = await soft_delete(conn, "expense_transactions", transaction_id, user_id)
+    after = transaction_from_row(after_row)
+
+    # No balance reversal: the sum that defines the balance already excludes
+    # soft-deleted rows, so setting deleted_at IS the reversal.
+    await _cascade_junctions_delete(conn, user_id, transaction_id)
+
+    # After-snapshot — junctions soft-deleted above, resolves to []
+    # (matches the post-delete wire state).
+    await attach_hashtag_ids(conn, after)
+
+    await write_activity_log(
+        conn, user_id, "transaction", transaction_id, ActivityAction.DELETED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
+async def _restore_leg(
+    conn: asyncpg.Connection,
+    user_id: str,
+    row: asyncpg.Record,
+    *,
+    unlink: bool,
+) -> dict:
+    """Restore one soft-deleted transaction row: snapshot, un-delete
+    (conditionally clearing ``reconciliation_id``), re-activate junctions, log.
+
+    The caller locked ``row`` with ``deleted=True, for_update=True``,
+    which is why the UPDATE below needs no ``deleted_at IS NOT NULL``
+    predicate — the row is known soft-deleted and can't change under us.
+    ``query_builder.restore`` is not used because it hard-codes its SET
+    list and cannot express the conditional unlink.
+    """
+    transaction_id = str(row["id"])
+    before = transaction_from_row(row)
+    # Soft-deleted state: cascade-soft-deleted junctions resolve to [] here.
+    await attach_hashtag_ids(conn, before)
+    deleted_at_marker = row["deleted_at"]
+
+    after_row = await conn.fetchrow(
+        """
+        UPDATE expense_transactions
+        SET deleted_at = NULL,
+            reconciliation_id = CASE WHEN $3 THEN NULL ELSE reconciliation_id END,
+            updated_at = now(), version = version + 1
+        WHERE id = $1 AND user_id = $2
+        RETURNING *
+        """,
+        transaction_id,
+        user_id,
+        unlink,
+    )
+    after = transaction_from_row(after_row)
+
+    # (There is no balance step to mirror the delete's reversal: clearing
+    # deleted_at above puts the row back into the sum that defines the balance.)
+    await _cascade_junctions_restore(conn, user_id, transaction_id, deleted_at_marker)
+
+    # Post-restore: junctions are active again → resolves to the restored set.
+    await attach_hashtag_ids(conn, after)
+
+    await write_activity_log(
+        conn, user_id, "transaction", transaction_id, ActivityAction.RESTORED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
+
+
 async def delete_transaction(
     conn: asyncpg.Connection,
     user_id: str,
@@ -713,9 +880,11 @@ async def delete_transaction(
     pairs are never orphaned).
 
     The response carries ``warnings: list[str]`` — always present on this
-    endpoint, empty when the delete is clean. A transaction assigned to a
-    completed reconciliation contributes a note so clients can surface that
-    the reconciliation totals may now be stale.
+    endpoint, empty when the delete is clean. The completed-reconciliation
+    check runs per leg: either leg of a transfer pair sitting in a
+    completed reconciliation contributes a note (the sibling's prefixed
+    ``"Transfer sibling: "``, mirroring restore), so clients can surface
+    that the reconciliation totals may now be stale.
 
     Both the primary and the sibling (if any) are locked with
     ``FOR UPDATE`` before their balance is reversed — same hazard as
@@ -730,89 +899,34 @@ async def delete_transaction(
         for_update=True,
     )
 
-    before = transaction_from_row(row)
-    # Pre-delete hashtag_ids — must be captured BEFORE the junction-row
-    # cascade-soft-delete below, otherwise the snapshot is empty and the
-    # audit trail can't tell what was attached prior to delete.
-    await attach_hashtag_ids(conn, before)
-
-    # Soft-delete
-    after_row = await soft_delete(conn, "expense_transactions", transaction_id, user_id)
-    after = transaction_from_row(after_row)
-
-    # No balance reversal: the sum that defines the balance already excludes
-    # soft-deleted rows, so setting deleted_at IS the reversal.
-
-    # Soft-delete junction rows
-    await conn.execute(
-        """
-        UPDATE expense_transaction_hashtags
-        SET deleted_at = now(), updated_at = now()
-        WHERE transaction_id = $1 AND transaction_source = 1 AND user_id = $2 AND deleted_at IS NULL
-        """,
-        transaction_id,
-        user_id,
-    )
-
-    # Handle transfer sibling — locked so its state can't change between the
-    # before-snapshot and the after-snapshot written below.
+    # Lock the transfer sibling too, so its state can't change between
+    # its before-snapshot and after-snapshot.
+    sibling_row = None
     if row["transfer_transaction_id"] is not None:
-        sibling_id = str(row["transfer_transaction_id"])
         # Non-raising fetch: a missing sibling is tolerated (asymmetric pairs
         # can exist after a one-legged delete), so no _or_404 here.
         sibling_row = await fetch_owned_row(
-            conn, "expense_transactions", sibling_id, user_id, for_update=True
+            conn, "expense_transactions", str(row["transfer_transaction_id"]),
+            user_id, for_update=True,
         )
-        if sibling_row is not None:
-            sibling_before = transaction_from_row(sibling_row)
-            await attach_hashtag_ids(conn, sibling_before)
 
-            sibling_after_row = await soft_delete(
-                conn, "expense_transactions", sibling_id, user_id
-            )
-            sibling_after = transaction_from_row(sibling_after_row)
+    # Sibling leg first — its activity-log entry has always preceded the
+    # primary's on a pair delete, and restore mirrors the same order.
+    if sibling_row is not None:
+        await _delete_leg(conn, user_id, sibling_row)
+    after = await _delete_leg(conn, user_id, row)
 
-            await conn.execute(
-                """
-                UPDATE expense_transaction_hashtags
-                SET deleted_at = now(), updated_at = now()
-                WHERE transaction_id = $1 AND transaction_source = 1 AND user_id = $2 AND deleted_at IS NULL
-                """,
-                sibling_id,
-                user_id,
-            )
-            # Sibling after-snapshot — junctions are now soft-deleted, so
-            # this resolves to [] (matches the post-delete wire state).
-            await attach_hashtag_ids(conn, sibling_after)
-
-            await write_activity_log(
-                conn, user_id, "transaction", sibling_id, ActivityAction.DELETED,
-                before_snapshot=sibling_before,
-                after_snapshot=sibling_after,
-            )
-
-    # Primary after-snapshot — junctions soft-deleted above, resolves to [].
-    await attach_hashtag_ids(conn, after)
-
-    # Activity log for primary transaction
-    await write_activity_log(
-        conn, user_id, "transaction", transaction_id, ActivityAction.DELETED,
-        before_snapshot=before,
-        after_snapshot=after,
-    )
-
-    # Warnings channel — always present (null-over-omission). Currently emits
-    # one value when the deleted row belonged to a completed reconciliation,
-    # but the list shape leaves room for future additions without changing
-    # the response contract.
+    # Warnings channel — always present (null-over-omission), checked per leg.
     warnings: list[str] = []
-    if row["reconciliation_id"] is not None:
-        recon = await fetch_recon_status(conn, user_id, row["reconciliation_id"])
-        if recon and recon["status"] == ReconciliationStatus.COMPLETED:
-            warnings.append(
-                "Transaction belonged to a completed reconciliation. "
-                "Reconciliation totals may be stale."
-            )
+    primary_warning = await _recon_warning(conn, user_id, row["reconciliation_id"])
+    if primary_warning is not None:
+        warnings.append(primary_warning)
+    if sibling_row is not None:
+        sibling_warning = await _recon_warning(
+            conn, user_id, sibling_row["reconciliation_id"]
+        )
+        if sibling_warning is not None:
+            warnings.append("Transfer sibling: " + sibling_warning)
 
     return {**after, "warnings": warnings}
 
@@ -851,13 +965,8 @@ async def restore_transaction(
     they were reconciling, deleted by mistake, and want the row back
     in the same batch without a re-assignment ceremony.
 
-    **Junction rows.** Restored precisely: ``WHERE deleted_at = $marker``
-    with ``$marker`` bound to the parent's pre-restore ``deleted_at``.
-    Because Postgres ``now()`` returns ``transaction_timestamp()`` (one
-    value per DB transaction), the cascade UPDATE inside ``delete_transaction``
-    set the junctions to the same timestamp as the parent. Exact match
-    catches only those rows, not pre-existing soft-deleted junctions
-    from earlier ``_sync_hashtags`` runs.
+    **Junction rows.** Restored precisely by exact ``deleted_at`` match —
+    see ``_cascade_junctions_delete`` for the marker contract.
 
     This intentionally differs from ``restore_hashtag`` /
     ``restore_reconciliation`` which both opt NOT to cascade-restore.
@@ -951,116 +1060,13 @@ async def restore_transaction(
             sibling_row["reconciliation_id"]
         )
 
-    # 5. Restore primary row (conditionally clearing reconciliation_id).
-    before = transaction_from_row(row)
-    # Soft-deleted state: cascade-soft-deleted junctions resolve to [] here.
-    await attach_hashtag_ids(conn, before)
-    primary_deleted_at = row["deleted_at"]
+    # 5. Restore both legs — sibling first (its activity-log entry has
+    #    always preceded the primary's; matches delete_transaction's order).
+    if is_transfer and sibling_row is not None:
+        await _restore_leg(conn, user_id, sibling_row, unlink=sibling_unlink)
+    after = await _restore_leg(conn, user_id, row, unlink=primary_unlink)
 
-    if primary_unlink:
-        after_row = await conn.fetchrow(
-            """
-            UPDATE expense_transactions
-            SET deleted_at = NULL, reconciliation_id = NULL,
-                updated_at = now(), version = version + 1
-            WHERE id = $1 AND user_id = $2
-            RETURNING *
-            """,
-            transaction_id,
-            user_id,
-        )
-    else:
-        after_row = await conn.fetchrow(
-            """
-            UPDATE expense_transactions
-            SET deleted_at = NULL, updated_at = now(), version = version + 1
-            WHERE id = $1 AND user_id = $2
-            RETURNING *
-            """,
-            transaction_id,
-            user_id,
-        )
-    after = transaction_from_row(after_row)
-
-    # 6. Re-activate cascaded junction rows on the primary.
-    # (There is no balance step to mirror the delete's reversal: clearing
-    # deleted_at above puts the row back into the sum that defines the balance.)
-    await conn.execute(
-        """
-        UPDATE expense_transaction_hashtags
-        SET deleted_at = NULL, updated_at = now()
-        WHERE transaction_id = $1 AND transaction_source = 1
-          AND user_id = $2 AND deleted_at = $3
-        """,
-        transaction_id,
-        user_id,
-        primary_deleted_at,
-    )
-
-    # 7. Sibling cascade (mirror steps 5-6).
-    if is_transfer and sibling_row is not None and sibling_id is not None:
-        sibling_before = transaction_from_row(sibling_row)
-        # Soft-deleted state → []; attach for §6 audit consistency.
-        await attach_hashtag_ids(conn, sibling_before)
-        sibling_deleted_at = sibling_row["deleted_at"]
-
-        if sibling_unlink:
-            sibling_after_row = await conn.fetchrow(
-                """
-                UPDATE expense_transactions
-                SET deleted_at = NULL, reconciliation_id = NULL,
-                    updated_at = now(), version = version + 1
-                WHERE id = $1 AND user_id = $2
-                RETURNING *
-                """,
-                sibling_id,
-                user_id,
-            )
-        else:
-            sibling_after_row = await conn.fetchrow(
-                """
-                UPDATE expense_transactions
-                SET deleted_at = NULL, updated_at = now(), version = version + 1
-                WHERE id = $1 AND user_id = $2
-                RETURNING *
-                """,
-                sibling_id,
-                user_id,
-            )
-        sibling_after = transaction_from_row(sibling_after_row)
-
-        await conn.execute(
-            """
-            UPDATE expense_transaction_hashtags
-            SET deleted_at = NULL, updated_at = now()
-            WHERE transaction_id = $1 AND transaction_source = 1
-              AND user_id = $2 AND deleted_at = $3
-            """,
-            sibling_id,
-            user_id,
-            sibling_deleted_at,
-        )
-        # Post-restore: junctions are active again → resolves to the restored set.
-        await attach_hashtag_ids(conn, sibling_after)
-
-        # Sibling activity log first (matches delete_transaction's order).
-        await write_activity_log(
-            conn, user_id, "transaction", sibling_id, ActivityAction.RESTORED,
-            before_snapshot=sibling_before,
-            after_snapshot=sibling_after,
-        )
-
-    # Primary post-restore: junctions are active again → restored set.
-    await attach_hashtag_ids(conn, after)
-
-    # 8. Primary activity log.
-    await write_activity_log(
-        conn, user_id, "transaction", transaction_id, ActivityAction.RESTORED,
-        before_snapshot=before,
-        after_snapshot=after,
-    )
-
-    # 9. Build warnings list (always present; empty when restore is clean).
+    # 6. Build warnings list (always present; empty when restore is clean).
     warnings: list[str] = []
     if primary_warning is not None:
         warnings.append(primary_warning)

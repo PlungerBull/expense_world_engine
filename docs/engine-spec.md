@@ -501,7 +501,7 @@ The same value rules as `POST` apply: `amount_cents` must be non-zero, `title` n
 ### `DELETE /transactions/{id}`
 Soft-delete. The balance sum excludes soft-deleted rows, so setting `deleted_at` is the reversal — there is no separate balance write.
 
-**Response shape:** Always includes a `warnings: list[str]` field (the "Warnings channel" convention above — this endpoint and restore are its two members). Empty list when the delete is clean; populated with one or more strings when something notable happened. Currently the only warning emitted is `"Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."` — the delete is still allowed (the engine does not auto-adjust the reconciliation's totals); the field surfaces the staleness so clients can render a notice.
+**Response shape:** Always includes a `warnings: list[str]` field (the "Warnings channel" convention above — this endpoint and restore are its two members). Empty list when the delete is clean; populated with one or more strings when something notable happened. The completed-reconciliation check runs **per leg** (2026-08-08, matching restore): a leg that belonged to a completed reconciliation contributes `"Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."`, with the transfer sibling's occurrence prefixed `"Transfer sibling: "`. The delete is still allowed (the engine does not auto-adjust the reconciliation's totals); the field surfaces the staleness so clients can render a notice.
 
 If the transaction has a `transfer_transaction_id`, both the transaction and its paired sibling are soft-deleted atomically.
 
