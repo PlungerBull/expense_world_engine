@@ -8,6 +8,8 @@
 
 The rework achieved its stated goals: every sacred convention is genuinely single-sourced (sign matrix, sign reader, balances, activity log, idempotency, error format), and the deletion work was clean — one unused import in the whole app, no dead functions, no commented-out code. The bloat that remains is **repetition of mechanical CRUD plumbing**: the same five or six patterns (fetch-or-404, soft-delete/restore ceremony, active-reference checks, list scaffolds, response serializers) are hand-typed dozens of times each. Several copies have already drifted, including three queries missing the `user_id` tenant filter and eight request models that silently drop unknown fields — so consolidation here is a correctness program, not a style pass.
 
+> **Status 2026-08-08:** Correctness (all 7), Dead Code, Unused Imports, and **Duplicates Tier 1 (§§1–5, incl. deferred Correctness 5–6 + `sql/028`) are closed** — each struck section carries its corrections and test pins. Open: Tier 2 (§§6–11), Tier 3 (§§12–19), the two remaining Magic Values rows, and the Dependency Report.
+
 ---
 
 ## Correctness-relevant drift (fix first)
