@@ -11,7 +11,8 @@ from app.schemas.transactions import TransactionResponse
 
 class ReconciliationCreateRequest(StrictModel):
     id: UUID
-    account_id: str
+    # UUID-typed like `id` — malformed FKs 422 at the boundary (open-bugs 6.6).
+    account_id: UUID
     name: str
     date_start: Optional[datetime] = None
     date_end: Optional[datetime] = None

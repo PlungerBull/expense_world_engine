@@ -20,7 +20,7 @@ class InboxTransferField(StrictModel):
     (WP7.2, docs/audit-2026-08-01-remediation-plan.md:221).
     """
 
-    account_id: str
+    account_id: UUID
     amount_cents: int  # signed: negative=outflow from the sibling, positive=inflow
 
 
@@ -33,8 +33,9 @@ class InboxCreateRequest(StrictModel):
     description: Optional[str] = None
     amount_cents: Optional[int] = None  # signed: negative=expense, positive=income
     date: Optional[AwareDatetime] = None
-    account_id: Optional[str] = None
-    category_id: Optional[str] = None
+    # UUID-typed like `id` — malformed FKs 422 at the boundary (open-bugs 6.6).
+    account_id: Optional[UUID] = None
+    category_id: Optional[UUID] = None
     transfer: Optional[InboxTransferField] = None
 
 
@@ -43,8 +44,8 @@ class InboxUpdateRequest(StrictModel):
     description: Optional[str] = None
     amount_cents: Optional[int] = None  # signed: negative=expense, positive=income
     date: Optional[AwareDatetime] = None
-    account_id: Optional[str] = None
-    category_id: Optional[str] = None
+    account_id: Optional[UUID] = None
+    category_id: Optional[UUID] = None
     # Explicit null clears the transfer — see update_inbox_item.
     transfer: Optional[InboxTransferField] = None
 

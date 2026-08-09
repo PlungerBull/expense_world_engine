@@ -11,6 +11,30 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-08 — malformed UUIDs in request *bodies* return `422`, previously `500`
+
+**Engine change** (`schemas/transactions.py`, `schemas/inbox.py`,
+`schemas/reconciliations.py`; open-bugs 6.6, bloat-audit §17g). Every
+UUID-valued FK field in a request body is now typed `UUID` like the `id` PKs
+beside it: `account_id`, `category_id`, `hashtag_ids`, `reconciliation_id`
+on transaction create/update, `transfer.account_id` on both transfer
+fragments, the inbox create/update pair, and reconciliation create.
+
+**What breaks:** a client sending a malformed UUID in one of these fields
+got `500 INTERNAL_ERROR` before (the garbage reached SQL as a bind param);
+it now gets the standard `422 VALIDATION_ERROR` with the field named in
+`fields` (dotted for nested locations: `transfer.account_id`,
+`transactions.0.category_id`). Clients treating 500 as "retry later" must
+not retry these. Well-formed UUIDs behave exactly as before.
+
+**Client action:** none for correct clients. The path/query half of this
+landed 2026-08-07 (bug 6.2) — the two layers now agree.
+
+### Engine references
+
+- `tests/test_uuid_body_fields.py` (new pins), `tests/test_uuid_params.py`
+  (the 6.2 precedent)
+
 ## 2026-08-08 — no-op `debit_as_negative` removed from `/dashboard` and `/reports/monthly`
 
 **Engine change** (`routers/dashboard.py`, `routers/reports.py`; bloat-audit

@@ -312,7 +312,9 @@ async def _sync_hashtags(
             user_id,
         )
         valid_ids = {str(r["id"]) for r in valid}
-        invalid = [h for h in hashtag_ids if h not in valid_ids]
+        # str() both sides: request models supply uuid.UUID since open-bugs
+        # 6.6 closed; a UUID is never `in` a set[str].
+        invalid = [str(h) for h in hashtag_ids if str(h) not in valid_ids]
         if invalid:
             raise validation_error(
                 "Some hashtag IDs are invalid.",
@@ -631,7 +633,9 @@ async def update_transaction(
                 "Reconciliation validation failed.",
                 {"reconciliation_id": "Must reference an active reconciliation."},
             )
-        effective_account_id = fields.get("account_id") or str(before_row["account_id"])
+        # str() the whole expression: fields["account_id"] is uuid.UUID since
+        # open-bugs 6.6 closed, and str != UUID is always True.
+        effective_account_id = str(fields.get("account_id") or before_row["account_id"])
         if str(recon["account_id"]) != effective_account_id:
             raise validation_error(
                 "Reconciliation validation failed.",
@@ -1151,7 +1155,9 @@ async def create_batch(
         if item.date > now:
             item_errors["date"] = MSG_NOT_FUTURE
 
-        if item.account_id not in valid_account_ids:
+        # str(): item FKs are uuid.UUID since open-bugs 6.6 closed, and the
+        # valid_* sets hold strings.
+        if str(item.account_id) not in valid_account_ids:
             item_errors["account_id"] = MSG_ACTIVE_ACCOUNT
 
         # category_id is optional on the schema (transfers waive it), but batch
@@ -1159,7 +1165,7 @@ async def create_batch(
         # "required" message instead of a misleading referential error.
         if not item.category_id:
             item_errors["category_id"] = "Required for non-transfer transactions."
-        elif item.category_id not in valid_category_ids:
+        elif str(item.category_id) not in valid_category_ids:
             item_errors["category_id"] = MSG_ACTIVE_CATEGORY
 
         item_id_str = str(item.id)

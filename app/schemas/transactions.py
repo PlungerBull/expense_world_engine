@@ -10,7 +10,7 @@ from app.schemas import StrictModel, audit_fields, opt_id, owned_fields
 
 class TransferField(StrictModel):
     id: UUID  # sibling transaction's client-supplied uuid
-    account_id: str
+    account_id: UUID
     amount_cents: int  # signed: negative=outflow, positive=inflow
 
 
@@ -23,14 +23,17 @@ class TransactionCreateRequest(StrictModel):
     title: str
     amount_cents: int  # signed: negative=expense, positive=income
     date: AwareDatetime
-    account_id: str
+    # FK fields are UUID-typed like `id`: a malformed value 422s at the schema
+    # boundary instead of reaching SQL as a bind param and 500ing (open-bugs
+    # 6.6, closed 2026-08-08).
+    account_id: UUID
     # Required for normal transactions, ignored for transfers (the engine
     # auto-assigns @Transfer/@Debt). Conditional requirement is enforced in
     # create_transaction, not here, since it depends on the transfer field.
-    category_id: Optional[str] = None
+    category_id: Optional[UUID] = None
     description: Optional[str] = None
     cleared: Optional[bool] = None
-    hashtag_ids: Optional[list[str]] = None
+    hashtag_ids: Optional[list[UUID]] = None
     transfer: Optional[TransferField] = None
 
 
@@ -38,12 +41,12 @@ class TransactionUpdateRequest(StrictModel):
     title: Optional[str] = None
     amount_cents: Optional[int] = None  # signed: negative=expense, positive=income
     date: Optional[AwareDatetime] = None
-    account_id: Optional[str] = None
-    category_id: Optional[str] = None
+    account_id: Optional[UUID] = None
+    category_id: Optional[UUID] = None
     description: Optional[str] = None
     cleared: Optional[bool] = None
-    hashtag_ids: Optional[list[str]] = None
-    reconciliation_id: Optional[str] = None
+    hashtag_ids: Optional[list[UUID]] = None
+    reconciliation_id: Optional[UUID] = None
 
 
 class TransactionBatchRequest(StrictModel):
