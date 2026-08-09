@@ -12,7 +12,7 @@ The 2026-08-07 verification audit confirmed every previously closed bug is genui
 
 1. **6.7** — system categories accepted on ordinary transactions (three boundary call sites: create, update, batch). *(Its pair 6.6 — UUID-valued body fields — closed 2026-08-08 with bloat-audit Tier 3: malformed body FKs now 422.)*
 2. **7.1** — inbox writes do no referential/ownership validation (narrowed 2026-08-08: malformed ids now 422 via 6.6; what remains is well-formed-but-nonexistent/deleted/cross-tenant ids).
-3. **5.5** — the four reconciliation state-machine gaps.
+3. **5.5** — the three reconciliation state-machine gaps *(was four; the sibling delete warning closed 2026-08-08 with bloat-audit Tier 2 §6)*.
 4. **8.2** — batch/transfer CREATE snapshots log `hashtag_ids: []`.
 5. **1.7 remainder** — dedicated FX-hygiene pass: rate plausibility vs prior day, negative-lookup cache TTL, archived-account currencies in the fetch list, `Decimal`/`ROUND_HALF_UP`.
 6. **Four ⚪ lows** — `restore_category` skips the reserved-name check (7.4-r); `?hashtag_id=` filter lacks `transaction_source = 1` (hashtag-filter — or fold into the inbox-hashtags feature below, whichever ships first); inbox titles stored verbatim, whitespace-only can promote (inbox-title, found 2026-08-08 — fix wants an owner call on 422-vs-NULL); `color or` collapses an explicit empty string to the default (account-color, found 2026-08-08 — needs a reject-vs-store decision).
