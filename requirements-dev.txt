@@ -15,3 +15,19 @@ pytest==8.4.2
 pytest-asyncio==1.2.0
 pytest-xdist==3.8.0
 httpx==0.28.1
+
+# JWT forgery stack — TEST-ONLY, and deliberately so. tests/test_pat.py and
+# tests/test_auth_over_the_wire.py forge HS256 tokens to pin the deleted JWT
+# auth branch CLOSED (audit 2.1: the engine must reject every JWT). Production
+# has no code importing any of these; they moved out of requirements.txt with
+# the bloat-audit Dependency Report (2026-08-08), which also deleted the fully
+# orphaned cryptography/cffi/pycparser residue of the same 2026-08-03 JWT
+# deletion. Do not move these back to runtime without reintroducing a signing
+# path per the deps.py docstring's conditions.
+python-jose==3.5.0
+ecdsa==0.19.2
+rsa==4.9.1
+pyasn1==0.6.3
+# six was always an unpinned transitive of ecdsa; pinned now that the block is
+# managed rather than residue.
+six==1.17.0
