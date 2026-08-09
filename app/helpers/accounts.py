@@ -23,10 +23,9 @@ import asyncpg
 
 from app.constants import ActivityAction, SystemCategoryKey
 from app.errors import conflict, not_found, validation_error
-from app.helpers.account_balance import fetch_balance
+from app.helpers.account_balance import fetch_balance, fetch_home_balance
 from app.helpers.activity_log import write_activity_log
 from app.helpers.categories import ensure_system_category
-from app.helpers.exchange_rate import get_rate, rate_lookup_date
 from app.helpers.query_builder import (
     dynamic_update,
     fetch_owned_row_or_404,
@@ -36,37 +35,6 @@ from app.helpers.query_builder import (
 from app.helpers.reference_data import name_taken, next_sort_order
 from app.helpers.validation import currency_code_error, normalize_name
 from app.schemas.accounts import account_from_row
-
-
-async def get_home_balance(
-    conn: asyncpg.Connection,
-    currency_code: str,
-    balance_cents: int,
-    user_id: str,
-) -> Optional[int]:
-    """Convert balance to home currency. Returns None if no rate available.
-
-    Callers that need to convert many balances at once (e.g. the account
-    list endpoint) should use ``batch_get_rates`` directly to avoid the
-    N+1 query pattern this helper creates when called in a loop.
-    """
-    settings = await conn.fetchrow(
-        "SELECT main_currency, display_timezone FROM user_settings WHERE user_id = $1",
-        user_id,
-    )
-    if settings is None:
-        return None
-
-    result = await get_rate(
-        conn,
-        from_currency=currency_code,
-        to_currency=settings["main_currency"],
-        as_of=rate_lookup_date(settings["display_timezone"]),
-    )
-    if result is None:
-        return None
-
-    return round(balance_cents * result[0])
 
 
 async def create_account(
@@ -126,10 +94,10 @@ async def create_account(
 
     # A brand-new account has no transactions, so its balance is 0 by
     # construction — querying the ledger to learn that would be a round-trip to
-    # confirm what the INSERT guarantees. The get_home_balance call stays,
+    # confirm what the INSERT guarantees. The fetch_home_balance call stays,
     # though: round(0 * rate) is 0, but "no rate available for this currency" is
     # null, and that distinction is wire-visible.
-    home = await get_home_balance(conn, row["currency_code"], 0, user_id)
+    home = await fetch_home_balance(conn, user_id, row["currency_code"], 0)
     response = account_from_row(row, 0, home)
 
     await write_activity_log(
@@ -206,9 +174,9 @@ async def create_opening_balance(
             title=title,
             amount_cents=body.amount_cents,
             date=body.date,
-            # The schema's account_id is str (UUID-valued body fields are a
-            # filed follow-up to bug 6.2); the path param arrives as UUID.
-            account_id=str(account_id),
+            # account_id arrives as the UUID path param; the request model's
+            # FK fields are UUID-typed since open-bugs 6.6 closed (2026-08-08).
+            account_id=account_id,
             category_id=category_id,
         ),
     )
@@ -244,7 +212,7 @@ async def update_account(
             conn, "expense_bank_accounts", account_id, user_id, "account"
         )
         balance_cents = await fetch_balance(conn, user_id, account_id)
-        home = await get_home_balance(conn, row["currency_code"], balance_cents, user_id)
+        home = await fetch_home_balance(conn, user_id, row["currency_code"], balance_cents)
         return account_from_row(row, balance_cents, home)
 
     before_row = await fetch_owned_row_or_404(
@@ -271,8 +239,8 @@ async def update_account(
     # create a window for a concurrent ledger write to make the audit pair
     # disagree about a field this mutation never touched.
     balance_cents = await fetch_balance(conn, user_id, account_id)
-    home = await get_home_balance(
-        conn, before_row["currency_code"], balance_cents, user_id
+    home = await fetch_home_balance(
+        conn, user_id, before_row["currency_code"], balance_cents
     )
     before = account_from_row(before_row, balance_cents, home)
 
@@ -324,7 +292,7 @@ async def delete_account(
     # (It need not be zero: the guard above only rejects *active* transactions,
     # so an account whose rows were all soft-deleted can still carry a figure.)
     balance_cents = await fetch_balance(conn, user_id, account_id)
-    home = await get_home_balance(conn, row["currency_code"], balance_cents, user_id)
+    home = await fetch_home_balance(conn, user_id, row["currency_code"], balance_cents)
 
     return await soft_delete_with_audit(
         conn, user_id, "expense_bank_accounts", "account", row,
@@ -364,8 +332,8 @@ async def restore_account(
     # Restoring the account row does not restore any transaction, so the balance
     # is the same on both sides of the mutation. Fetched once, both snapshots.
     balance_cents = await fetch_balance(conn, user_id, account_id)
-    home = await get_home_balance(
-        conn, before_row["currency_code"], balance_cents, user_id
+    home = await fetch_home_balance(
+        conn, user_id, before_row["currency_code"], balance_cents
     )
 
     return await restore_with_audit(
@@ -419,8 +387,8 @@ async def _set_account_archive(
     # Archiving moves no money — an archived account still holds a real balance
     # and still reports it. One fetch, both snapshots.
     balance_cents = await fetch_balance(conn, user_id, account_id)
-    home = await get_home_balance(
-        conn, before_row["currency_code"], balance_cents, user_id
+    home = await fetch_home_balance(
+        conn, user_id, before_row["currency_code"], balance_cents
     )
     before = account_from_row(before_row, balance_cents, home)
 

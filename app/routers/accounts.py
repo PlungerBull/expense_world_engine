@@ -8,9 +8,15 @@ from app import db
 from app.deps import CurrentUser, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES
 from app.helpers import accounts as accounts_service
-from app.helpers.account_balance import fetch_balance, fetch_balances
-from app.helpers.exchange_rate import batch_get_rates, rate_lookup_date
+from app.helpers.account_balance import (
+    fetch_balance,
+    fetch_balances,
+    fetch_home_balance,
+    fetch_home_balances,
+)
+from app.helpers.exchange_rate import rate_lookup_date
 from app.helpers.idempotency import run_idempotent
+from app.helpers.settings import get_user_report_settings
 from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
@@ -57,42 +63,25 @@ async def list_accounts(
             offset=offset,
         )
 
-        # Batch home-balance conversion. Previously each account in this loop
-        # paid its own settings read + rate lookup (the per-account path that
-        # survives as helpers/accounts.get_home_balance) — an N+1 pattern
-        # that produced ~2N extra DB round-trips per list request. Now:
-        #   1. Fetch user_settings ONCE outside the loop.
-        #   2. Collect distinct account currencies.
-        #   3. Resolve all rates in one deduplicated batch.
-        # The loop becomes a pure in-memory transform.
-        settings_row = await conn.fetchrow(
-            "SELECT main_currency, display_timezone FROM user_settings WHERE user_id = $1",
-            auth_user.id,
-        )
-        main_currency = settings_row["main_currency"] if settings_row else None
-
-        rate_by_currency: dict[str, float] = {}
-        if main_currency and rows:
-            currencies = {row["currency_code"] for row in rows}
-            today = rate_lookup_date(settings_row["display_timezone"])
-            rate_by_currency = await batch_get_rates(
-                conn, currencies, main_currency, today,
-            )
-
-        # Balances for exactly the accounts on this page, in one query. Scoped to
-        # the page rather than the whole ledger so the index on
-        # (user_id, account_id) can drive it; `fetch_balances` seeds every
-        # requested id with 0, so an account with no transactions is 0 rather
-        # than a missing key.
+        # One settings read (422 SETTINGS_MISSING, like every home-converting
+        # surface — owner decision 2026-08-08), one clock read, then balances
+        # for exactly the accounts on this page in one query (`fetch_balances`
+        # seeds every requested id with 0) and one batched conversion.
+        settings = await get_user_report_settings(conn, auth_user.id)
+        today = rate_lookup_date(settings["display_timezone"])
         balances = await fetch_balances(conn, auth_user.id, [r["id"] for r in rows])
+        homes = await fetch_home_balances(
+            conn,
+            main_currency=settings["main_currency"],
+            today=today,
+            balances=balances,
+            currency_by_id={str(r["id"]): r["currency_code"] for r in rows},
+        )
 
-        data = []
-        for row in rows:
-            balance_cents = balances[str(row["id"])]
-            rate = rate_by_currency.get(row["currency_code"])
-            home = round(balance_cents * rate) if rate is not None else None
-            data.append(account_from_row(row, balance_cents, home))
-
+        data = [
+            account_from_row(row, balances[str(row["id"])], homes[str(row["id"])])
+            for row in rows
+        ]
         return paginated_response(data, total, limit, offset)
 
 
@@ -138,8 +127,8 @@ async def get_account(account_id: UUID, auth_user: CurrentUser):
         )
 
         balance_cents = await fetch_balance(conn, auth_user.id, account_id)
-        home = await accounts_service.get_home_balance(
-            conn, row["currency_code"], balance_cents, auth_user.id
+        home = await fetch_home_balance(
+            conn, auth_user.id, row["currency_code"], balance_cents
         )
         return account_from_row(row, balance_cents, home)
 

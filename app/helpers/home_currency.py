@@ -101,7 +101,7 @@ consequences worth knowing:
     The root fix is validating ``display_timezone`` on write; that shipped with
     ``sql/024`` (helpers/validation.validate_timezone), so this covers only
     out-of-band DB writes.
-  * Callers already have the value from ``monthly_report.get_user_report_settings``
+  * Callers already have the value from ``settings.get_user_report_settings``
     (already called by ``routers/dashboard.py`` and ``routers/reports.py``). Reuse
     it; do not add a second settings loader.
 

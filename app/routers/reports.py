@@ -6,11 +6,8 @@ from fastapi import APIRouter, Query
 from app import db
 from app.deps import CurrentUser
 from app.errors import ERROR_RESPONSES, validation_error
-from app.helpers.monthly_report import (
-    compute_month_bounds,
-    compute_month_flow,
-    get_user_report_settings,
-)
+from app.helpers.monthly_report import compute_month_bounds, compute_month_flow
+from app.helpers.settings import get_user_report_settings
 from app.schemas.reports import MonthlyReportRangeResponse, MonthlyReportResponse
 
 router = APIRouter(prefix="/reports", tags=["reports"], responses=ERROR_RESPONSES)

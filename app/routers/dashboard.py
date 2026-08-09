@@ -7,13 +7,10 @@ from fastapi import APIRouter, Query
 from app import db
 from app.deps import CurrentUser
 from app.errors import ERROR_RESPONSES
-from app.helpers.account_balance import fetch_balances
-from app.helpers.exchange_rate import batch_get_rates, rate_lookup_date
-from app.helpers.monthly_report import (
-    compute_month_bounds,
-    compute_month_flow,
-    get_user_report_settings,
-)
+from app.helpers.account_balance import fetch_balances, fetch_home_balances
+from app.helpers.exchange_rate import rate_lookup_date
+from app.helpers.monthly_report import compute_month_bounds, compute_month_flow
+from app.helpers.settings import get_user_report_settings
 from app.schemas.dashboard import DashboardResponse, dashboard_account_from_row
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"], responses=ERROR_RESPONSES)
@@ -70,30 +67,21 @@ async def _load_accounts(
 
     rows = await conn.fetch(query, user_id)
     balances = await fetch_balances(conn, user_id, [r["id"] for r in rows])
-
-    # Batch rate resolution — previously this loop fired one `get_rate` call
-    # per account, producing an N+1 pattern on the hottest read in the app.
-    # Collecting distinct currencies once and resolving in a single batch
-    # call deduplicates lookups so the DB is hit once per currency, not once
-    # per account.
-    currencies = {row["currency_code"] for row in rows}
-    rate_by_currency = (
-        await batch_get_rates(conn, currencies, main_currency, today)
-        if currencies
-        else {}
+    # main_currency/today stay caller-supplied: get_dashboard reads settings
+    # and the clock once for all three slices — no per-slice midnight drift,
+    # no tripled settings read.
+    homes = await fetch_home_balances(
+        conn,
+        main_currency=main_currency,
+        today=today,
+        balances=balances,
+        currency_by_id={str(r["id"]): r["currency_code"] for r in rows},
     )
 
-    result: list[dict] = []
-    for row in rows:
-        balance_cents = balances[str(row["id"])]
-        rate = rate_by_currency.get(row["currency_code"])
-        home_cents: Optional[int] = (
-            round(balance_cents * rate) if rate is not None else None
-        )
-
-        result.append(dashboard_account_from_row(row, balance_cents, home_cents))
-
-    return result
+    return [
+        dashboard_account_from_row(row, balances[str(row["id"])], homes[str(row["id"])])
+        for row in rows
+    ]
 
 
 # The `archived_categories` and `archived_hashtags` panels were here — two

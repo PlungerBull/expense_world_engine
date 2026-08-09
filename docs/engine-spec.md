@@ -132,7 +132,7 @@ Consequently there is **no home-currency recalculation pass**. `app/helpers/reca
 
 **Response shape:** the full `user_settings` row. The former `recalculation` field is **removed** — not nulled — because the operation it summarised cannot occur.
 
-**Settings preconditions:** Endpoints that read `user_settings` (dashboard, reports, transfers) return `422 SETTINGS_MISSING` with `fields: {"user_settings": "Must be provisioned via POST /v1/auth/bootstrap."}` if the user has not completed bootstrap. This is a precondition-unmet state, not a conflict.
+**Settings preconditions:** Endpoints that read `user_settings` (dashboard, reports, transfers, and — since 2026-08-08 — every account surface that emits `current_balance_home_cents`: the accounts list, account detail, and account mutations) return `422 SETTINGS_MISSING` with `fields: {"user_settings": "Must be provisioned via POST /v1/auth/bootstrap."}` if the user has not completed bootstrap. This is a precondition-unmet state, not a conflict. *(Before the bloat-audit §15 consolidation the account routes silently emitted `current_balance_home_cents: null` instead — a state only reachable by deleting the settings row out from under a bootstrapped user.)*
 
 **No exchange-rate preconditions on writes:** since `sql/021`, **no write path performs a rate lookup at all** — recording what happened is never blocked by a stale FX table. Conversion happens at read time, only on cross-currency aggregates; a row whose date has no resolvable rate surfaces there as `null` plus a non-zero `unconverted_count` (see Dashboard & Reporting). The former `422 RATE_UNAVAILABLE` write precondition is retired with the stored `exchange_rate`/`amount_home_cents` columns it protected.
 

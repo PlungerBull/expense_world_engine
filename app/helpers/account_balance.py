@@ -9,8 +9,11 @@ after creation — so each sum stays inside one currency by construction. Adding
 PEN balance to a USD one would produce a number in no currency at all, which is
 the mistake ``CLAUDE.md``'s home-currency rule exists to prevent. The only figure
 that spans currencies is ``current_balance_home_cents``, which converts each
-account separately before anything is combined, and which is the caller's job
-(``helpers/accounts.get_home_balance``), not this module's.
+account separately before anything is combined — ``fetch_home_balance`` /
+``fetch_home_balances`` below, the single implementation since the bloat-audit
+§15 consolidation (2026-08-08) replaced three drifting copies (the
+``helpers/accounts.get_home_balance`` N+1 path plus two hand-rolled batch loops
+in the accounts and dashboard routers).
 
 This module replaces ``app/helpers/balance.py``, which owned the write side of a
 stored ``expense_bank_accounts.current_balance_cents`` column (dropped by
@@ -89,17 +92,20 @@ REPEATABLE READ block -- see ``helpers/idempotency.run_idempotent`` for the
 boundary convention.
 """
 
-from typing import Iterable
+from datetime import date as date_type
+from typing import Iterable, Optional
 
 import asyncpg
 
+from app.helpers.exchange_rate import batch_get_rates, get_rate, rate_lookup_date
 from app.helpers.home_currency import SIGNED_CENTS_EXPR
+from app.helpers.settings import get_user_report_settings
 
 # Built once at import, matching helpers/monthly_report.py's handling of the same
 # fragments. SIGNED_CENTS_EXPR is `signed_expr("t.amount_cents")` -- the native,
 # unconverted signed amount. Balances are always in the account's own currency;
-# home-currency balances are converted from this figure by the caller, at today's
-# rate (see helpers/accounts.get_home_balance).
+# home-currency balances are converted from this figure at today's rate
+# (fetch_home_balance / fetch_home_balances below).
 _BALANCE_SUM_SQL = f"SUM({SIGNED_CENTS_EXPR})::bigint"
 
 
@@ -153,7 +159,77 @@ async def fetch_balance(
     return balances[str(account_id)]
 
 
+async def fetch_home_balances(
+    conn: asyncpg.Connection,
+    *,
+    main_currency: str,
+    today: date_type,
+    balances: dict[str, int],
+    currency_by_id: dict[str, str],
+) -> dict[str, Optional[int]]:
+    """Convert already-fetched balances to home currency, one rate per currency.
+
+    ``main_currency`` and ``today`` are caller-supplied — the dashboard reads
+    settings and the clock ONCE and converts three account slices with them,
+    so re-deriving either here would triple the settings read and reopen the
+    per-slice midnight drift its comment guards against. Get them from
+    ``settings.get_user_report_settings`` (which 422s when settings are
+    missing and asserts the home-currency lock) + ``rate_lookup_date``.
+
+    ``None`` means "no rate available for this account's currency today" —
+    wire-visible and distinct from a zero balance. ``round()`` on the float
+    rate is kept byte-for-byte from the three copies this replaces; the
+    Decimal/half-up question is open-bugs 1.7, deliberately not smuggled in
+    here.
+    """
+    currencies = set(currency_by_id.values())
+    rate_by_currency = (
+        await batch_get_rates(conn, currencies, main_currency, today)
+        if currencies
+        else {}
+    )
+    result: dict[str, Optional[int]] = {}
+    for account_id, balance_cents in balances.items():
+        rate = rate_by_currency.get(currency_by_id[account_id])
+        result[account_id] = round(balance_cents * rate) if rate is not None else None
+    return result
+
+
+async def fetch_home_balance(
+    conn: asyncpg.Connection,
+    user_id: str,
+    currency_code: str,
+    balance_cents: int,
+) -> Optional[int]:
+    """Home-currency value of one already-known balance, or None if no rate.
+
+    The single-account twin of ``fetch_home_balances`` for the mutation paths
+    and the account detail read, which each convert exactly one figure. Takes
+    the balance rather than reading it so ``create_account`` can pass its
+    by-construction 0 without a wasted ledger query (``round(0 * rate)`` is
+    0, but "no rate for this currency" is still ``null``, and that
+    distinction is wire-visible).
+
+    Reads settings itself — and therefore 422s SETTINGS_MISSING like every
+    other home-converting surface (owner decision 2026-08-08; before the §15
+    consolidation the account routes silently emitted null instead).
+    """
+    settings = await get_user_report_settings(conn, user_id)
+    today = rate_lookup_date(settings["display_timezone"])
+    result = await get_rate(
+        conn,
+        from_currency=currency_code,
+        to_currency=settings["main_currency"],
+        as_of=today,
+    )
+    if result is None:
+        return None
+    return round(balance_cents * result[0])
+
+
 __all__ = [
     "fetch_balance",
     "fetch_balances",
+    "fetch_home_balance",
+    "fetch_home_balances",
 ]

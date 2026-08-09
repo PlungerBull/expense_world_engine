@@ -11,6 +11,30 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-08 — account routes 422 `SETTINGS_MISSING` when settings are absent (was: silent null home balances)
+
+**Engine change** (`helpers/account_balance.py`, `helpers/settings.py`;
+bloat-audit §15, owner decision). The three copies of the balance→home
+conversion (per-account helper + two hand-rolled router batch loops) merged
+into `fetch_home_balance`/`fetch_home_balances`, and the merged path reads
+settings via the same `get_user_report_settings` the dashboard and reports
+use — which refuses with `422 SETTINGS_MISSING` instead of silently
+emitting `current_balance_home_cents: null`.
+
+**What breaks:** `GET /accounts`, `GET /accounts/{id}`, and account
+mutations now 422 when the user has no `user_settings` row. In practice
+unreachable — bootstrap always creates the row — so no correct client sees
+any difference; the change is that an impossible state now fails loudly
+instead of rendering blanks.
+
+**Client action:** none. Conversion math, rounding, and the null-when-no-rate
+meaning of `current_balance_home_cents` are byte-identical.
+
+### Engine references
+
+- `tests/test_accounts_settings_missing.py` (new pin)
+- `docs/engine-spec.md` — Settings preconditions paragraph
+
 ## 2026-08-08 — malformed UUIDs in request *bodies* return `422`, previously `500`
 
 **Engine change** (`schemas/transactions.py`, `schemas/inbox.py`,
