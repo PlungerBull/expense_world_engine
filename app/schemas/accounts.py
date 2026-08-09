@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel
 
-from app.schemas import StrictModel
+from app.schemas import StrictModel, audit_fields, owned_fields
 
 
 class AccountCreateRequest(StrictModel):
@@ -70,8 +70,7 @@ def account_from_row(
     currency today.
     """
     return AccountResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
+        **owned_fields(row),
         name=row["name"],
         currency_code=row["currency_code"],
         is_person=row["is_person"],
@@ -80,8 +79,5 @@ def account_from_row(
         current_balance_home_cents=balance_home_cents,
         is_archived=row["is_archived"],
         sort_order=row["sort_order"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        version=row["version"],
-        deleted_at=row["deleted_at"],
+        **audit_fields(row),
     ).model_dump(mode="json")

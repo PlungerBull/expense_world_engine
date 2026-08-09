@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from app.schemas import StrictModel
+from app.schemas import StrictModel, audit_fields, owned_fields
 
 
 class CategoryCreateRequest(StrictModel):
@@ -39,15 +39,11 @@ class CategoryResponse(BaseModel):
 
 def category_from_row(row) -> dict:
     return CategoryResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
+        **owned_fields(row),
         name=row["name"],
         color=row["color"],
         is_system=row["is_system"],
         system_key=row["system_key"],
         sort_order=row["sort_order"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        version=row["version"],
-        deleted_at=row["deleted_at"],
+        **audit_fields(row),
     ).model_dump(mode="json")

@@ -5,7 +5,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, Field
 
 from app.constants import TransactionType
-from app.schemas import StrictModel
+from app.schemas import StrictModel, audit_fields, opt_id, owned_fields
 
 
 class TransferField(StrictModel):
@@ -126,8 +126,7 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
         resolved = [str(h) for h in row_value] if row_value else []
 
     return TransactionResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
+        **owned_fields(row),
         title=row["title"],
         description=row["description"],
         amount_cents=row["amount_cents"],
@@ -136,13 +135,10 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
         account_id=str(row["account_id"]),
         category_id=str(row["category_id"]),
         cleared=row["cleared"],
-        transfer_transaction_id=str(row["transfer_transaction_id"]) if row["transfer_transaction_id"] else None,
-        inbox_id=str(row["inbox_id"]) if row["inbox_id"] else None,
-        reconciliation_id=str(row["reconciliation_id"]) if row["reconciliation_id"] else None,
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        version=row["version"],
-        deleted_at=row["deleted_at"],
+        transfer_transaction_id=opt_id(row["transfer_transaction_id"]),
+        inbox_id=opt_id(row["inbox_id"]),
+        reconciliation_id=opt_id(row["reconciliation_id"]),
+        **audit_fields(row),
         hashtag_ids=resolved,
     ).model_dump(mode="json")
 

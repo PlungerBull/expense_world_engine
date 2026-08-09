@@ -3,7 +3,7 @@ from typing import Optional
 
 from pydantic import BaseModel
 
-from app.schemas import StrictModel
+from app.schemas import StrictModel, owned_fields
 
 
 class PatCreateRequest(StrictModel):
@@ -33,21 +33,18 @@ def pat_from_row(row, plaintext: Optional[str] = None) -> dict:
     # When plaintext is supplied (only on create), the full response
     # including the one-shot token is returned. On every other path
     # the token is never reconstructable — only the hash is stored.
-    if plaintext is not None:
-        return PatCreateResponse(
-            id=str(row["id"]),
-            user_id=str(row["user_id"]),
-            token=plaintext,
-            token_prefix=row["token_prefix"],
-            name=row["name"],
-            created_at=row["created_at"],
-            revoked_at=row["revoked_at"],
-        ).model_dump(mode="json")
-    return PatResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
+    #
+    # PatCreateResponse deliberately restates PatResponse rather than
+    # inheriting it: `token` sits at position 3 in the create response, and
+    # a subclass field would land last (bloat-audit §17d, key-order rule in
+    # schemas/__init__).
+    common = dict(
+        **owned_fields(row),
         token_prefix=row["token_prefix"],
         name=row["name"],
         created_at=row["created_at"],
         revoked_at=row["revoked_at"],
-    ).model_dump(mode="json")
+    )
+    if plaintext is not None:
+        return PatCreateResponse(token=plaintext, **common).model_dump(mode="json")
+    return PatResponse(**common).model_dump(mode="json")

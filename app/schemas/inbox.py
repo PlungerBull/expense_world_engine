@@ -5,7 +5,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel
 
 from app.constants import InboxStatus, TransactionType
-from app.schemas import StrictModel
+from app.schemas import StrictModel, audit_fields, opt_id, owned_fields
 
 
 class InboxTransferField(StrictModel):
@@ -88,20 +88,16 @@ def inbox_from_row(row) -> dict:
     amount_cents = row["amount_cents"]
     transfer_amount_cents = row["transfer_amount_cents"]
     return InboxResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
+        **owned_fields(row),
         title=row["title"],
         description=row["description"],
         amount_cents=amount_cents,
         transaction_type=row["transaction_type"],
         date=row["date"],
-        account_id=str(row["account_id"]) if row["account_id"] else None,
-        category_id=str(row["category_id"]) if row["category_id"] else None,
+        account_id=opt_id(row["account_id"]),
+        category_id=opt_id(row["category_id"]),
         status=row["status"],
-        transfer_account_id=str(row["transfer_account_id"]) if row["transfer_account_id"] else None,
+        transfer_account_id=opt_id(row["transfer_account_id"]),
         transfer_amount_cents=transfer_amount_cents,
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        version=row["version"],
-        deleted_at=row["deleted_at"],
+        **audit_fields(row),
     ).model_dump(mode="json")

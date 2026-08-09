@@ -5,6 +5,7 @@ from typing import Any, Optional
 from pydantic import BaseModel
 
 from app.constants import ActivityAction
+from app.schemas import owned_fields
 
 
 class ActivityLogResponse(BaseModel):
@@ -30,8 +31,7 @@ def _parse_snapshot(value: Any) -> Any:
 
 def activity_from_row(row) -> dict:
     return ActivityLogResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
+        **owned_fields(row),
         resource_type=row["resource_type"],
         resource_id=str(row["resource_id"]),
         action=row["action"],

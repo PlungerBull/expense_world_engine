@@ -5,7 +5,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from app.constants import ReconciliationStatus
-from app.schemas import StrictModel
+from app.schemas import StrictModel, audit_fields, owned_fields
 from app.schemas.transactions import TransactionResponse
 
 
@@ -68,8 +68,7 @@ def reconciliation_from_row(row) -> dict:
     response with the figure silently missing.
     """
     return ReconciliationResponse(
-        id=str(row["id"]),
-        user_id=str(row["user_id"]),
+        **owned_fields(row),
         account_id=str(row["account_id"]),
         name=row["name"],
         date_start=row["date_start"],
@@ -78,10 +77,7 @@ def reconciliation_from_row(row) -> dict:
         beginning_balance_cents=row["beginning_balance_cents"],
         ending_balance_cents=row["ending_balance_cents"],
         difference_cents=row["difference_cents"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        version=row["version"],
-        deleted_at=row["deleted_at"],
+        **audit_fields(row),
     ).model_dump(mode="json")
 
 
