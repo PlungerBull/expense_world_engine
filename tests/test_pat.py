@@ -19,7 +19,6 @@ import pytest
 from jose import jwt
 
 from app import db
-from app.config import settings
 from app.deps import get_current_user
 from app.errors import AppError
 from app.helpers.auth_token import PAT_PREFIX, hash_pat

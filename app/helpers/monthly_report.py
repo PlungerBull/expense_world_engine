@@ -57,7 +57,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from app.constants import HOME_CURRENCY
+from app.constants import HOME_CURRENCY, TransactionSource
 from app.errors import settings_missing
 from app.helpers.validation import resolve_timezone
 from app.helpers.home_currency import (
@@ -197,7 +197,7 @@ async def compute_month_flow(
                         SELECT array_agg(th.hashtag_id::text ORDER BY th.hashtag_id::text)
                         FROM expense_transaction_hashtags th
                         WHERE th.transaction_id = t.id
-                          AND th.transaction_source = 1
+                          AND th.transaction_source = {int(TransactionSource.LEDGER)}
                           AND th.deleted_at IS NULL
                     ),
                     ARRAY[]::text[]

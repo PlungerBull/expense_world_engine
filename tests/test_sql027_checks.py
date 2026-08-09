@@ -8,7 +8,6 @@
     home-currency figure (the table is the sole source since sql/021). The
     fetch/backfill jobs also refuse it in _upsert_rate before the INSERT.
 """
-import uuid
 from datetime import date
 
 import asyncpg

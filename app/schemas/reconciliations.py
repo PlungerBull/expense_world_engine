@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from app.constants import ReconciliationStatus
 from app.schemas import StrictModel
 from app.schemas.transactions import TransactionResponse
 
@@ -38,7 +39,8 @@ class ReconciliationResponse(BaseModel):
     name: str
     date_start: Optional[datetime] = None
     date_end: Optional[datetime] = None
-    status: int
+    # DRAFT or COMPLETED; sql/025 CHECKs the column.
+    status: ReconciliationStatus
     # Native only. A reconciliation is scoped to ONE account, and the account
     # governs the currency — so there is nothing here to combine and nothing to
     # convert. The two `*_home_cents` fields that used to sit beside these were

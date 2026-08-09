@@ -56,6 +56,19 @@ class TransactionType(IntEnum):
     INFLOW = 2
 
 
+class TransactionSource(IntEnum):
+    """Which writer attached this hashtag junction row.
+
+    ``expense_transaction_hashtags.transaction_source`` — CHECK-locked by
+    sql/027 to exactly this one value. There is deliberately no ``INBOX = 2``
+    member: the value exists nowhere in code, and sql/027's header instructs
+    that the member and the widened CHECK ship *with* the inbox-hashtag
+    writer, never ahead of it — an admissible-but-unwritten value is how
+    half-copied conventions become load-bearing by accident.
+    """
+    LEDGER = 1
+
+
 class ActivityAction(IntEnum):
     CREATED = 1
     UPDATED = 2

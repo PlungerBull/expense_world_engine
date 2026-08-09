@@ -28,10 +28,10 @@ These rules apply to all mutable tables unless explicitly noted as an exception.
 |---|---|---|
 | `transaction_type` | `expense_transactions` | 1 = outflow (expense), 2 = inflow (income). **There is no value 3** — a transfer leg is an ordinary outflow or inflow, identified by `transfer_transaction_id` (`sql/020`). CHECK-enforced. |
 | `transaction_type` | `expense_transaction_inbox` | same enum, nullable (a draft may have no amount yet). CHECK-enforced with an explicit `IS NULL OR` arm. |
-| `status` | `expense_transaction_inbox` | 1 = pending, 2 = promoted, 3 = dismissed |
+| `status` | `expense_transaction_inbox` | 1 = pending, 2 = promoted. **There is no value 3** — a dismissed row is `status = 1` + `deleted_at` set (the status records how far the row got, `deleted_at` records that it left the inbox). CHECK-enforced (`sql/029`). |
 | `status` | `expense_reconciliations` | 1 = draft, 2 = completed. CHECK-enforced (`sql/025`). |
-| `transaction_source` | `expense_transaction_hashtags` | 1 = ledger attach path — the only value ever written; see the table's section |
-| `action` | `activity_log` | 1 = created, 2 = updated, 3 = deleted, 4 = restored |
+| `transaction_source` | `expense_transaction_hashtags` | 1 = ledger attach path — the only value ever written; see the table's section. CHECK-enforced (`sql/027`). |
+| `action` | `activity_log` | 1 = created, 2 = updated, 3 = deleted, 4 = restored. CHECK-enforced (`sql/029`). |
 
 ### Exceptions (no version / no deleted_at)
 
@@ -188,7 +188,7 @@ activity_log
   - resource_type    text, NOT NULL
                      — e.g. 'expense_transaction', 'expense_bank_account', 'expense_category'
   - resource_id      UUID, NOT NULL
-  - action           smallint, NOT NULL
+  - action           smallint, NOT NULL — CHECK (action IN (1, 2, 3, 4)), sql/029
                      — 1=created, 2=updated, 3=deleted, 4=restored
   - before_snapshot  jsonb, nullable
                      — full row state before the change. null on creates.
@@ -340,11 +340,14 @@ expense_transaction_inbox
   - date          timestamptz, nullable
   - account_id    UUID, nullable, FK → expense_bank_accounts
   - category_id   UUID, nullable, FK → expense_categories
-  - status        smallint, NOT NULL, default 1
-                  — 1=pending (active in inbox)
+  - status        smallint, NOT NULL, default 1 — CHECK (status IN (1, 2)), sql/029
+                  — 1=pending (active in inbox, or dismissed if deleted_at is set)
                   — 2=promoted (moved to ledger; row is soft-deleted)
-                  — 3=dismissed (rejected without promoting; row is soft-deleted)
-                  — status distinguishes why a row was soft-deleted
+                  — there is NO 3=dismissed value: a dismissed row is
+                    status=1 + deleted_at. status records how far the row
+                    got; deleted_at records that it left the inbox. (The
+                    phantom value 3 stood here undocumented-in-code until
+                    the sql/029 audit — nothing ever wrote it.)
   - transaction_type smallint, nullable
                   — 1=outflow, 2=inflow — same enum as expense_transactions, no value 3.
                   — inferred by the engine from the signed request amount_cents.

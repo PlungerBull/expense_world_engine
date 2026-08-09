@@ -4,13 +4,16 @@ from typing import Any, Optional
 
 from pydantic import BaseModel
 
+from app.constants import ActivityAction
+
 
 class ActivityLogResponse(BaseModel):
     id: str
     user_id: str
     resource_type: str
     resource_id: str
-    action: int
+    # created/updated/deleted/restored; sql/029 CHECKs the column.
+    action: ActivityAction
     before_snapshot: Optional[Any] = None
     after_snapshot: Optional[Any] = None
     changed_by: str

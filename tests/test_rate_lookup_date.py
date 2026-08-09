@@ -9,7 +9,6 @@ different days. One helper now owns the definition.
 No freezegun / datetime monkeypatching in this suite (test_rate_cache.py
 explains why), so these tests are deterministic without mocking the clock.
 """
-import uuid
 from datetime import datetime, timezone
 
 import pytest

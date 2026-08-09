@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel
 
+from app.constants import InboxStatus, TransactionType
 from app.schemas import StrictModel
 
 
@@ -63,14 +64,18 @@ class InboxResponse(BaseModel):
     # frozen before the draft even had a date — which is precisely how a $100
     # receipt used to promote as 100 PEN cents.
     amount_cents: Optional[int] = None
-    # 1 = outflow, 2 = inflow — of the PRIMARY leg (the inbox row itself) when
-    # this is a transfer draft. Nullable: a sparse draft with no amount yet has
-    # no direction. The sibling's direction is the inverse and is never stored.
-    transaction_type: Optional[int] = None
+    # Direction of the PRIMARY leg (the inbox row itself) when this is a
+    # transfer draft. Nullable: a sparse draft with no amount yet has no
+    # direction. The sibling's direction is the inverse and is never stored.
+    # Enum-typed like the ledger twin; sql/020 CHECKs the column (with an
+    # explicit IS NULL arm).
+    transaction_type: Optional[TransactionType] = None
     date: Optional[datetime] = None
     account_id: Optional[str] = None
     category_id: Optional[str] = None
-    status: int
+    # PENDING or PROMOTED — a dismissed row is PENDING + deleted_at, never a
+    # third value. sql/029 CHECKs the column.
+    status: InboxStatus
     transfer_account_id: Optional[str] = None
     transfer_amount_cents: Optional[int] = None  # always positive
     created_at: datetime

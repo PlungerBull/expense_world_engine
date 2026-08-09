@@ -62,9 +62,11 @@ class TransactionResponse(BaseModel):
     # Absent, not null: a permanently-null key on every transaction forever is
     # dead weight, and this is the documented exception to null-over-omission.
     amount_cents: int
-    # 1 = outflow, 2 = inflow. Direction, and nothing else — a transfer is
-    # identified by transfer_transaction_id, not by a third type value.
-    transaction_type: int
+    # Direction, and nothing else — a transfer is identified by
+    # transfer_transaction_id, not by a third type value. Typed with the enum
+    # (wire-identical plain int, OpenAPI documents the closed set); safe to
+    # fail a read loudly because sql/020 CHECKs the column.
+    transaction_type: TransactionType
     date: datetime
     account_id: str
     category_id: str

@@ -59,7 +59,7 @@ from typing import Optional
 
 import asyncpg
 
-from app.constants import ActivityAction, ReconciliationStatus
+from app.constants import ActivityAction, ReconciliationStatus, TransactionSource
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import (
@@ -123,11 +123,12 @@ async def _fetch_hashtag_ids_map(
         SELECT transaction_id, hashtag_id
         FROM expense_transaction_hashtags
         WHERE transaction_id = ANY($1::uuid[])
-          AND transaction_source = 1
+          AND transaction_source = $2
           AND deleted_at IS NULL
         ORDER BY transaction_id, hashtag_id
         """,
         transaction_ids,
+        int(TransactionSource.LEDGER),
     )
     result: dict[str, list[str]] = {str(tid): [] for tid in transaction_ids}
     for r in rows:
@@ -220,7 +221,7 @@ async def _cascade_junctions_delete(
         UPDATE expense_transaction_hashtags
         SET deleted_at = now(), updated_at = now()
         WHERE transaction_id = $1
-          AND transaction_source = 1
+          AND transaction_source = $4
           AND user_id = $2
           AND deleted_at IS NULL
           AND hashtag_id <> ALL($3::uuid[])
@@ -228,6 +229,7 @@ async def _cascade_junctions_delete(
         transaction_id,
         user_id,
         keep_hashtag_ids or [],
+        int(TransactionSource.LEDGER),
     )
 
 
@@ -247,12 +249,13 @@ async def _cascade_junctions_restore(
         """
         UPDATE expense_transaction_hashtags
         SET deleted_at = NULL, updated_at = now()
-        WHERE transaction_id = $1 AND transaction_source = 1
+        WHERE transaction_id = $1 AND transaction_source = $4
           AND user_id = $2 AND deleted_at = $3
         """,
         transaction_id,
         user_id,
         deleted_at_marker,
+        int(TransactionSource.LEDGER),
     )
 
 
@@ -266,7 +269,7 @@ async def _sync_hashtags(
 
     Replacement semantics, not delta semantics. The active set after this
     call equals ``hashtag_ids`` regardless of what was attached before.
-    Uses ``transaction_source = 1`` to identify ledger junction rows.
+    Uses ``TransactionSource.LEDGER`` to identify ledger junction rows.
 
     Implementation: a narrowed soft-delete drops only the rows *leaving*
     the active set, and an ``ON CONFLICT DO UPDATE`` upsert handles the
@@ -330,7 +333,7 @@ async def _sync_hashtags(
             """
             INSERT INTO expense_transaction_hashtags
                 (transaction_id, transaction_source, hashtag_id, user_id, created_at, updated_at)
-            SELECT $1, 1, hashtag_id, $2, now(), now()
+            SELECT $1, $4, hashtag_id, $2, now(), now()
             FROM unnest($3::uuid[]) AS hashtag_id
             ON CONFLICT (transaction_id, hashtag_id) DO UPDATE
             SET deleted_at = NULL,
@@ -340,6 +343,7 @@ async def _sync_hashtags(
             transaction_id,
             user_id,
             hashtag_ids,
+            int(TransactionSource.LEDGER),
         )
 
 
