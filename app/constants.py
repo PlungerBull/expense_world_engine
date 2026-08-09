@@ -16,6 +16,18 @@ from enum import Enum, IntEnum
 # ever reverted.
 HOME_CURRENCY = "PEN"
 
+# The canonical base of every stored exchange-rate row: rates are stored as
+# (base_currency=BASE_CURRENCY, target_currency=X, rate = units of X per 1 base
+# unit); direction math lives in helpers/exchange_rate.get_rate. sql/015 locks
+# the engine's currency set to {USD, PEN}, which is what makes interpolating
+# this into SQL literals safe (same argument as HOME_CURRENCY above). The
+# currency-lock docs say base and home must move together on any unlock —
+# naming both here is what makes that greppable. NOT every 'USD' literal is
+# this constant: helpers/home_currency's `a.currency_code = 'USD'` guard means
+# "the only supported non-home currency" and deliberately stays a literal (see
+# the fail-closed comment beside it).
+BASE_CURRENCY = "USD"
+
 
 class SystemCategoryKey(str, Enum):
     """Stable discriminator for engine-managed categories.

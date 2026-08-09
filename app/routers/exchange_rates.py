@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Query
 
 from app import db
+from app.constants import BASE_CURRENCY
 from app.deps import CurrentUser, Limit, Offset
 from app.errors import ERROR_RESPONSES, not_found, validation_error
 from app.helpers.exchange_rate import get_rate, rate_lookup_date
@@ -19,7 +20,7 @@ router = APIRouter(prefix="/exchange-rates", tags=["exchange-rates"], responses=
 async def get_exchange_rate(
     auth_user: CurrentUser,
     target: str = Query(..., min_length=3, max_length=3),
-    base: str = Query("USD", min_length=3, max_length=3),
+    base: str = Query(BASE_CURRENCY, min_length=3, max_length=3),
     date: Optional[date_type] = Query(None),
 ):
     base_upper = base.upper()

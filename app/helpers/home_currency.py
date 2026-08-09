@@ -161,7 +161,7 @@ remains unscheduled.
 """
 from textwrap import indent
 
-from app.constants import HOME_CURRENCY, TransactionType
+from app.constants import BASE_CURRENCY, HOME_CURRENCY, TransactionType
 
 # Table aliases the fragments below reference. Part of the contract — callers
 # and tests build their scaffold from these rather than hardcoding letters.
@@ -186,7 +186,7 @@ def home_rate_join(tz_placeholder: str) -> str:
     return f"""LEFT JOIN LATERAL (
     SELECT er.rate
     FROM exchange_rates er
-    WHERE er.base_currency   = 'USD'
+    WHERE er.base_currency   = '{BASE_CURRENCY}'
       AND er.target_currency = '{HOME_CURRENCY}'
       AND er.rate_date <= ({TXN_ALIAS}.date AT TIME ZONE {tz_placeholder})::date
     ORDER BY er.rate_date DESC

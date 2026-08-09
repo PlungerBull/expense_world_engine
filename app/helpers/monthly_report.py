@@ -57,7 +57,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
-from app.constants import TransactionSource
+from app.constants import SystemCategoryKey, TransactionSource
 from app.helpers.validation import resolve_timezone
 from app.helpers.home_currency import (
     SIGNED_HOME_CENTS_EXPR,
@@ -144,10 +144,11 @@ async def compute_month_flow(
         SELECT id, name, sort_order
         FROM expense_categories
         WHERE user_id = $1 AND deleted_at IS NULL
-          AND system_key IS DISTINCT FROM 'opening_balance'
+          AND system_key IS DISTINCT FROM $2
         ORDER BY sort_order ASC, name ASC
         """,
         user_id,
+        SystemCategoryKey.OPENING_BALANCE.value,
     )
 
     # The `a` and `r` aliases the fragments reference exist only inside this CTE,
@@ -182,7 +183,7 @@ async def compute_month_flow(
               AND NOT EXISTS (
                   SELECT 1 FROM expense_categories c
                   WHERE c.id = t.category_id
-                    AND c.system_key = 'opening_balance'
+                    AND c.system_key = '{SystemCategoryKey.OPENING_BALANCE.value}'
               )
         )
         SELECT
@@ -249,7 +250,7 @@ async def compute_month_flow(
               AND NOT EXISTS (
                   SELECT 1 FROM expense_categories c
                   WHERE c.id = t.category_id
-                    AND c.system_key = 'opening_balance'
+                    AND c.system_key = '{SystemCategoryKey.OPENING_BALANCE.value}'
               )
         )
         SELECT

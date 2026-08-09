@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from app.constants import BASE_CURRENCY
 from app.helpers.validation import resolve_timezone
 
 
@@ -81,11 +82,11 @@ async def _fetch_rate_from_db(
     if from_currency == to_currency:
         return (1.0, as_of)
 
-    if from_currency == "USD":
+    if from_currency == BASE_CURRENCY:
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT rate, rate_date FROM exchange_rates
-            WHERE base_currency = 'USD' AND target_currency = $1
+            WHERE base_currency = '{BASE_CURRENCY}' AND target_currency = $1
               AND rate_date <= $2
             ORDER BY rate_date DESC
             LIMIT 1
@@ -97,11 +98,11 @@ async def _fetch_rate_from_db(
             return None
         return (float(row["rate"]), row["rate_date"])
 
-    if to_currency == "USD":
+    if to_currency == BASE_CURRENCY:
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT rate, rate_date FROM exchange_rates
-            WHERE base_currency = 'USD' AND target_currency = $1
+            WHERE base_currency = '{BASE_CURRENCY}' AND target_currency = $1
               AND rate_date <= $2
             ORDER BY rate_date DESC
             LIMIT 1

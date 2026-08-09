@@ -23,12 +23,14 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Optional
 
 import asyncpg
 
 from app.config import settings
+from app.constants import BASE_CURRENCY
 
 CURRENCY_API_URL = (
     "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@{version}/v1/currencies/usd.min.json"
@@ -75,21 +77,41 @@ async def _create_pool_waiting_for_db() -> Optional[asyncpg.Pool]:
     return None
 
 
+@asynccontextmanager
+async def _job_conn(prefix: str):
+    """Pool lifecycle both jobs share: wait for postgres, acquire one
+    connection, close the pool on the way out (including early returns
+    inside the ``with``). Yields ``None`` when postgres never came up —
+    the caller prints nothing more and exits 1; the wait itself already
+    logged the failure with the job's own prefix.
+    """
+    pool = await _create_pool_waiting_for_db()
+    if pool is None:
+        print(f"[{prefix}] failed to create DB pool", file=sys.stderr)
+        yield None
+        return
+    try:
+        async with pool.acquire() as conn:
+            yield conn
+    finally:
+        await pool.close()
+
+
 async def _fetch_target_currencies(conn: asyncpg.Connection) -> list[str]:
     """Return every distinct non-USD currency currently referenced by the system."""
     rows = await conn.fetch(
-        """
+        f"""
         SELECT DISTINCT currency_code AS code
         FROM expense_bank_accounts
         WHERE deleted_at IS NULL
           AND is_archived = false
           AND currency_code IS NOT NULL
-          AND currency_code <> 'USD'
+          AND currency_code <> '{BASE_CURRENCY}'
         UNION
         SELECT DISTINCT main_currency AS code
         FROM user_settings
         WHERE main_currency IS NOT NULL
-          AND main_currency <> 'USD'
+          AND main_currency <> '{BASE_CURRENCY}'
         """
     )
     return sorted({row["code"] for row in rows})
@@ -131,9 +153,9 @@ async def _upsert_rate(
     if rate <= 0:
         raise ValueError(f"non-positive rate for USD->{target} on {rate_date}: {rate}")
     row = await conn.fetchrow(
-        """
+        f"""
         INSERT INTO exchange_rates (base_currency, target_currency, rate_date, rate)
-        VALUES ('USD', $1, $2, $3)
+        VALUES ('{BASE_CURRENCY}', $1, $2, $3)
         ON CONFLICT (base_currency, target_currency, rate_date) DO NOTHING
         RETURNING id
         """,
@@ -144,69 +166,84 @@ async def _upsert_rate(
     return row is not None
 
 
+async def _apply_rates(
+    conn: asyncpg.Connection,
+    targets: list[str],
+    rates: dict,
+    rate_date: date,
+) -> dict:
+    """Upsert one date's rates for every target; returns the structured tally
+    ``{"inserted": [target...], "skipped": [target...], "missing": [target...],
+    "failed": [(target, reason)...]}``.
+
+    The tally is lists, not counts, because the two callers label failures
+    differently — the daily fetch reports bare targets, the backfill prefixes
+    each with its date — and a helper that printed would flatten that
+    (bloat-audit §18). ``skipped`` means already-present (``ON CONFLICT DO
+    NOTHING`` hit); ``failed`` carries ``_upsert_rate``'s non-positive-rate
+    refusals, never aborts the rest of the targets.
+    """
+    tally: dict = {"inserted": [], "skipped": [], "missing": [], "failed": []}
+    for target in targets:
+        if target not in rates:
+            tally["missing"].append(target)
+            continue
+        try:
+            did_insert = await _upsert_rate(conn, target, rate_date, float(rates[target]))
+        except ValueError as exc:
+            tally["failed"].append((target, str(exc)))
+            continue
+        tally["inserted" if did_insert else "skipped"].append(target)
+    return tally
+
+
 async def run() -> int:
-    pool = await _create_pool_waiting_for_db()
-    if pool is None:
-        print("[fetch_exchange_rates] failed to create DB pool", file=sys.stderr)
-        return 1
+    async with _job_conn("fetch_exchange_rates") as conn:
+        if conn is None:
+            return 1
 
-    inserted = 0
-    skipped = 0
-    failed: list[str] = []
+        targets = await _fetch_target_currencies(conn)
+        if not targets:
+            print("[fetch_exchange_rates] no non-USD currencies in active use — nothing to do")
+            return 0
 
-    try:
-        async with pool.acquire() as conn:
-            targets = await _fetch_target_currencies(conn)
-            if not targets:
-                print("[fetch_exchange_rates] no non-USD currencies in active use — nothing to do")
-                return 0
+        print(f"[fetch_exchange_rates] fetching USD -> {targets}")
 
-            print(f"[fetch_exchange_rates] fetching USD -> {targets}")
+        try:
+            # to_thread, matching the backfill: _fetch_currency_api blocks on
+            # urllib and has no business pinning the event loop even when, as
+            # here, nothing else is scheduled on it.
+            resp = await asyncio.to_thread(_fetch_currency_api)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+            print(f"[fetch_exchange_rates] HTTP error: {exc}", file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"[fetch_exchange_rates] invalid JSON: {exc}", file=sys.stderr)
+            return 2
 
-            try:
-                resp = _fetch_currency_api()
-            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
-                print(f"[fetch_exchange_rates] HTTP error: {exc}", file=sys.stderr)
-                return 2
-            except json.JSONDecodeError as exc:
-                print(f"[fetch_exchange_rates] invalid JSON: {exc}", file=sys.stderr)
-                return 2
+        try:
+            rate_date = datetime.strptime(resp["date"], "%Y-%m-%d").date()
+            rates = resp["rates"]
+        except (KeyError, ValueError) as exc:
+            print(
+                f"[fetch_exchange_rates] malformed response: {exc} (payload={resp})",
+                file=sys.stderr,
+            )
+            return 2
 
-            try:
-                rate_date = datetime.strptime(resp["date"], "%Y-%m-%d").date()
-                rates = resp["rates"]
-            except (KeyError, ValueError) as exc:
-                print(
-                    f"[fetch_exchange_rates] malformed response: {exc} (payload={resp})",
-                    file=sys.stderr,
-                )
-                return 2
+        tally = await _apply_rates(conn, targets, rates, rate_date)
 
-            for target in targets:
-                if target not in rates:
-                    print(
-                        f"[fetch_exchange_rates] missing target {target} in response",
-                        file=sys.stderr,
-                    )
-                    failed.append(target)
-                    continue
+    for target in tally["missing"]:
+        print(f"[fetch_exchange_rates] missing target {target} in response", file=sys.stderr)
+    for _target, reason in tally["failed"]:
+        print(f"[fetch_exchange_rates] {reason}", file=sys.stderr)
+    for target in tally["inserted"]:
+        print(f"[fetch_exchange_rates] inserted USD->{target} {rate_date} = {rates[target]}")
 
-                try:
-                    did_insert = await _upsert_rate(conn, target, rate_date, float(rates[target]))
-                except ValueError as exc:
-                    print(f"[fetch_exchange_rates] {exc}", file=sys.stderr)
-                    failed.append(target)
-                    continue
-                if did_insert:
-                    inserted += 1
-                    print(f"[fetch_exchange_rates] inserted USD->{target} {rate_date} = {rates[target]}")
-                else:
-                    skipped += 1
-    finally:
-        await pool.close()
-
+    failed = tally["missing"] + [target for target, _reason in tally["failed"]]
     print(
-        f"[fetch_exchange_rates] done: inserted={inserted} skipped={skipped} failed={len(failed)}"
+        f"[fetch_exchange_rates] done: inserted={len(tally['inserted'])} "
+        f"skipped={len(tally['skipped'])} failed={len(failed)}"
     )
     if failed:
         print(f"[fetch_exchange_rates] failed targets: {', '.join(failed)}", file=sys.stderr)

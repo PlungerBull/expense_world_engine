@@ -52,11 +52,12 @@ from typing import Optional
 
 import asyncpg
 
+from app.constants import BASE_CURRENCY
 from app.jobs.fetch_exchange_rates import (
-    _create_pool_waiting_for_db,
+    _apply_rates,
     _fetch_currency_api,
     _fetch_target_currencies,
-    _upsert_rate,
+    _job_conn,
 )
 
 # Earliest date the provider's dated endpoint serves. See module docstring.
@@ -86,10 +87,10 @@ async def _existing_dates(
     second currency did not, the date still needs another pass.
     """
     rows = await conn.fetch(
-        """
+        f"""
         SELECT rate_date
         FROM exchange_rates
-        WHERE base_currency = 'USD'
+        WHERE base_currency = '{BASE_CURRENCY}'
           AND target_currency = ANY($1::text[])
           AND rate_date BETWEEN $2 AND $3
         GROUP BY rate_date
@@ -139,86 +140,78 @@ async def run(start: date, end: date, currencies: Optional[list[str]]) -> int:
         print(f"[backfill] --from {start} is after --to {end}", file=sys.stderr)
         return 2
 
-    pool = await _create_pool_waiting_for_db()
-    if pool is None:
-        print("[backfill] failed to create DB pool", file=sys.stderr)
-        return 1
-
     inserted = 0
     skipped_existing = 0
     missing_target: list[str] = []
     gaps: list[str] = []
     failed: list[str] = []
 
-    try:
-        async with pool.acquire() as conn:
-            targets = currencies or await _fetch_target_currencies(conn)
-            if not targets:
-                print("[backfill] no non-USD currencies in active use — nothing to do")
-                return 0
+    async with _job_conn("backfill") as conn:
+        if conn is None:
+            return 1
 
-            all_days = [
-                start + timedelta(days=offset) for offset in range((end - start).days + 1)
-            ]
-            done = await _existing_dates(conn, targets, start, end)
-            todo = [day for day in all_days if day not in done]
-            skipped_existing = len(all_days) - len(todo)
+        targets = currencies or await _fetch_target_currencies(conn)
+        if not targets:
+            print("[backfill] no non-USD currencies in active use — nothing to do")
+            return 0
 
-            print(
-                f"[backfill] USD -> {targets} | {start} .. {end} | "
-                f"{len(all_days)} dates, {skipped_existing} already present, "
-                f"{len(todo)} to fetch"
-            )
-            if not todo:
-                return 0
+        all_days = [
+            start + timedelta(days=offset) for offset in range((end - start).days + 1)
+        ]
+        done = await _existing_dates(conn, targets, start, end)
+        todo = [day for day in all_days if day not in done]
+        skipped_existing = len(all_days) - len(todo)
 
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
-            completed = 0
+        print(
+            f"[backfill] USD -> {targets} | {start} .. {end} | "
+            f"{len(all_days)} dates, {skipped_existing} already present, "
+            f"{len(todo)} to fetch"
+        )
+        if not todo:
+            return 0
 
-            async def fetch(day: date):
-                """Always resolves to (day, payload|None, error|None).
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+        completed = 0
 
-                Errors are returned rather than raised so the date stays bound
-                to its failure — raising out of the gather loses which date it
-                was, which makes a report of 'HTTP 404' useless for follow-up.
-                """
-                async with semaphore:
-                    try:
-                        return day, await _fetch_one_date(day), None
-                    except urllib.error.HTTPError as exc:
-                        return day, None, f"HTTP {exc.code}"
-                    except Exception as exc:  # noqa: BLE001 — reported, not swallowed
-                        return day, None, f"{type(exc).__name__}: {exc}"
+        async def fetch(day: date):
+            """Always resolves to (day, payload|None, error|None).
 
-            # Fetches overlap, but writes happen here in completion order on the
-            # single pooled connection — no concurrent use of one asyncpg
-            # connection, which is not safe.
-            for coro in asyncio.as_completed([fetch(day) for day in todo]):
-                day, payload, error = await coro
-                if error is not None:
-                    # A 404 is the provider stating it has no data for that day,
-                    # and re-running will never fix it. Kept separate from real
-                    # failures so a permanent hole in their dataset doesn't make
-                    # this job look broken forever.
-                    (gaps if error == "HTTP 404" else failed).append(f"{day} ({error})")
-                    continue
+            Errors are returned rather than raised so the date stays bound
+            to its failure — raising out of the gather loses which date it
+            was, which makes a report of 'HTTP 404' useless for follow-up.
+            """
+            async with semaphore:
+                try:
+                    return day, await _fetch_one_date(day), None
+                except urllib.error.HTTPError as exc:
+                    return day, None, f"HTTP {exc.code}"
+                except Exception as exc:  # noqa: BLE001 — reported, not swallowed
+                    return day, None, f"{type(exc).__name__}: {exc}"
 
-                rates = payload.get("rates", {})
-                for target in targets:
-                    if target not in rates:
-                        missing_target.append(f"{day} {target}")
-                        continue
-                    try:
-                        if await _upsert_rate(conn, target, day, float(rates[target])):
-                            inserted += 1
-                    except ValueError as exc:
-                        failed.append(f"{day} ({exc})")
+        # Fetches overlap, but writes happen here in completion order on the
+        # single pooled connection — no concurrent use of one asyncpg
+        # connection, which is not safe.
+        for coro in asyncio.as_completed([fetch(day) for day in todo]):
+            day, payload, error = await coro
+            if error is not None:
+                # A 404 is the provider stating it has no data for that day,
+                # and re-running will never fix it. Kept separate from real
+                # failures so a permanent hole in their dataset doesn't make
+                # this job look broken forever.
+                (gaps if error == "HTTP 404" else failed).append(f"{day} ({error})")
+                continue
 
-                completed += 1
-                if completed % PROGRESS_EVERY == 0:
-                    print(f"[backfill] {completed}/{len(todo)} dates fetched")
-    finally:
-        await pool.close()
+            tally = await _apply_rates(conn, targets, payload.get("rates", {}), day)
+            inserted += len(tally["inserted"])
+            # tally["skipped"] (already-present rows) is deliberately
+            # uncounted here — _existing_dates already reported whole done
+            # dates, and a partially-present date's re-inserts are the point.
+            missing_target.extend(f"{day} {target}" for target in tally["missing"])
+            failed.extend(f"{day} ({reason})" for _target, reason in tally["failed"])
+
+            completed += 1
+            if completed % PROGRESS_EVERY == 0:
+                print(f"[backfill] {completed}/{len(todo)} dates fetched")
 
     print(
         f"[backfill] done: inserted={inserted} already_present={skipped_existing} "
