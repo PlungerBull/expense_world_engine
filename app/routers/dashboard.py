@@ -120,18 +120,10 @@ async def get_dashboard(
             "When false (default), that field is returned as null."
         ),
     ),
-    debit_as_negative: bool = Query(
-        False,
-        description=(
-            "Accepted for API consistency with other read endpoints. Dashboard "
-            "aggregates are already signed by construction (per-category "
-            "spent_home_cents is positive for income and negative for expense; "
-            "totals return split positive inflow/outflow). The flag is a no-op."
-        ),
-    ),
 ):
-    # debit_as_negative is intentionally unused here — see docstring above.
-    del debit_as_negative
+    # No debit_as_negative here (removed 2026-08-08, bloat-audit §16): dashboard
+    # aggregates are already signed by construction, and FastAPI ignores unknown
+    # query params, so a caller still sending it is silently unaffected.
     async with db.pool.acquire() as conn:
         settings = await get_user_report_settings(conn, auth_user.id)
         year, month, start_utc, end_utc = compute_month_bounds(settings["display_timezone"])

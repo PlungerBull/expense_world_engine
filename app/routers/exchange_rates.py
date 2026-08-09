@@ -4,10 +4,10 @@ from typing import Optional
 from fastapi import APIRouter, Query
 
 from app import db
-from app.deps import CurrentUser
+from app.deps import CurrentUser, Limit, Offset
 from app.errors import ERROR_RESPONSES, not_found, validation_error
 from app.helpers.exchange_rate import get_rate, rate_lookup_date
-from app.helpers.pagination import paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
 from app.helpers.validation import currency_code_error
 from app.schemas.exchange_rates import ExchangeRateHistoryItem, ExchangeRateResponse
 from app.schemas.pagination import Paginated
@@ -75,8 +75,8 @@ async def get_exchange_rate(
 async def list_exchange_rate_history(
     auth_user: CurrentUser,
     date: Optional[date_type] = Query(None),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    limit: Limit = DEFAULT_LIMIT,
+    offset: Offset = 0,
 ):
     """List stored exchange-rate rows, newest first.
 

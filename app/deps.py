@@ -24,11 +24,12 @@ which records what has to be rebuilt and the three mistakes not to repeat.
 from dataclasses import dataclass
 from typing import Annotated, Optional
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Query
 
 from app import db
 from app.errors import unauthorized
 from app.helpers.auth_token import PAT_PREFIX, hash_pat
+from app.helpers.pagination import MAX_LIMIT
 
 
 @dataclass
@@ -65,3 +66,25 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[AuthUser, Depends(get_current_user)]
+
+
+# Shared request-parameter annotations. FastAPI forbids putting the default
+# inside Annotated ("Set the default value with `=` instead"), so each site
+# still writes it: `x_idempotency_key: IdempotencyKey = None`,
+# `limit: Limit = DEFAULT_LIMIT`, `offset: Offset = 0`.
+
+IdempotencyKey = Annotated[Optional[str], Header(alias="X-Idempotency-Key")]
+
+Limit = Annotated[int, Query(ge=1, le=MAX_LIMIT)]
+Offset = Annotated[int, Query(ge=0)]
+
+DebitAsNegative = Annotated[
+    bool,
+    Query(
+        description=(
+            "Caller-side display preference: when true, outflow amounts are "
+            "returned negative. Storage and default responses are always "
+            "positive; transaction_type carries direction."
+        )
+    ),
+]

@@ -11,6 +11,30 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-08 — no-op `debit_as_negative` removed from `/dashboard` and `/reports/monthly`
+
+**Engine change** (`routers/dashboard.py`, `routers/reports.py`; bloat-audit
+2026-08-06 §16, owner decision). The two aggregate read routes no longer
+declare the `debit_as_negative` query parameter. It was always a documented
+no-op there (their figures are signed by construction); the parameter existed
+only for surface uniformity.
+
+**What breaks:** nothing at runtime — FastAPI ignores unknown query
+parameters, so a client still sending the flag gets the same response as
+before. The break is contractual: the flag no longer appears in OpenAPI for
+these routes, and a client that *relied on it being documented as accepted*
+(none known; the CLI never sends it to either route) should drop it.
+
+**Client action:** none required. Remove the flag from any dashboard/report
+request for tidiness.
+
+### Engine references
+
+- `docs/engine-spec.md` — Base Conventions sign-convention paragraph + the
+  `/dashboard` section bullet
+- The five real `debit_as_negative` surfaces are unchanged and now share one
+  `DebitAsNegative` annotation (`app/deps.py`)
+
 ## 2026-08-08 — two validation `message` strings changed (bloat-audit Tier 2)
 
 **Engine change** (`helpers/validation.py` + `schemas/transactions.py`;

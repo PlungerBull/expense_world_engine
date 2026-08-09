@@ -6,12 +6,11 @@ isolated from the user/settings bootstrap flow. Both routers share the
 same /auth URL namespace.
 """
 
-from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter
 
-from app.deps import CurrentUser
+from app.deps import CurrentUser, IdempotencyKey
 from app.errors import ERROR_RESPONSES
 from app.helpers import pat as pat_service
 from app.helpers.idempotency import run_idempotent
@@ -24,7 +23,7 @@ router = APIRouter(prefix="/auth/pat", tags=["auth"], responses=ERROR_RESPONSES)
 async def create_pat(
     body: PatCreateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     # The caller must hold a valid PAT (the JWT branch was deleted
     # 2026-08-03 — PATs are the only credential). Policy decision, kept
@@ -50,7 +49,7 @@ async def create_pat(
 async def revoke_pat(
     pat_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,

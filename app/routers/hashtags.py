@@ -1,16 +1,15 @@
 """HTTP handlers for /hashtags — thin adapters over helpers.hashtags."""
 
-from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Query
 
 from app import db
-from app.deps import CurrentUser
+from app.deps import CurrentUser, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES
 from app.helpers import hashtags as hashtags_service
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
 from app.schemas.hashtags import (
@@ -28,8 +27,8 @@ router = APIRouter(prefix="/hashtags", tags=["hashtags"], responses=ERROR_RESPON
 async def list_hashtags(
     auth_user: CurrentUser,
     include_deleted: bool = Query(False),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    limit: Limit = DEFAULT_LIMIT,
+    offset: Offset = 0,
 ):
     async with db.pool.acquire() as conn:
         conditions = ["user_id = $1"]
@@ -64,7 +63,7 @@ async def list_hashtags(
 async def create_hashtag(
     body: HashtagCreateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -90,7 +89,7 @@ async def update_hashtag(
     hashtag_id: UUID,
     body: HashtagUpdateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     fields = extract_update_fields(body)
     return await run_idempotent(
@@ -107,7 +106,7 @@ async def update_hashtag(
 async def delete_hashtag(
     hashtag_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -123,7 +122,7 @@ async def delete_hashtag(
 async def restore_hashtag(
     hashtag_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,

@@ -3,16 +3,16 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Query
 
 from app import db
-from app.deps import CurrentUser
+from app.deps import CurrentUser, DebitAsNegative, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import reconciliations as reconciliations_service
 from app.helpers.formatting import apply_debit_as_negative
 from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
 from app.helpers.validation import extract_update_fields
 from app.schemas.pagination import Paginated
 from app.schemas.reconciliations import (
@@ -37,8 +37,8 @@ async def list_reconciliations(
     auth_user: CurrentUser,
     account_id: Optional[UUID] = Query(None),
     include_deleted: bool = Query(False),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    limit: Limit = DEFAULT_LIMIT,
+    offset: Offset = 0,
 ):
     async with db.pool.acquire() as conn:
         conditions = ["rec.user_id = $1"]
@@ -92,7 +92,7 @@ async def list_reconciliations(
 async def create_reconciliation(
     body: ReconciliationCreateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -119,9 +119,9 @@ async def create_reconciliation(
 async def get_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,
-    debit_as_negative: bool = Query(False),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    debit_as_negative: DebitAsNegative = False,
+    limit: Limit = DEFAULT_LIMIT,
+    offset: Offset = 0,
 ):
     async with db.pool.acquire() as conn:
         row = await reconciliations_service.fetch_reconciliation(
@@ -183,7 +183,7 @@ async def update_reconciliation(
     reconciliation_id: UUID,
     body: ReconciliationUpdateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     # date_start / date_end are legitimately nullable (user can clear a date
     # to "reopen" the range). All other fields reject null.
@@ -205,7 +205,7 @@ async def update_reconciliation(
 async def complete_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -224,7 +224,7 @@ async def complete_reconciliation(
 async def revert_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -243,7 +243,7 @@ async def revert_reconciliation(
 async def delete_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -262,7 +262,7 @@ async def delete_reconciliation(
 async def restore_reconciliation(
     reconciliation_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,

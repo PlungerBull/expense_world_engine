@@ -1,11 +1,9 @@
 """HTTP handlers for /auth — thin adapters over helpers.auth."""
 
-from typing import Optional
-
-from fastapi import APIRouter, Header
+from fastapi import APIRouter
 
 from app import db
-from app.deps import CurrentUser
+from app.deps import CurrentUser, IdempotencyKey
 from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import auth as auth_service
 from app.helpers.idempotency import run_idempotent
@@ -28,7 +26,7 @@ router = APIRouter(prefix="/auth", tags=["auth"], responses=ERROR_RESPONSES)
 async def bootstrap(
     body: BootstrapRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     # 200, not 201: /bootstrap has upsert semantics. First call inserts the
     # user + settings rows; subsequent calls update last_login_at on the
@@ -72,7 +70,7 @@ async def me(auth_user: CurrentUser):
 async def update_settings(
     body: SettingsUpdateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     fields = extract_update_fields(body)
     return await run_idempotent(
@@ -89,7 +87,7 @@ async def update_settings(
 async def update_profile(
     body: ProfileUpdateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     fields = extract_update_fields(body)
     return await run_idempotent(

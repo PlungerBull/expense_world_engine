@@ -1,18 +1,17 @@
 """HTTP handlers for /accounts — thin adapters over helpers.accounts."""
 
-from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Query
 
 from app import db
-from app.deps import CurrentUser
+from app.deps import CurrentUser, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES
 from app.helpers import accounts as accounts_service
 from app.helpers.account_balance import fetch_balance, fetch_balances
 from app.helpers.exchange_rate import batch_get_rates, rate_lookup_date
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
 from app.schemas.accounts import (
@@ -34,8 +33,8 @@ async def list_accounts(
     include_people: bool = Query(False),
     include_archived: bool = Query(False),
     include_deleted: bool = Query(False),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    limit: Limit = DEFAULT_LIMIT,
+    offset: Offset = 0,
 ):
     async with db.pool.acquire() as conn:
         conditions = ["user_id = $1"]
@@ -109,7 +108,7 @@ async def list_accounts(
 async def create_account(
     body: AccountCreateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -127,7 +126,7 @@ async def create_opening_balance(
     account_id: UUID,
     body: OpeningBalanceRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -158,7 +157,7 @@ async def update_account(
     account_id: UUID,
     body: AccountUpdateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     fields = extract_update_fields(body)
     return await run_idempotent(
@@ -175,7 +174,7 @@ async def update_account(
 async def delete_account(
     account_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -191,7 +190,7 @@ async def delete_account(
 async def restore_account(
     account_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -207,7 +206,7 @@ async def restore_account(
 async def archive_account(
     account_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -223,7 +222,7 @@ async def archive_account(
 async def unarchive_account(
     account_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,

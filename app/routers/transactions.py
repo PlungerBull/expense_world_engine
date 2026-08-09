@@ -9,15 +9,15 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Query
 
 from app import db
-from app.deps import CurrentUser
+from app.deps import CurrentUser, DebitAsNegative, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES
 from app.helpers import transactions as transactions_service
 from app.helpers.formatting import apply_debit_as_negative
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
 from app.schemas.pagination import Paginated
@@ -46,7 +46,7 @@ def _escape_like(term: str) -> str:
 async def get_transaction(
     transaction_id: UUID,
     auth_user: CurrentUser,
-    debit_as_negative: bool = Query(False),
+    debit_as_negative: DebitAsNegative = False,
 ):
     async with db.pool.acquire() as conn:
         row = await fetch_owned_row_or_404(
@@ -74,9 +74,9 @@ async def list_transactions(
     cleared: Optional[bool] = Query(None),
     search: Optional[str] = Query(None),
     include_deleted: bool = Query(False),
-    debit_as_negative: bool = Query(False),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    debit_as_negative: DebitAsNegative = False,
+    limit: Limit = DEFAULT_LIMIT,
+    offset: Offset = 0,
 ):
     async with db.pool.acquire() as conn:
         conditions = ["t.user_id = $1"]
@@ -158,7 +158,7 @@ async def list_transactions(
 async def create_transaction(
     body: TransactionCreateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -178,7 +178,7 @@ async def update_transaction(
     transaction_id: UUID,
     body: TransactionUpdateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     # Split out hashtag_ids and reconciliation_id — the helper receives
     # the rest as a mutable ``fields`` dict it can update in place.
@@ -213,7 +213,7 @@ async def update_transaction(
 async def delete_transaction(
     transaction_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -232,7 +232,7 @@ async def delete_transaction(
 async def restore_transaction(
     transaction_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -251,7 +251,7 @@ async def restore_transaction(
 async def batch_create_transactions(
     body: TransactionBatchRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,

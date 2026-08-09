@@ -4,19 +4,18 @@ GET endpoints (list + detail) stay here. Mutation endpoints (POST, PUT,
 DELETE, POST /promote) delegate to helpers.inbox.
 """
 
-from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Query
 
 from app import db
 from app.constants import InboxStatus
-from app.deps import CurrentUser
+from app.deps import CurrentUser, DebitAsNegative, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES
 from app.helpers import inbox as inbox_service
 from app.helpers.formatting import apply_debit_as_negative_inbox
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
 from app.schemas.inbox import (
     InboxCreateRequest,
@@ -40,9 +39,9 @@ async def list_inbox(
     ready: bool = Query(False),
     overdue: bool = Query(False),
     include_deleted: bool = Query(False),
-    debit_as_negative: bool = Query(False),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    debit_as_negative: DebitAsNegative = False,
+    limit: Limit = DEFAULT_LIMIT,
+    offset: Offset = 0,
 ):
     async with db.pool.acquire() as conn:
         conditions = ["i.user_id = $1", "i.status = $2"]
@@ -134,7 +133,7 @@ async def list_inbox(
 async def create_inbox_item(
     body: InboxCreateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -153,7 +152,7 @@ async def create_inbox_item(
 async def get_inbox_item(
     inbox_id: UUID,
     auth_user: CurrentUser,
-    debit_as_negative: bool = Query(False),
+    debit_as_negative: DebitAsNegative = False,
 ):
     async with db.pool.acquire() as conn:
         row = await fetch_owned_row_or_404(
@@ -173,7 +172,7 @@ async def update_inbox_item(
     inbox_id: UUID,
     body: InboxUpdateRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -192,7 +191,7 @@ async def update_inbox_item(
 async def delete_inbox_item(
     inbox_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -211,7 +210,7 @@ async def delete_inbox_item(
 async def restore_inbox_item(
     inbox_id: UUID,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
@@ -232,7 +231,7 @@ async def promote_inbox_item(
     inbox_id: UUID,
     body: InboxPromoteRequest,
     auth_user: CurrentUser,
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_idempotency_key: IdempotencyKey = None,
 ):
     return await run_idempotent(
         auth_user.id,
