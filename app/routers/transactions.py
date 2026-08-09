@@ -17,7 +17,7 @@ from app.errors import ERROR_RESPONSES
 from app.helpers import transactions as transactions_service
 from app.helpers.formatting import apply_debit_as_negative
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
 from app.schemas.pagination import Paginated
@@ -125,22 +125,15 @@ async def list_transactions(
                 f"OR t.description ILIKE ${len(params)} ESCAPE '\\')"
             )
 
-        where = " AND ".join(conditions)
-
-        total = await conn.fetchval(
-            f"SELECT count(*) FROM expense_transactions t WHERE {where}", *params
-        )
-
-        rows = await conn.fetch(
-            f"""
-            SELECT t.* FROM expense_transactions t
-            WHERE {where}
-            ORDER BY t.date DESC, t.created_at DESC
-            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
-            """,
-            *params,
-            limit,
-            offset,
+        rows, total = await list_page(
+            conn,
+            from_sql="expense_transactions t",
+            conditions=conditions,
+            params=params,
+            order_by="t.date DESC, t.created_at DESC",
+            limit=limit,
+            offset=offset,
+            select="t.*",
         )
 
         data = [transaction_from_row(row) for row in rows]

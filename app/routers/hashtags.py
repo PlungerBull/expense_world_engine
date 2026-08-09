@@ -9,7 +9,7 @@ from app.deps import CurrentUser, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES
 from app.helpers import hashtags as hashtags_service
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
 from app.schemas.hashtags import (
@@ -37,22 +37,14 @@ async def list_hashtags(
         if not include_deleted:
             conditions.append("deleted_at IS NULL")
 
-        where = " AND ".join(conditions)
-
-        total = await conn.fetchval(
-            f"SELECT count(*) FROM expense_hashtags WHERE {where}", *params
-        )
-
-        rows = await conn.fetch(
-            f"""
-            SELECT * FROM expense_hashtags
-            WHERE {where}
-            ORDER BY sort_order ASC, created_at ASC
-            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
-            """,
-            *params,
-            limit,
-            offset,
+        rows, total = await list_page(
+            conn,
+            from_sql="expense_hashtags",
+            conditions=conditions,
+            params=params,
+            order_by="sort_order ASC, created_at ASC",
+            limit=limit,
+            offset=offset,
         )
 
         data = [hashtag_from_row(row) for row in rows]

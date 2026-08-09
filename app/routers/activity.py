@@ -6,7 +6,7 @@ from fastapi import APIRouter, Query
 from app import db
 from app.deps import CurrentUser, Limit, Offset
 from app.errors import ERROR_RESPONSES
-from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.schemas.activity import ActivityLogResponse, activity_from_row
 from app.schemas.pagination import Paginated
 
@@ -26,32 +26,26 @@ async def list_activity(
     params: list = [auth_user.id]
 
     if resource_type is not None:
-        conditions.append(f"resource_type = ${len(params) + 1}")
         params.append(resource_type)
+        conditions.append(f"resource_type = ${len(params)}")
 
     if resource_id is not None:
-        conditions.append(f"resource_id = ${len(params) + 1}")
         params.append(resource_id)
-
-    where = " AND ".join(conditions)
+        conditions.append(f"resource_id = ${len(params)}")
 
     async with db.pool.acquire() as conn:
-        total = await conn.fetchval(
-            f"SELECT count(*) FROM activity_log WHERE {where}", *params
-        )
-
-        rows = await conn.fetch(
-            f"""
-            SELECT id, user_id, resource_type, resource_id, action,
-                   before_snapshot, after_snapshot, changed_by, created_at
-            FROM activity_log
-            WHERE {where}
-            ORDER BY created_at DESC
-            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
-            """,
-            *params,
-            limit,
-            offset,
+        rows, total = await list_page(
+            conn,
+            from_sql="activity_log",
+            conditions=conditions,
+            params=params,
+            order_by="created_at DESC",
+            limit=limit,
+            offset=offset,
+            select=(
+                "id, user_id, resource_type, resource_id, action, "
+                "before_snapshot, after_snapshot, changed_by, created_at"
+            ),
         )
 
         data = [activity_from_row(row) for row in rows]

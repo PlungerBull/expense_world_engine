@@ -85,12 +85,16 @@ async def list_exchange_rate_history(
     not an error. UNIQUE (base_currency, target_currency, rate_date)
     guarantees one row per pair per day, so no server-side dedup is needed.
     """
+    # Deliberate `list_page` non-adopter (bloat-audit §12): exchange_rates is
+    # the one all-users table, so this list has no user_id predicate and its
+    # WHERE may be empty — both things the helper refuses by design (its
+    # non-empty-conditions check is what backs the tenant-predicate rule).
     conditions = []
     params: list = []
 
     if date is not None:
-        conditions.append(f"rate_date = ${len(params) + 1}")
         params.append(date)
+        conditions.append(f"rate_date = ${len(params)}")
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 

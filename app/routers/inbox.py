@@ -15,7 +15,7 @@ from app.errors import ERROR_RESPONSES
 from app.helpers import inbox as inbox_service
 from app.helpers.formatting import apply_debit_as_negative_inbox
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
 from app.schemas.inbox import (
     InboxCreateRequest,
@@ -102,22 +102,15 @@ async def list_inbox(
             conditions.append("i.date IS NOT NULL")
             conditions.append("i.date < now()")
 
-        where = " AND ".join(conditions)
-
-        total = await conn.fetchval(
-            f"SELECT count(*) FROM expense_transaction_inbox i WHERE {where}", *params
-        )
-
-        rows = await conn.fetch(
-            f"""
-            SELECT i.* FROM expense_transaction_inbox i
-            WHERE {where}
-            ORDER BY i.created_at DESC
-            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
-            """,
-            *params,
-            limit,
-            offset,
+        rows, total = await list_page(
+            conn,
+            from_sql="expense_transaction_inbox i",
+            conditions=conditions,
+            params=params,
+            order_by="i.created_at DESC",
+            limit=limit,
+            offset=offset,
+            select="i.*",
         )
 
         data = [inbox_from_row(row) for row in rows]

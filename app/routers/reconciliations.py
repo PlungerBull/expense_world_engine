@@ -12,7 +12,7 @@ from app.helpers import reconciliations as reconciliations_service
 from app.helpers.formatting import apply_debit_as_negative
 from app.helpers.transactions import attach_hashtag_ids
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.helpers.validation import extract_update_fields
 from app.schemas.pagination import Paginated
 from app.schemas.reconciliations import (
@@ -50,6 +50,11 @@ async def list_reconciliations(
             params.append(account_id)
             conditions.append(f"rec.account_id = ${len(params)}")
 
+        # Deliberate `list_page` non-adopter (bloat-audit §12): the page SELECT
+        # is RECONCILIATION_SELECT, which carries its own FROM plus the
+        # difference_cents correlated subquery, while the count deliberately
+        # uses this cheaper FROM that skips it. The helper's independent
+        # from_sql/select knobs can't express that split.
         where = " AND ".join(conditions)
 
         total = await conn.fetchval(
@@ -130,26 +135,18 @@ async def get_reconciliation(
         if row is None:
             raise not_found("reconciliation")
 
-        transactions_total = await conn.fetchval(
-            """
-            SELECT count(*) FROM expense_transactions
-            WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
-            """,
-            reconciliation_id,
-            auth_user.id,
-        )
-
-        txn_rows = await conn.fetch(
-            """
-            SELECT * FROM expense_transactions
-            WHERE reconciliation_id = $1 AND user_id = $2 AND deleted_at IS NULL
-            ORDER BY date DESC, created_at DESC
-            LIMIT $3 OFFSET $4
-            """,
-            reconciliation_id,
-            auth_user.id,
-            limit,
-            offset,
+        txn_rows, transactions_total = await list_page(
+            conn,
+            from_sql="expense_transactions",
+            conditions=[
+                "reconciliation_id = $1",
+                "user_id = $2",
+                "deleted_at IS NULL",
+            ],
+            params=[reconciliation_id, auth_user.id],
+            order_by="date DESC, created_at DESC",
+            limit=limit,
+            offset=offset,
         )
 
         recon = reconciliation_from_row(row)

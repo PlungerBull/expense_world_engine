@@ -11,7 +11,7 @@ from app.helpers import accounts as accounts_service
 from app.helpers.account_balance import fetch_balance, fetch_balances
 from app.helpers.exchange_rate import batch_get_rates, rate_lookup_date
 from app.helpers.idempotency import run_idempotent
-from app.helpers.pagination import DEFAULT_LIMIT, paginated_response
+from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
 from app.helpers.validation import extract_update_fields
 from app.schemas.accounts import (
@@ -47,22 +47,14 @@ async def list_accounts(
         if not include_archived:
             conditions.append("is_archived = false")
 
-        where = " AND ".join(conditions)
-
-        total = await conn.fetchval(
-            f"SELECT count(*) FROM expense_bank_accounts WHERE {where}", *params
-        )
-
-        rows = await conn.fetch(
-            f"""
-            SELECT * FROM expense_bank_accounts
-            WHERE {where}
-            ORDER BY sort_order ASC, created_at ASC
-            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
-            """,
-            *params,
-            limit,
-            offset,
+        rows, total = await list_page(
+            conn,
+            from_sql="expense_bank_accounts",
+            conditions=conditions,
+            params=params,
+            order_by="sort_order ASC, created_at ASC",
+            limit=limit,
+            offset=offset,
         )
 
         # Batch home-balance conversion. Previously each account in this loop
