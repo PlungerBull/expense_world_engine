@@ -68,10 +68,13 @@ panel) are **kept**; `POST /people` ships later as its own item.
 
 ### Engine references
 
-- `tests/test_request_strictness.py`, `tests/test_uuid_body_fields.py`
-  (updated), new pins in the C3 removal commit
+- `tests/test_transfer_removal.py` (the new fail-closed pins);
+  `tests/test_request_strictness.py`, `tests/test_uuid_body_fields.py` (updated)
 - `docs/engine-spec.md` — "Moves between accounts" convention;
-  `docs/currency-model-decision.md` — 2026-08-10 amendment; `sql/030`
+  `docs/currency-model-decision.md` — 2026-08-10 amendment
+- Landed 2026-08-11: code in `89bd30c`, migration `sql/030` in `316ef7d`
+  (applied to the live DB the same day); the engine has been serving the
+  new contract since.
 
 ## 2026-08-08 — account routes 422 `SETTINGS_MISSING` when settings are absent (was: silent null home balances)
 
