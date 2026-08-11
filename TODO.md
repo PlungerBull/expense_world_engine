@@ -2,25 +2,7 @@
 
 Operational / deployment tasks, plus accepted design changes awaiting scheduling — work that is not part of normal code review. Each entry describes what needs to happen, why, and when it becomes blocking. **Delete an entry when it closes — git history holds the record; do not keep tombstones here.**
 
-The open items, in execution order: the transfer removal, the bug burn-down, the People API, and the inbox-hashtags feature.
-
----
-
-## Remove the transfer feature — decided 2026-08-10, execute FIRST
-
-**Owner decision 2026-08-10: delete auto-paired transfers** — the one-request convenience where a single line with a `transfer` field makes the engine auto-register the opposite leg in the counterparty account. Overly convoluted for current use. Moving money between accounts is recorded from now on as **two ordinary rows** (one outflow, one inflow), categorized with **ordinary user categories** — the owner accepts that monthly inflow/outflow totals will include account-to-account moves.
-
-The live ledger holds **zero transfer legs, zero inbox transfer drafts** (verified 2026-08-10), so this is pure code+schema deletion — no data migration, and the window is only this cheap until real transfers get recorded.
-
-Scope:
-
-- **Delete the pairing machinery:** `helpers/transfers.py`, the `transfer` request field (`TransferField`/`InboxTransferField` schemas), the `transfer_transaction_id` column, the sibling delete/restore machinery (`_delete_leg`/`_restore_leg` and the per-leg warnings), `ALLOWED_ON_TRANSFER_LEG`, the opposite-sign guard (`opposite_signs`/`MSG_OPPOSITE_SIGN`), the inbox transfer columns (`sql/019`) and their coherence CHECK (`sql/020`) — all via a `sql/030` migration.
-- **Delete the `@Transfer` and `@Debt` system categories** (owner decision 2026-08-10 — no built-in "this is a move" marker). `RESERVED_CATEGORY_NAMES` shrinks to `@Opening`; opening balances are untouched.
-- **Keep `is_person` and every person read surface** (`?include_people`, the dashboard `people` panel, the opening-balance guard). The person feature stays — money to/from a person is ordinary rows against a person account, whose balance is the debt. The missing entry point ships separately (next section).
-- **Docs to update when it lands:** `engine-spec.md` (transfer sections), `schema-reference.md`, `currency-model-decision.md` (the "`@Transfer` ≠ 0" model), CLAUDE.md's sign-convention transfer bullets, and a `client-breaking-changes.md` entry (the CLI has transfer commands).
-- **Re-scopes the burn-down below** — update the `open-bugs.md` rows as part of landing this: 6.7 shrinks to guarding `@Opening` only, 8.2 to the batch path only, 7.1 loses the inbox transfer-field surface, 7.4-r shrinks with the reserved set.
-
-**Why first:** fixing 6.7/8.2/7.1 before this means fixing code and categories about to be deleted.
+The open items, in execution order: the bug burn-down, the People API, and the inbox-hashtags feature. *(The transfer removal that preceded them landed 2026-08-11 — `sql/030`, commits `05b5eb8`…`316ef7d`.)*
 
 ---
 
@@ -28,10 +10,10 @@ Scope:
 
 The 2026-08-07 verification audit confirmed every previously closed bug is genuinely fixed (each pinned by a test) and these are what remain. **Detail lives only in [docs/open-bugs.md](docs/open-bugs.md)** — this entry is the schedule, not a second copy; delete a line here when its row leaves that file.
 
-1. **6.7** — system categories accepted on ordinary transactions (three boundary call sites: create, update, batch). *(Its pair 6.6 — UUID-valued body fields — closed 2026-08-08 with bloat-audit Tier 3: malformed body FKs now 422.)*
-2. **7.1** — inbox writes do no referential/ownership validation (narrowed 2026-08-08: malformed ids now 422 via 6.6; what remains is well-formed-but-nonexistent/deleted/cross-tenant ids).
+1. **6.7** — `@Opening` accepted on ordinary transactions (three boundary call sites: create, update, batch; re-scoped 2026-08-11 — the transfer removal deleted the other two system categories).
+2. **7.1** — inbox writes do no referential/ownership validation (narrowed 2026-08-08: malformed ids now 422 via 6.6; and 2026-08-11: the transfer-field surface is gone; what remains is well-formed-but-nonexistent/deleted/cross-tenant `account_id`/`category_id`).
 3. **5.5** — the three reconciliation state-machine gaps *(was four; the sibling delete warning closed 2026-08-08 with bloat-audit Tier 2 §6)*.
-4. **8.2** — batch/transfer CREATE snapshots log `hashtag_ids: []`.
+4. **8.2** — batch CREATE snapshots log `hashtag_ids: []` *(the transfer path's copy left with the feature, 2026-08-11)*.
 5. **1.7 remainder** — dedicated FX-hygiene pass: rate plausibility vs prior day, negative-lookup cache TTL, archived-account currencies in the fetch list, `Decimal`/`ROUND_HALF_UP`.
 6. **Four ⚪ lows** — `restore_category` skips the reserved-name check (7.4-r); `?hashtag_id=` filter lacks `transaction_source = 1` (hashtag-filter — or fold into the inbox-hashtags feature below, whichever ships first); inbox titles stored verbatim, whitespace-only can promote (inbox-title, found 2026-08-08 — fix wants an owner call on 422-vs-NULL); `color or` collapses an explicit empty string to the default (account-color, found 2026-08-08 — needs a reject-vs-store decision).
 
@@ -39,13 +21,13 @@ The 2026-08-07 verification audit confirmed every previously closed bug is genui
 
 ---
 
-## People API — build `POST /people` — decided 2026-08-10, ships after the transfer removal
+## People API — build `POST /people` — decided 2026-08-10, ships after the bug burn-down
 
 The parked question is resolved: **keep the person feature, build the entry point.** With auto-paired transfers gone, a person account is just an account you register ordinary rows against — its balance *is* the debt. What's missing is unchanged: **no endpoint can set `is_person`** (the INSERT in `app/helpers/accounts.py` omits the column; `AccountCreateRequest` rejects the field), so the `people` dashboard panel and `?include_people` remain dead surfaces until this ships.
 
 Shape is already decided (spec §People sketch + decision D7 in [docs/open-bugs.md](docs/open-bugs.md)): explicit creation only — `POST /people`, never auto-created as a side effect of anything.
 
-**When it becomes blocking:** the first time the owner wants to track a debt. Sequenced after the transfer removal (which deletes the `@Debt` auto-branch this replaces) and the bug burn-down.
+**When it becomes blocking:** the first time the owner wants to track a debt. Sequenced after the bug burn-down. (The transfer removal landed 2026-08-11, deleting the `@Debt` auto-branch this replaces.)
 
 ---
 
