@@ -25,6 +25,10 @@ from app.errors import validation_error
 # helpers and every collect-all-errors flow (it was retyped 12× before).
 MSG_ACTIVE_ACCOUNT = "Must reference an active, non-archived account."
 MSG_ACTIVE_CATEGORY = "Must reference an active category."
+# System categories (@Opening) are engine-assigned only. Public writes that
+# name one get this; the engine's own path (create_opening_balance →
+# create_transaction(allow_system_category=True)) is the sole exemption.
+MSG_USER_CATEGORY = "Must not reference a system category."
 
 # Field messages for the small re-typed predicates (bloat-audit Tier 2 §10).
 # The collect-all-errors flows set ``errors[field] = MSG_*`` themselves;
@@ -260,20 +264,25 @@ async def active_category_ids(
     conn: asyncpg.Connection,
     category_ids: Iterable[str],
     user_id: str,
-) -> set[str]:
-    """Vectorised twin of ``active_category_row`` for batch flows."""
+) -> dict[str, bool]:
+    """Vectorised twin of ``active_category_row`` for batch flows.
+
+    Returns ``{id: is_system}`` for the active, tenant-scoped subset —
+    membership answers "active?", the value answers "system?" (batch flows
+    must reject system categories like the single-row paths do, bug 6.7).
+    """
     ids = list(category_ids)
     if not ids:
-        return set()
+        return {}
     rows = await conn.fetch(
         """
-        SELECT id FROM expense_categories
+        SELECT id, is_system FROM expense_categories
         WHERE id = ANY($1::uuid[]) AND user_id = $2 AND deleted_at IS NULL
         """,
         ids,
         user_id,
     )
-    return {str(r["id"]) for r in rows}
+    return {str(r["id"]): r["is_system"] for r in rows}
 
 
 async def validate_active_category(

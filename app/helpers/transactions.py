@@ -64,6 +64,7 @@ from app.helpers.validation import (
     MSG_NOT_EMPTY,
     MSG_NOT_FUTURE,
     MSG_NOT_ZERO,
+    MSG_USER_CATEGORY,
     active_account_ids,
     active_account_row,
     active_category_ids,
@@ -397,12 +398,20 @@ async def create_transaction(
     conn: asyncpg.Connection,
     user_id: str,
     body: TransactionCreateRequest,
+    *,
+    allow_system_category: bool = False,
 ) -> dict:
     """Create a transaction in the ledger.
 
     Validates account/category existence, infers ``transaction_type`` from
     the sign of ``amount_cents``, inserts the row, syncs hashtags, and
     writes an activity log entry.
+
+    ``allow_system_category`` is the boundary-vs-internal switch (bug 6.7):
+    public callers keep the default and cannot file a row under @Opening —
+    such a row would move the balance while vanishing from every flow
+    report. ``create_opening_balance`` is the one ``True`` caller; it is
+    the engine assigning the system category to itself.
 
     **No currency work happens here.** The row is stored in its account's own
     currency and converted at read time (helpers/home_currency.py). Recording
@@ -436,7 +445,12 @@ async def create_transaction(
     # failed.") instead of the previous "Transaction validation failed."
     # The field-level error remains the authoritative signal for clients.
     await validate_active_account(conn, body.account_id, user_id)
-    await validate_active_category(conn, body.category_id, user_id)
+    category = await validate_active_category(conn, body.category_id, user_id)
+    if not allow_system_category and category["is_system"]:
+        raise validation_error(
+            "Category validation failed.",
+            {"category_id": MSG_USER_CATEGORY},
+        )
 
     # Infer transaction_type and normalize amount to positive storage form
     transaction_type = infer_transaction_type(body.amount_cents)
@@ -599,9 +613,18 @@ async def update_transaction(
     if "account_id" in fields:
         await validate_active_account(conn, fields["account_id"], user_id)
 
-    # Validate new category_id if changing
+    # Validate new category_id if changing. Unconditional system-category
+    # rejection: unlike create, no internal path updates a row into
+    # @Opening, so there is no opt-in here (bug 6.7).
     if "category_id" in fields:
-        await validate_active_category(conn, fields["category_id"], user_id)
+        category = await validate_active_category(
+            conn, fields["category_id"], user_id
+        )
+        if category["is_system"]:
+            raise validation_error(
+                "Category validation failed.",
+                {"category_id": MSG_USER_CATEGORY},
+            )
 
     # Validate title if changing
     if "title" in fields:
@@ -930,12 +953,16 @@ async def create_batch(
             item_errors["date"] = MSG_NOT_FUTURE
 
         # str(): item FKs are uuid.UUID since open-bugs 6.6 closed, and the
-        # valid_* sets hold strings.
+        # valid_* collections are keyed by strings.
         if str(item.account_id) not in valid_account_ids:
             item_errors["account_id"] = MSG_ACTIVE_ACCOUNT
 
+        # Membership = active; value = is_system. Batch has no internal
+        # caller, so the system rejection is unconditional (bug 6.7).
         if str(item.category_id) not in valid_category_ids:
             item_errors["category_id"] = MSG_ACTIVE_CATEGORY
+        elif valid_category_ids[str(item.category_id)]:
+            item_errors["category_id"] = MSG_USER_CATEGORY
 
         item_id_str = str(item.id)
         if item_id_str in seen_ids:

@@ -397,7 +397,7 @@ Promotes a ready inbox item to the ledger.
 - `amount_cents` is present and not zero
 - `date` is present and `≤ now()`
 - `account_id` is present and references an active, non-archived account
-- `category_id` is present and references an active category
+- `category_id` is present and references an active, **non-system** category — promotion inserts the ledger row directly (not via the transaction-create path), so it carries its own copy of the system-category boundary; a draft pointing at `@Opening` returns `422` here and is excluded from `?ready=true` (the two definitions of "ready" must agree)
 
 If any condition fails, returns `422` with **all** the failing fields, not just the first. (One edge check sits outside the accumulation and surfaces on its own: a row with an amount but a null `transaction_type` — out-of-band data only, unreachable through the API.)
 
@@ -443,6 +443,8 @@ Creates a transaction directly in the ledger, bypassing the inbox. Used by the C
 **Optional:** `description`, `cleared`, `hashtag_ids`
 **Forbidden:** any unknown field → `422 VALIDATION_ERROR` (`extra="forbid"`). This is what makes the removal of `exchange_rate` (`sql/021`) — and of `transfer` (2026-08-10) — visible to a caller still sending it — the engine no longer implements what the field asks for, and a caller who believes the value matters deserves to be told it does not.
 
+**System categories:** `category_id` must reference an active **user** category. A system category (`is_system = true` — `@Opening`) is engine-assigned only (see `docs/currency-model-decision.md`): naming one returns `422` with `fields: {"category_id": "Must not reference a system category."}`. The only path that files under `@Opening` is `POST /accounts/{id}/opening-balance`, which opts in internally (`create_transaction(allow_system_category=True)`).
+
 Returns `409 CONFLICT` if `id` already exists. No rate lookup, no conversion, no balance write — recording the row is the whole of the write.
 
 **On success (atomic):**
@@ -455,7 +457,7 @@ Partial update.
 
 **Updatable fields:** `title`, `amount_cents`, `date`, `account_id`, `category_id`, `description`, `cleared`, `hashtag_ids`, `reconciliation_id`. Every field is optional; omitted fields are left untouched. An empty body is a no-op that returns current state (no version bump, no activity entry). Unknown fields 422 (`extra="forbid"`). Explicit `null` is rejected with `422` `"Must not be null."` on every field **except** `reconciliation_id`, where `null` means unassign (see below) — clearing `description` or `cleared` via null is not supported.
 
-The same value rules as `POST` apply: `amount_cents` must be non-zero, `title` non-empty after trim, `date` not in the future, `account_id` active and non-archived, `category_id` active, every `hashtag_ids` entry active.
+The same value rules as `POST` apply: `amount_cents` must be non-zero, `title` non-empty after trim, `date` not in the future, `account_id` active and non-archived, `category_id` active **and not a system category** (moving an ordinary row *into* `@Opening` is the same `422` as on create; there is no internal caller here, so the rejection is unconditional), every `hashtag_ids` entry active.
 
 **Reconciliation assignment:** `reconciliation_id` on this endpoint is the **only** way a transaction is assigned to or removed from a reconciliation batch — see *Assigning transactions* under Reconciliations below for the full rules.
 
@@ -495,7 +497,7 @@ This is intentionally asymmetric to `restore_reconciliation` (which never re-lin
 ### `POST /transactions/batch`
 Batch create. Array of transaction objects, processed as a single database transaction — all succeed or all fail.
 
-Every item in the batch must carry its own client-supplied `id`. Duplicate ids within a single batch are rejected up front with `422 VALIDATION_ERROR` (`fields.items[i].id = "Duplicate id within batch."`).
+Every item in the batch must carry its own client-supplied `id`. Duplicate ids within a single batch are rejected up front with `422 VALIDATION_ERROR` (`fields.items[i].id = "Duplicate id within batch."`). Per-item category rules match single create, including the system-category rejection (`fields.items[i].category_id = "Must not reference a system category."`).
 
 **Use cases:** Bulk historical entry. CSV import is a later phase — when implemented, it will also use this endpoint.
 
@@ -665,7 +667,7 @@ Returns the current calendar month overview. Single endpoint, one call, everythi
 - **Aggregates are home-currency ONLY** — `spent_home_cents`, never a native `spent_cents`. `GROUP BY category_id` has no currency partition, so a category holding $15 and S/25 has no native total: `4000` would be a number in no currency at all. The only correct cross-account figures are converted ones (`CLAUDE.md`, Home currency).
 - **Every aggregate is nullable and paired with `unconverted_count`** — the number of rows in the group whose date had no resolvable rate. A non-zero count makes the figure `null` rather than a partial total: `SUM` skips nulls, and the inflow/outflow `CASE` shape scores a null row as zero, so an unflagged aggregate would understate in silence.
 - **`hashtag_breakdown`** — array of `{ hashtag_ids, spent_home_cents, unconverted_count }` rows. Aggregation is `GROUP BY (category_id, sorted_array_of_hashtag_ids)`. The hashtag set is sorted by `id` before grouping so `[#a, #b]` and `[#b, #a]` collapse to the same row. Transactions with no hashtags appear as a row with `hashtag_ids: []`. **The sum of all fully-converted `hashtag_breakdown` rows under a category equals that category's `spent_home_cents` exactly** — no double-counting, no orphaned amounts.
-- **Opening balances are excluded from flow views entirely** (dashboard month panel and `/reports/monthly` alike): transactions under the `opening_balance` system category contribute nothing to `totals`, and the `@Opening` category row is omitted from `categories`. Rationale: an opening balance is where tracking starts, not money that moved — including it would report phantom income in the seed month. Exclusion keys off `system_key`, so renaming the category never breaks it. Account balances **do** include opening balances by construction, and the seed rows appear normally in transaction lists. Consequence: any transaction manually assigned to the `@Opening` category is likewise excluded from flow reports — the category carries the semantic.
+- **Opening balances are excluded from flow views entirely** (dashboard month panel and `/reports/monthly` alike): transactions under the `opening_balance` system category contribute nothing to `totals`, and the `@Opening` category row is omitted from `categories`. Rationale: an opening balance is where tracking starts, not money that moved — including it would report phantom income in the seed month. Exclusion keys off `system_key`, so renaming the category never breaks it. Account balances **do** include opening balances by construction, and the seed rows appear normally in transaction lists. Consequence: any transaction under the `@Opening` category is likewise excluded from flow reports — the category carries the semantic. Since 2026-08-11 no public write can make that assignment (system categories are engine-assigned only; see `POST /transactions`), so the only rows carrying it are opening-balance seeds and any pre-guard stragglers.
 - All `*_home_cents` fields are pre-converted by the engine. Clients never compute currency conversions.
 - `bank_accounts[].current_balance_home_cents` and `people[].current_balance_home_cents` are `Optional[int]`. They are always populated for same-currency accounts (identity rate). For cross-currency accounts, they are `null` only when no exchange rate is available from the account's currency to `main_currency` for today's date (today resolved in the user's `display_timezone` via `exchange_rate.rate_lookup_date`, matching the reports) — in that case, clients should display the native balance as a fallback.
 - "Current month" means `[first_day_of_month, last_day_of_month]` in the user's `display_timezone`.

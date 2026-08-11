@@ -348,25 +348,21 @@ Without this, `@Opening`'s exclusion from flow reports is unenforceable — a us
 filing an ordinary expense under `@Opening` would silently drop it from every
 monthly report while it still moves the balance.
 
-### The remaining holes (open-bugs 6.7)
+### Enforced 2026-08-11 (was open-bugs 6.7)
 
-| # | Hole | Where |
-|---|---|---|
-| 1 | `POST /transactions` accepts a system `category_id` | `validate_active_category` (`helpers/validation.py`) checks `deleted_at` and `is_archived` but **not `is_system`**; no other guard found |
-| 2 | `PUT /transactions/{id}` can move an ordinary transaction *into* a system category | same missing check |
+Every public door into the ledger rejects a system `category_id` with `422`
+(`fields: {"category_id": "Must not reference a system category."}`): `POST` /
+`PUT /transactions`, `POST /transactions/batch`, and `POST /inbox/{id}/promote`
+(promotion inserts the ledger row directly, so it carries its own copy of the
+guard, and the `?ready=true` predicate excludes such drafts to stay in step).
+The internal path keeps working as designed: `create_opening_balance` calls
+`create_transaction(allow_system_category=True)` — the single opt-in, same
+public-boundary-plus-internal-path shape as bug 7.4's reserved-name check.
+Pinned by `tests/test_system_category_boundary.py`.
 
 *(A third hole — moving a transfer leg out of `@Transfer` — was closed 2026-08-07
 as bug 6.5 via the transfer edit guard, then became unrepresentable when the
 transfer feature was removed 2026-08-10.)*
-
-### Fix (for the two still open)
-
-- Reject `is_system = true` category targets at the **public boundary** (request
-  validation), returning `422`. The internal path must keep working:
-  `create_opening_balance` delegates to `create_transaction` with `@Opening`.
-  Same public-boundary-plus-internal-path shape as bug 7.4's reserved-name
-  check (closed 2026-08-07), which rejects the reserved system-category *name* at
-  the same boundary.
 
 ---
 

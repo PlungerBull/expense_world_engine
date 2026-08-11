@@ -10,12 +10,11 @@ The open items, in execution order: the bug burn-down, the People API, and the i
 
 The 2026-08-07 verification audit confirmed every previously closed bug is genuinely fixed (each pinned by a test) and these are what remain. **Detail lives only in [docs/open-bugs.md](docs/open-bugs.md)** — this entry is the schedule, not a second copy; delete a line here when its row leaves that file.
 
-1. **6.7** — `@Opening` accepted on ordinary transactions (three boundary call sites: create, update, batch; re-scoped 2026-08-11 — the transfer removal deleted the other two system categories).
-2. **7.1** — inbox writes do no referential/ownership validation (narrowed 2026-08-08: malformed ids now 422 via 6.6; and 2026-08-11: the transfer-field surface is gone; what remains is well-formed-but-nonexistent/deleted/cross-tenant `account_id`/`category_id`).
-3. **5.5** — the three reconciliation state-machine gaps *(was four; the sibling delete warning closed 2026-08-08 with bloat-audit Tier 2 §6)*.
-4. **8.2** — batch CREATE snapshots log `hashtag_ids: []` *(the transfer path's copy left with the feature, 2026-08-11)*.
-5. **1.7 remainder** — dedicated FX-hygiene pass: rate plausibility vs prior day, negative-lookup cache TTL, archived-account currencies in the fetch list, `Decimal`/`ROUND_HALF_UP`.
-6. **Four ⚪ lows** — `restore_category` skips the reserved-name check (7.4-r); `?hashtag_id=` filter lacks `transaction_source = 1` (hashtag-filter — or fold into the inbox-hashtags feature below, whichever ships first); inbox titles stored verbatim, whitespace-only can promote (inbox-title, found 2026-08-08 — fix wants an owner call on 422-vs-NULL); `color or` collapses an explicit empty string to the default (account-color, found 2026-08-08 — needs a reject-vs-store decision).
+1. **7.1** — inbox writes do no referential/ownership validation (narrowed 2026-08-08: malformed ids now 422 via 6.6; and 2026-08-11: the transfer-field surface is gone; what remains is well-formed-but-nonexistent/deleted/cross-tenant `account_id`/`category_id`).
+2. **5.5** — the three reconciliation state-machine gaps *(was four; the sibling delete warning closed 2026-08-08 with bloat-audit Tier 2 §6)*.
+3. **8.2** — batch CREATE snapshots log `hashtag_ids: []` *(the transfer path's copy left with the feature, 2026-08-11)*.
+4. **1.7 remainder** — dedicated FX-hygiene pass: rate plausibility vs prior day, negative-lookup cache TTL, archived-account currencies in the fetch list, `Decimal`/`ROUND_HALF_UP`.
+5. **Four ⚪ lows** — `restore_category` skips the reserved-name check (7.4-r); `?hashtag_id=` filter lacks `transaction_source = 1` (hashtag-filter — or fold into the inbox-hashtags feature below, whichever ships first); inbox titles stored verbatim, whitespace-only can promote (inbox-title, found 2026-08-08 — fix wants an owner call on 422-vs-NULL); `color or` collapses an explicit empty string to the default (account-color, found 2026-08-08 — needs a reject-vs-store decision).
 
 **When it becomes blocking:** nothing here corrupts data today — that severity tier is empty — but 7.1 turns typos into stored-then-rejected-at-promote surprises on a daily-use path, so the burn-down should precede any new feature work.
 

@@ -179,6 +179,9 @@ async def create_opening_balance(
             account_id=account_id,
             category_id=category_id,
         ),
+        # The one caller allowed to file under a system category — this IS
+        # the engine assigning @Opening; public writes are rejected (bug 6.7).
+        allow_system_category=True,
     )
 
 

@@ -39,6 +39,7 @@ from app.helpers.transactions import attach_hashtag_ids, insert_transaction_row
 from app.helpers.validation import (
     MSG_ACTIVE_ACCOUNT,
     MSG_ACTIVE_CATEGORY,
+    MSG_USER_CATEGORY,
     active_account_row,
     active_category_row,
     db_now,
@@ -317,11 +318,20 @@ async def promote_inbox_item(
     ):
         errors["account_id"] = MSG_ACTIVE_ACCOUNT
 
-    if inbox_row["category_id"] is None or (
-        await active_category_row(conn, inbox_row["category_id"], user_id)
-        is None
-    ):
+    if inbox_row["category_id"] is None:
         errors["category_id"] = MSG_ACTIVE_CATEGORY
+    else:
+        category = await active_category_row(
+            conn, inbox_row["category_id"], user_id
+        )
+        if category is None:
+            errors["category_id"] = MSG_ACTIVE_CATEGORY
+        elif category["is_system"]:
+            # Promotion inserts the ledger row directly (not via
+            # create_transaction), so it carries its own copy of the
+            # system-category boundary (bug 6.7): only the engine files
+            # rows under @Opening, and promotion is a user action.
+            errors["category_id"] = MSG_USER_CATEGORY
 
     if errors:
         raise validation_error("Inbox item is not ready to promote.", errors)

@@ -11,6 +11,42 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-11 — system categories rejected as `category_id` on every write (was: silently accepted)
+
+**Engine change** (`helpers/transactions.py`, `helpers/inbox.py`,
+`helpers/validation.py`, `routers/inbox.py`; open-bugs 6.7, owner decision).
+System categories (`is_system = true` — only `@Opening` exists) are
+engine-assigned only. A write naming one as `category_id` now returns
+`422 VALIDATION_ERROR` with
+`fields: {"category_id": "Must not reference a system category."}`
+(batch: `fields.items[i].category_id`), where it was previously accepted —
+storing a row that moved the balance while vanishing from every flow report.
+
+**What breaks:**
+
+- **`POST /transactions`**, **`PUT /transactions/{id}`**,
+  **`POST /transactions/batch`**: `@Opening` as `category_id` → `422`.
+- **`POST /inbox/{id}/promote`**: a draft whose `category_id` is `@Opening`
+  → `422` (`"Inbox item is not ready to promote."`), and such drafts no
+  longer appear in `GET /inbox?ready=true`. Saving the draft itself is still
+  accepted — inbox write-side validation is bug 7.1, not this change.
+- `POST /accounts/{id}/opening-balance` is unaffected — it remains the one
+  path that files under `@Opening`.
+
+**What the CLI must do:** nothing structurally — no field or shape changed.
+But `@Opening` arrives on `GET /categories` (`is_system: true`), so any
+category picker that offers it should filter `is_system` rows out of
+write flows; a user who picked it previously created the invisible-row bug
+this closes, and now gets the `422`.
+
+### Engine references
+
+- `tests/test_system_category_boundary.py` (the new pins)
+- `docs/engine-spec.md` — §`POST /transactions`, §`PUT /transactions/{id}`,
+  §`POST /transactions/batch`, §`POST /inbox/{id}/promote`
+- `docs/currency-model-decision.md` — "system categories are engine-assigned
+  only", now marked enforced
+
 ## 2026-08-10 — the transfer feature is removed (was: auto-paired legs via a `transfer` request field)
 
 **Engine change** (`helpers/transfers.py` deleted; `helpers/transactions.py`,

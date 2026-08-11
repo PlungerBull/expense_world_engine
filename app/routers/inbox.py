@@ -73,15 +73,16 @@ async def list_inbox(
                 "WHERE a.id = i.account_id AND a.user_id = i.user_id "
                 "AND a.deleted_at IS NULL AND a.is_archived = false)"
             )
-            # Category must be present and active (an inbox row pointing at a
-            # deleted category isn't promotable — promote would 422 on the
-            # same guard, so excluding it from `?ready=true` keeps the
+            # Category must be present, active, and not a system category
+            # (an inbox row pointing at a deleted category — or at @Opening,
+            # bug 6.7 — isn't promotable: promote would 422 on the same
+            # guard, so excluding it from `?ready=true` keeps the
             # client-facing list honest).
             conditions.append(
                 "(i.category_id IS NOT NULL AND EXISTS ("
                 "SELECT 1 FROM expense_categories c "
                 "WHERE c.id = i.category_id AND c.user_id = i.user_id "
-                "AND c.deleted_at IS NULL))"
+                "AND c.deleted_at IS NULL AND c.is_system = false))"
             )
 
         if overdue:

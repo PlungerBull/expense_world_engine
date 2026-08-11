@@ -72,9 +72,10 @@ async def test_vectorised_helpers_exclude_deleted_archived_and_foreign(test_data
                 await active_account_row(conn, archived_id, test_data.user_id)
                 is None
             )
+            # Categories: mapping id → is_system (membership = active).
             assert await active_category_ids(
                 conn, [test_data.category_id], test_data.user_id
-            ) == {test_data.category_id}
+            ) == {test_data.category_id: False}
         finally:
             await conn.execute(
                 "DELETE FROM expense_bank_accounts WHERE id = ANY($1::uuid[])",
