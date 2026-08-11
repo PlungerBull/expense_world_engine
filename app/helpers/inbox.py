@@ -45,6 +45,8 @@ from app.helpers.validation import (
     db_now,
     extract_update_fields,
     reject_zero_amount,
+    validate_active_account,
+    validate_active_category,
 )
 from app.schemas.inbox import InboxCreateRequest, InboxUpdateRequest, inbox_from_row
 from app.schemas.transactions import infer_transaction_type, transaction_from_row
@@ -75,6 +77,15 @@ async def create_inbox_item(
     transaction_type: Optional[int] = None
     if primary_signed is not None:
         transaction_type = infer_transaction_type(primary_signed)
+
+    # A supplied reference must point at an active, tenant-owned resource;
+    # both fields stay optional. Deliberately no is_system arm, unlike the
+    # ledger write path: a draft may carry a system category — promote is
+    # where it gets refused (test_system_category_boundary pins this).
+    if body.account_id is not None:
+        await validate_active_account(conn, body.account_id, user_id)
+    if body.category_id is not None:
+        await validate_active_category(conn, body.category_id, user_id)
 
     # No rate is looked up and none is stored. This is where open bug 1.4 was:
     # the lookup fired only when BOTH account_id and date were present, and the
@@ -158,6 +169,14 @@ async def update_inbox_item(
     )
 
     before = inbox_from_row(before_row)
+
+    # Same reference rule as create (and same deliberate lack of an
+    # is_system arm). Sits after the ownership fetch so a nonexistent
+    # inbox item is a 404 before any 422.
+    if "account_id" in fields:
+        await validate_active_account(conn, fields["account_id"], user_id)
+    if "category_id" in fields:
+        await validate_active_category(conn, fields["category_id"], user_id)
 
     if primary_signed is not None:
         fields["transaction_type"] = infer_transaction_type(primary_signed)

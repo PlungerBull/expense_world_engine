@@ -11,6 +11,30 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-11 — inbox writes validate `account_id`/`category_id` references (was: stored unvalidated, rejected at promote)
+
+**Engine change** (`helpers/inbox.py`; open-bugs 7.1, the last item the 6.7
+entry below deferred). `POST /inbox` and `PUT /inbox/{id}` now run the same
+reference validation as the ledger write paths: a well-formed `account_id` or
+`category_id` that is nonexistent, soft-deleted, archived (accounts), or
+another tenant's returns `422 VALIDATION_ERROR` with
+`fields: {"account_id": "Must reference an active, non-archived account."}` /
+`fields: {"category_id": "Must reference an active category."}`, where it was
+previously stored and only rejected at promote. (A nonexistent id previously
+hit the table's FK and returned a `500`.)
+
+**What breaks:** a client that saved drafts with stale ids and relied on
+promote-time rejection now gets the `422` at save. Unchanged: sparse drafts
+(the fields stay optional — only supplied ids are checked), drafts pointing
+at a system category (still accepted at save, refused only at promote), and
+edits to a draft whose stored reference has since died (untouched fields are
+not re-validated).
+
+**What the CLI must do:** nothing structurally — surface the `422` at draft
+save like it already does for ledger writes.
+
+---
+
 ## 2026-08-11 — system categories rejected as `category_id` on every write (was: silently accepted)
 
 **Engine change** (`helpers/transactions.py`, `helpers/inbox.py`,

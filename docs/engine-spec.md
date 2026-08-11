@@ -358,6 +358,8 @@ Creates a new inbox item.
 
 **Required:** `id` (client-supplied UUID). All other fields are optional — the engine accepts sparse inbox rows and waits for later edits to complete them.
 
+A supplied `account_id` or `category_id` must reference an active resource owned by the caller (`account_id` additionally non-archived), else `422` with the standard reference messages. The fields stay optional; only what is sent is checked. System categories are the deliberate exception to matching the ledger's write rules: a draft may point at `@Opening` and is refused only at promote (and excluded from `?ready=true`).
+
 `amount_cents` follows the standard sign convention: negative = expense, positive = income. The engine infers `transaction_type` from the sign and stores `amount_cents` as positive (same as the ledger). `transaction_type` is stored on the inbox row so direction is preserved through to promotion.
 
 No inbox field accepts an explicit `null` — send a value or omit the key. *(The former `transfer` object, the one explicit-null exception, left with the 2026-08-10 transfer removal.)*
@@ -369,6 +371,8 @@ Pass `?debit_as_negative=true` on `GET /inbox` or `GET /inbox/{id}` to have amou
 ### `GET /inbox/{id}`
 ### `PUT /inbox/{id}`
 Partial update. Re-evaluates promotion readiness after every update. Date and account changes need no rate handling — nothing on the row stores a conversion.
+
+An `account_id` or `category_id` present in the update follows the same reference rule as `POST /inbox`; references the update does not touch are not re-validated — a draft whose account has since died stays editable, and promote remains the gate.
 
 ### `DELETE /inbox/{id}`
 Soft-delete. Sets `deleted_at = now()` without touching `status`, so the row remains `status = 1` (PENDING) + `deleted_at IS NOT NULL` — distinct from the PROMOTED end-state (`status = 2` + `deleted_at IS NOT NULL`).

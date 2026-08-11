@@ -184,8 +184,10 @@ async def test_ready_filter_is_tenant_scoped(client, test_data):
                 account_b, user_b,
             )
             # A draft for the TEST user that references user B's account —
-            # inserted directly because the write path stores it unvalidated
-            # (open-bugs 7.1). Fully "ready" in every other respect.
+            # inserted directly because the write path now rejects a
+            # cross-tenant reference (7.1 fixed); this seeds the pre-fix shape
+            # to prove the read/promote sides still hold on data already in
+            # the table. Fully "ready" in every other respect.
             await conn.execute(
                 """INSERT INTO expense_transaction_inbox
                     (id, user_id, title, amount_cents, transaction_type, date,
@@ -220,3 +222,291 @@ async def test_ready_filter_is_tenant_scoped(client, test_data):
                 "DELETE FROM expense_bank_accounts WHERE id = $1", account_b
             )
             await conn.execute("DELETE FROM users WHERE id = $1", user_b)
+
+
+@pytest.mark.asyncio
+async def test_inbox_create_rejects_inactive_references(client, test_data):
+    """POST /inbox refuses a well-formed id that is nonexistent, deleted,
+    archived (accounts), or another tenant's — the write-side half of the
+    reference rule (was open-bugs 7.1)."""
+    deleted_account = str(uuid.uuid4())
+    archived_account = str(uuid.uuid4())
+    deleted_category = str(uuid.uuid4())
+    user_b = str(uuid.uuid4())
+    account_b = str(uuid.uuid4())
+    category_b = str(uuid.uuid4())
+    created_drafts: list[str] = []
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 is_archived, sort_order, created_at, updated_at, deleted_at)
+               VALUES ($1, $2, 'inbox-ref deleted', 'PEN', false, '#000000',
+                 false, 0, now(), now(), now())""",
+            deleted_account, test_data.user_id,
+        )
+        await conn.execute(
+            """INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 is_archived, sort_order, created_at, updated_at)
+               VALUES ($1, $2, 'inbox-ref archived', 'PEN', false, '#000000',
+                 true, 0, now(), now())""",
+            archived_account, test_data.user_id,
+        )
+        await conn.execute(
+            """INSERT INTO expense_categories
+                (id, user_id, name, color, is_system, sort_order,
+                 created_at, updated_at, deleted_at)
+               VALUES ($1, $2, 'inbox-ref deleted cat', '#FF0000', false, 0,
+                 now(), now(), now())""",
+            deleted_category, test_data.user_id,
+        )
+        await conn.execute(
+            """INSERT INTO users (id, display_name, created_at, updated_at)
+               VALUES ($1, 'inbox-ref-user-b', now(), now())""",
+            user_b,
+        )
+        await conn.execute(
+            """INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 is_archived, sort_order, created_at, updated_at)
+               VALUES ($1, $2, 'B account', 'PEN', false, '#000000',
+                 false, 0, now(), now())""",
+            account_b, user_b,
+        )
+        await conn.execute(
+            """INSERT INTO expense_categories
+                (id, user_id, name, color, is_system, sort_order,
+                 created_at, updated_at)
+               VALUES ($1, $2, 'B category', '#FF0000', false, 0,
+                 now(), now())""",
+            category_b, user_b,
+        )
+    try:
+        bad_accounts = [
+            str(uuid.uuid4()), deleted_account, archived_account, account_b
+        ]
+        for bad_id in bad_accounts:
+            r = await client.post(
+                "/v1/inbox",
+                json={"id": str(uuid.uuid4()), "account_id": bad_id},
+                headers=_idem(),
+            )
+            assert r.status_code == 422, r.text
+            assert r.json()["error"]["fields"]["account_id"] == MSG_ACTIVE_ACCOUNT
+
+        bad_categories = [str(uuid.uuid4()), deleted_category, category_b]
+        for bad_id in bad_categories:
+            r = await client.post(
+                "/v1/inbox",
+                json={"id": str(uuid.uuid4()), "category_id": bad_id},
+                headers=_idem(),
+            )
+            assert r.status_code == 422, r.text
+            assert r.json()["error"]["fields"]["category_id"] == MSG_ACTIVE_CATEGORY
+
+        # Bad account + bad category: the account check raises first, same
+        # short-circuit as the single transaction create.
+        r = await client.post(
+            "/v1/inbox",
+            json={
+                "id": str(uuid.uuid4()),
+                "account_id": str(uuid.uuid4()),
+                "category_id": str(uuid.uuid4()),
+            },
+            headers=_idem(),
+        )
+        assert r.status_code == 422, r.text
+        body = r.json()["error"]
+        assert body["message"] == "Account validation failed."
+        assert body["fields"] == {"account_id": MSG_ACTIVE_ACCOUNT}
+
+        # Sparse drafts stay accepted — the rule fires only on supplied ids.
+        sparse_id = str(uuid.uuid4())
+        r = await client.post(
+            "/v1/inbox", json={"id": sparse_id}, headers=_idem()
+        )
+        assert r.status_code == 201, r.text
+        created_drafts.append(sparse_id)
+
+        valid_id = str(uuid.uuid4())
+        r = await client.post(
+            "/v1/inbox",
+            json={
+                "id": valid_id,
+                "account_id": test_data.account_id,
+                "category_id": test_data.category_id,
+            },
+            headers=_idem(),
+        )
+        assert r.status_code == 201, r.text
+        created_drafts.append(valid_id)
+    finally:
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM activity_log WHERE resource_id = ANY($1::uuid[])",
+                created_drafts,
+            )
+            await conn.execute(
+                "DELETE FROM expense_transaction_inbox WHERE id = ANY($1::uuid[])",
+                created_drafts,
+            )
+            await conn.execute(
+                "DELETE FROM expense_categories WHERE id = ANY($1::uuid[])",
+                [deleted_category, category_b],
+            )
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = ANY($1::uuid[])",
+                [deleted_account, archived_account, account_b],
+            )
+            await conn.execute("DELETE FROM users WHERE id = $1", user_b)
+
+
+@pytest.mark.asyncio
+async def test_inbox_update_rejects_inactive_references(client, test_data):
+    """PUT /inbox/{id} applies the same reference rule to fields present in
+    the update — and a rejected update leaves the draft untouched."""
+    deleted_account = str(uuid.uuid4())
+    inbox_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 is_archived, sort_order, created_at, updated_at, deleted_at)
+               VALUES ($1, $2, 'inbox-put deleted', 'PEN', false, '#000000',
+                 false, 0, now(), now(), now())""",
+            deleted_account, test_data.user_id,
+        )
+    try:
+        r = await client.post(
+            "/v1/inbox",
+            json={"id": inbox_id, "account_id": test_data.account_id},
+            headers=_idem(),
+        )
+        assert r.status_code == 201, r.text
+
+        for bad_account in (str(uuid.uuid4()), deleted_account):
+            r = await client.put(
+                f"/v1/inbox/{inbox_id}",
+                json={"account_id": bad_account},
+                headers=_idem(),
+            )
+            assert r.status_code == 422, r.text
+            assert r.json()["error"]["fields"]["account_id"] == MSG_ACTIVE_ACCOUNT
+
+        r = await client.put(
+            f"/v1/inbox/{inbox_id}",
+            json={"category_id": str(uuid.uuid4())},
+            headers=_idem(),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["error"]["fields"]["category_id"] == MSG_ACTIVE_CATEGORY
+
+        # The rejected updates rolled back — the draft still holds its
+        # original reference and no category.
+        r = await client.get(f"/v1/inbox/{inbox_id}")
+        assert r.status_code == 200, r.text
+        assert r.json()["account_id"] == test_data.account_id
+        assert r.json()["category_id"] is None
+
+        r = await client.put(
+            f"/v1/inbox/{inbox_id}",
+            json={"category_id": test_data.category_id},
+            headers=_idem(),
+        )
+        assert r.status_code == 200, r.text
+
+        # A nonexistent inbox item is a 404 before any reference 422.
+        r = await client.put(
+            f"/v1/inbox/{uuid.uuid4()}",
+            json={"account_id": str(uuid.uuid4())},
+            headers=_idem(),
+        )
+        assert r.status_code == 404, r.text
+    finally:
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM activity_log WHERE resource_id = $1", inbox_id
+            )
+            await conn.execute(
+                "DELETE FROM expense_transaction_inbox WHERE id = $1", inbox_id
+            )
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = $1",
+                deleted_account,
+            )
+
+
+@pytest.mark.asyncio
+async def test_stale_draft_reference_is_promotes_problem(client, test_data):
+    """A reference that dies after the draft was written stays promote's job:
+    edits that don't touch it still succeed, and promote is where it 422s."""
+    account_id = str(uuid.uuid4())
+    inbox_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 is_archived, sort_order, created_at, updated_at)
+               VALUES ($1, $2, 'inbox-stale account', 'PEN', false, '#000000',
+                 false, 0, now(), now())""",
+            account_id, test_data.user_id,
+        )
+    try:
+        r = await client.post(
+            "/v1/inbox",
+            json={
+                "id": inbox_id,
+                "title": "stale draft",
+                "amount_cents": -1000,
+                "date": "2024-03-15T12:00:00Z",
+                "account_id": account_id,
+                "category_id": test_data.category_id,
+            },
+            headers=_idem(),
+        )
+        assert r.status_code == 201, r.text
+
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE expense_bank_accounts SET deleted_at = now() WHERE id = $1",
+                account_id,
+            )
+
+        # An edit that doesn't touch the reference does not re-validate it —
+        # a stale draft stays editable.
+        r = await client.put(
+            f"/v1/inbox/{inbox_id}",
+            json={"title": "still editable"},
+            headers=_idem(),
+        )
+        assert r.status_code == 200, r.text
+
+        # Re-sending the now-dead reference is refused.
+        r = await client.put(
+            f"/v1/inbox/{inbox_id}",
+            json={"account_id": account_id},
+            headers=_idem(),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["error"]["fields"]["account_id"] == MSG_ACTIVE_ACCOUNT
+
+        # Promote remains the gate for what the row already holds.
+        r = await client.post(
+            f"/v1/inbox/{inbox_id}/promote",
+            json={"id": str(uuid.uuid4())},
+            headers=_idem(),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["error"]["fields"]["account_id"] == MSG_ACTIVE_ACCOUNT
+    finally:
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM activity_log WHERE resource_id = $1", inbox_id
+            )
+            await conn.execute(
+                "DELETE FROM expense_transaction_inbox WHERE id = $1", inbox_id
+            )
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = $1", account_id
+            )
