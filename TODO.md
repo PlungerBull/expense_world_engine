@@ -2,7 +2,25 @@
 
 Operational / deployment tasks, plus accepted design changes awaiting scheduling — work that is not part of normal code review. Each entry describes what needs to happen, why, and when it becomes blocking. **Delete an entry when it closes — git history holds the record; do not keep tombstones here.**
 
-One parked product question, one accepted-but-unscheduled feature, and the bug burn-down are the open items.
+The open items, in execution order: the transfer removal, the bug burn-down, the People API, and the inbox-hashtags feature.
+
+---
+
+## Remove the transfer feature — decided 2026-08-10, execute FIRST
+
+**Owner decision 2026-08-10: delete auto-paired transfers** — the one-request convenience where a single line with a `transfer` field makes the engine auto-register the opposite leg in the counterparty account. Overly convoluted for current use. Moving money between accounts is recorded from now on as **two ordinary rows** (one outflow, one inflow), categorized with **ordinary user categories** — the owner accepts that monthly inflow/outflow totals will include account-to-account moves.
+
+The live ledger holds **zero transfer legs, zero inbox transfer drafts** (verified 2026-08-10), so this is pure code+schema deletion — no data migration, and the window is only this cheap until real transfers get recorded.
+
+Scope:
+
+- **Delete the pairing machinery:** `helpers/transfers.py`, the `transfer` request field (`TransferField`/`InboxTransferField` schemas), the `transfer_transaction_id` column, the sibling delete/restore machinery (`_delete_leg`/`_restore_leg` and the per-leg warnings), `ALLOWED_ON_TRANSFER_LEG`, the opposite-sign guard (`opposite_signs`/`MSG_OPPOSITE_SIGN`), the inbox transfer columns (`sql/019`) and their coherence CHECK (`sql/020`) — all via a `sql/030` migration.
+- **Delete the `@Transfer` and `@Debt` system categories** (owner decision 2026-08-10 — no built-in "this is a move" marker). `RESERVED_CATEGORY_NAMES` shrinks to `@Opening`; opening balances are untouched.
+- **Keep `is_person` and every person read surface** (`?include_people`, the dashboard `people` panel, the opening-balance guard). The person feature stays — money to/from a person is ordinary rows against a person account, whose balance is the debt. The missing entry point ships separately (next section).
+- **Docs to update when it lands:** `engine-spec.md` (transfer sections), `schema-reference.md`, `currency-model-decision.md` (the "`@Transfer` ≠ 0" model), CLAUDE.md's sign-convention transfer bullets, and a `client-breaking-changes.md` entry (the CLI has transfer commands).
+- **Re-scopes the burn-down below** — update the `open-bugs.md` rows as part of landing this: 6.7 shrinks to guarding `@Opening` only, 8.2 to the batch path only, 7.1 loses the inbox transfer-field surface, 7.4-r shrinks with the reserved set.
+
+**Why first:** fixing 6.7/8.2/7.1 before this means fixing code and categories about to be deleted.
 
 ---
 
@@ -21,17 +39,13 @@ The 2026-08-07 verification audit confirmed every previously closed bug is genui
 
 ---
 
-## People API — build `POST /people`, or delete the `is_person` axis — 🅿️ PARKED product question
+## People API — build `POST /people` — decided 2026-08-10, ships after the transfer removal
 
-Person accounts are **structurally complete and functionally unreachable**: `is_person` is read by the accounts list filter (`?include_people`), the dashboard `people` panel split, the transfer engine's `@Debt` branch, and the opening-balance guard — but **no endpoint can set it**. The INSERT in `app/helpers/accounts.py` omits the column entirely, and `AccountCreateRequest` rejects the field (`extra="forbid"`). No production row can ever have it true, so the `people` dashboard panel is always `[]` and the `@Debt` leg of the transfer pair is unreachable.
+The parked question is resolved: **keep the person feature, build the entry point.** With auto-paired transfers gone, a person account is just an account you register ordinary rows against — its balance *is* the debt. What's missing is unchanged: **no endpoint can set `is_person`** (the INSERT in `app/helpers/accounts.py` omits the column; `AccountCreateRequest` rejects the field), so the `people` dashboard panel and `?include_people` remain dead surfaces until this ships.
 
-The three options, most expensive first:
+Shape is already decided (spec §People sketch + decision D7 in [docs/open-bugs.md](docs/open-bugs.md)): explicit creation only — `POST /people`, never auto-created as a side effect of anything.
 
-1. **Status quo** — full machinery, no entry point. The most expensive option: every future agent re-discovers the dead axis, and every transfer-engine change must keep a branch alive that nothing can execute.
-2. **Build `POST /people`** (spec §People already sketches it: explicit creation only, never auto-created by a transfer — see decision D7 in [docs/open-bugs.md](docs/open-bugs.md) and the design rule in `engine-spec.md`).
-3. **Delete the axis** — drop `is_person`, the `@Debt` branch, the `people` panel, `?include_people`, and the `@Debt` system category.
-
-**When it becomes blocking:** the first time the owner wants to track a debt. Decide before building anything on top of the transfer engine's person branch.
+**When it becomes blocking:** the first time the owner wants to track a debt. Sequenced after the transfer removal (which deletes the `@Debt` auto-branch this replaces) and the bug burn-down.
 
 ---
 
