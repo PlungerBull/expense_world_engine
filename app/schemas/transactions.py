@@ -8,17 +8,12 @@ from app.constants import TransactionType
 from app.schemas import StrictModel, audit_fields, opt_id, owned_fields
 
 
-class TransferField(StrictModel):
-    id: UUID  # sibling transaction's client-supplied uuid
-    account_id: UUID
-    amount_cents: int  # signed: negative=outflow, positive=inflow
-
-
 class TransactionCreateRequest(StrictModel):
     # Unknown fields 422 rather than being silently dropped. This is what makes
-    # the removal of `exchange_rate` (sql/021) visible to a client still sending
-    # it: the engine no longer stores a rate anywhere, and a caller who believes
-    # the value matters deserves to be told it does not.
+    # the removal of `exchange_rate` (sql/021) — and of `transfer` (2026-08-10)
+    # — visible to a client still sending it: the engine no longer implements
+    # what the field asks for, and a caller who believes the value matters
+    # deserves to be told it does not.
     id: UUID
     title: str
     amount_cents: int  # signed: negative=expense, positive=income
@@ -27,14 +22,13 @@ class TransactionCreateRequest(StrictModel):
     # boundary instead of reaching SQL as a bind param and 500ing (open-bugs
     # 6.6, closed 2026-08-08).
     account_id: UUID
-    # Required for normal transactions, ignored for transfers (the engine
-    # auto-assigns @Transfer/@Debt). Conditional requirement is enforced in
-    # create_transaction, not here, since it depends on the transfer field.
-    category_id: Optional[UUID] = None
+    # Unconditionally required since the transfer removal (2026-08-10) — the
+    # only waiver was the transfer path's auto-assignment. Missing 422s here
+    # at the schema boundary, same as omitting `title`.
+    category_id: UUID
     description: Optional[str] = None
     cleared: Optional[bool] = None
     hashtag_ids: Optional[list[UUID]] = None
-    transfer: Optional[TransferField] = None
 
 
 class TransactionUpdateRequest(StrictModel):
@@ -65,16 +59,14 @@ class TransactionResponse(BaseModel):
     # Absent, not null: a permanently-null key on every transaction forever is
     # dead weight, and this is the documented exception to null-over-omission.
     amount_cents: int
-    # Direction, and nothing else — a transfer is identified by
-    # transfer_transaction_id, not by a third type value. Typed with the enum
-    # (wire-identical plain int, OpenAPI documents the closed set); safe to
-    # fail a read loudly because sql/020 CHECKs the column.
+    # Direction, and nothing else — there is no third type value. Typed with
+    # the enum (wire-identical plain int, OpenAPI documents the closed set);
+    # safe to fail a read loudly because sql/020 CHECKs the column.
     transaction_type: TransactionType
     date: datetime
     account_id: str
     category_id: str
     cleared: bool
-    transfer_transaction_id: Optional[str] = None
     inbox_id: Optional[str] = None
     reconciliation_id: Optional[str] = None
     created_at: datetime
@@ -138,7 +130,6 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
         account_id=str(row["account_id"]),
         category_id=str(row["category_id"]),
         cleared=row["cleared"],
-        transfer_transaction_id=opt_id(row["transfer_transaction_id"]),
         inbox_id=opt_id(row["inbox_id"]),
         reconciliation_id=opt_id(row["reconciliation_id"]),
         **audit_fields(row),
@@ -151,33 +142,17 @@ def infer_transaction_type(amount_cents: int) -> TransactionType:
 
     Negative = OUTFLOW (money leaves the account), positive = INFLOW.
 
-    **Signs are read only in this module** — this function for direction,
-    ``opposite_signs`` below for the transfer pairing rule. Every write
-    path — ordinary transactions, batch, both transfer legs, and the
-    inbox — routes through here, so there is exactly one answer to "what
-    does the sign mean". Adding a reader anywhere else is the bug, not
-    the fix.
+    **This is the only place in the engine a sign is read.** Every write
+    path — ordinary transactions, batch, and the inbox — routes through
+    here, so there is exactly one answer to "what does the sign mean".
+    Adding a reader anywhere else is the bug, not the fix.
 
     Until WP1 there was a second, byte-identical copy of this rule named
     ``infer_transfer_direction``, because transfers encoded their direction in
-    a separate column. That column is gone (sql/020) and so is the duplicate.
+    a separate column; a second reader named ``opposite_signs`` (the transfer
+    pairing rule) then lived beside this one until the feature itself was
+    removed (2026-08-10). Both are gone.
 
     Callers must reject zero first; ``0`` maps to INFLOW here.
     """
     return TransactionType.OUTFLOW if amount_cents < 0 else TransactionType.INFLOW
-
-
-MSG_OPPOSITE_SIGN = "Must have opposite sign to amount_cents."
-
-
-def opposite_signs(a: int, b: int) -> bool:
-    """True when the two signed amounts point opposite ways.
-
-    The transfer pairing rule: one leg flows out, the other flows in.
-    Non-raising by design — the ledger path accumulates the failure into
-    its errors dict (multi-error responses are pinned) while the inbox
-    path raises immediately; both report ``MSG_OPPOSITE_SIGN``.
-
-    Callers must reject zero first; zero has no sign.
-    """
-    return (a > 0) != (b > 0)

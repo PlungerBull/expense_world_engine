@@ -146,7 +146,6 @@ async def list_transactions(
 # ---------------------------------------------------------------------------
 # POST /transactions
 # ---------------------------------------------------------------------------
-# The transfer branch returns the primary leg only — same TransactionResponse.
 @router.post("", response_model=TransactionResponse, status_code=201)
 async def create_transaction(
     body: TransactionCreateRequest,

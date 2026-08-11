@@ -223,7 +223,7 @@ def signed_expr(magnitude: str) -> str:
     """Apply the sign matrix to an unsigned magnitude expression.
 
     Inflows are positive, outflows negative. That is the entire rule: after
-    WP1 a transfer leg is an ordinary row and needs no branch of its own,
+    WP1 every row is an ordinary row and direction is the only branch,
     where this used to need four arms to express two outcomes.
 
     **This is the only rendering of the sign matrix in the engine.** It used to

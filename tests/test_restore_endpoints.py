@@ -2,8 +2,8 @@
 
 The transaction restore path has its own dedicated test file
 (`test_transaction_restore.py`) because its inverse logic is intricate
-(balance re-apply, junction precision, transfer sibling cascade,
-reconciliation handling). The five endpoints covered here are the
+(balance re-apply, junction precision, reconciliation handling).
+The five endpoints covered here are the
 "simpler" restores — accounts, categories, hashtags, reconciliations,
 and pending inbox items — but each carries its own resource-specific
 guard rail that this file pins down:

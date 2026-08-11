@@ -8,11 +8,8 @@ Signed semantics: every row contributes a signed amount derived from
 transaction_type alone — outflows negative, inflows positive. The expressions come
 from ``helpers/home_currency.signed_expr``, the engine's single rendering of that
 rule; this module used to carry two literal copies of a four-branch version, which
-is audit finding WP9.1. Categories sum the signed amounts, so a same-currency
-real-to-real transfer naturally cancels to zero under @Transfer, and a loan to a
-person shows as negative @Transfer (real leg) + positive @Debt (person leg). Totals
-split the signed values into inflow (positive) and outflow (|negative|); net is
-inflow - outflow and is unaffected by internal movement volume.
+is audit finding WP9.1. Categories sum the signed amounts. Totals split the signed
+values into inflow (positive) and outflow (|negative|); net is inflow - outflow.
 
 `spent_home_cents` on a category can therefore be negative — the field name is
 retained for spec-contract reasons but semantically it is "signed net flow through
@@ -23,21 +20,17 @@ There are no native cross-account aggregates, because ``GROUP BY category_id`` h
 no currency partition: a category holding $15 and S/25 would report 4000, a number
 in no currency at all. Conversion happens exactly where figures are combined.
 
-@Transfer no longer always reads zero. Both legs of a cross-currency transfer are
-converted at their own account's rate for the day, so a $1,000 → S/3,450 exchange on
-a day the market rate is 3.58 reports −S/130: the spread the bank actually charged.
-It used to be forced to zero by assignment at write time. So `@Transfer != 0` means
-one of exactly two things — an FX spread, or a loan/repayment with a person, whose
-other leg landed in @Debt with nothing to cancel against. See
-docs/currency-model-decision.md.
+Account-to-account moves are ordinary rows (the auto-paired transfer feature was
+removed 2026-08-10) and are INCLUDED: gross inflow/outflow contain internal
+movement volume by owner decision, and a cross-currency move's two rows convert
+independently at their own accounts' rates, so any FX spread lands in whatever
+user categories the rows carry. Nothing here nets or pairs them.
 
 Opening balances (transactions under the ``opening_balance`` system category) are
 excluded entirely: no category row in the panel, no contribution to totals. An
 opening balance is where tracking starts, not money that moved — including it
 would report phantom income in the seed month. Exclusion keys off ``system_key``,
-so renaming the @Opening display name never breaks it. Transfers, by contrast,
-ARE included: both legs carry signed amounts (gross inflow/outflow do include
-internal movement volume).
+so renaming the @Opening display name never breaks it.
 
 Unconvertible rows
 ------------------

@@ -1,12 +1,10 @@
 """insert_transaction_row — the one INSERT INTO expense_transactions.
 
-Bloat-audit 2026-08-06 Duplicates §5: the column list existed at five sites
-(create, batch, promote, both transfer legs), each with its own
-UniqueViolation → 409 translation — the same missed-site failure shape as the
-create_batch sign-matrix incident. The helper is shared now, so one wire test
-pins the duplicate-id conflict message for every path; sibling linkage and
-inbox_id propagation stay pinned by test_wp1_transfer_collapse.py and
-test_inbox_transfers.py.
+Bloat-audit 2026-08-06 Duplicates §5: the column list existed at several sites
+(create, batch, promote), each with its own UniqueViolation → 409 translation —
+the same missed-site failure shape as the create_batch sign-matrix incident.
+The helper is shared now, so one wire test pins the duplicate-id conflict
+message for every path.
 """
 import uuid
 
@@ -22,17 +20,7 @@ def _idem() -> dict:
 @pytest.mark.asyncio
 async def test_duplicate_id_conflict_names_the_transaction_id(client, test_data):
     txn_id = str(uuid.uuid4())
-    other_account_id = str(uuid.uuid4())
-    async with db.pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO expense_bank_accounts
-                (id, user_id, name, currency_code, is_person, color,
-                 is_archived, sort_order, created_at, updated_at)
-               VALUES ($1, $2, $3, 'PEN', false, '#123456', false, 9,
-                 now(), now())""",
-            other_account_id, test_data.user_id,
-            f"insert-row-other-{other_account_id[:8]}",
-        )
+    inbox_id = str(uuid.uuid4())
     body = {
         "id": txn_id,
         "title": "duplicate-id probe",
@@ -54,21 +42,24 @@ async def test_duplicate_id_conflict_names_the_transaction_id(client, test_data)
             == f"A transaction with id '{txn_id}' already exists."
         )
 
-        # The transfer path speaks the identical sentence for a colliding leg.
-        r = await client.post(
-            "/v1/transactions",
+        # The promote path speaks the identical sentence for the same collision.
+        draft = await client.post(
+            "/v1/inbox",
             json={
-                "id": str(uuid.uuid4()),
-                "title": "duplicate-leg probe",
+                "id": inbox_id,
+                "title": "duplicate-id promote probe",
                 "amount_cents": -500,
                 "date": "2024-03-15T12:00:00Z",
                 "account_id": test_data.account_id,
-                "transfer": {
-                    "id": txn_id,  # collides with the existing row
-                    "account_id": other_account_id,
-                    "amount_cents": 500,
-                },
+                "category_id": test_data.category_id,
             },
+            headers=_idem(),
+        )
+        assert draft.status_code == 201, draft.text
+
+        r = await client.post(
+            f"/v1/inbox/{inbox_id}/promote",
+            json={"id": txn_id},  # collides with the existing row
             headers=_idem(),
         )
         assert r.status_code == 409, r.text
@@ -79,12 +70,12 @@ async def test_duplicate_id_conflict_names_the_transaction_id(client, test_data)
     finally:
         async with db.pool.acquire() as conn:
             await conn.execute(
-                "DELETE FROM activity_log WHERE resource_id = $1", txn_id
+                "DELETE FROM activity_log WHERE resource_id = ANY($1::uuid[])",
+                [txn_id, inbox_id],
             )
             await conn.execute(
                 "DELETE FROM expense_transactions WHERE id = $1", txn_id
             )
             await conn.execute(
-                "DELETE FROM expense_bank_accounts WHERE id = $1",
-                other_account_id,
+                "DELETE FROM expense_transaction_inbox WHERE id = $1", inbox_id
             )

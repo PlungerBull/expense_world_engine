@@ -27,9 +27,9 @@ async def get_user_report_settings(
     that module's docstring; this is the chokepoint for it, because every query
     that converts reaches SQL through a caller of this function.
 
-    Before WP2 the assertion lived in helpers/transfers.py, which was the only
-    place holding both values at once. Conversion has moved to the read path, so
-    the check moved with it.
+    Before WP2 the assertion lived in the since-deleted helpers/transfers.py
+    (removed 2026-08-10), which was then the only place holding both values at
+    once. Conversion has moved to the read path, so the check moved with it.
     """
     row = await conn.fetchrow(
         "SELECT main_currency, display_timezone FROM user_settings WHERE user_id = $1",

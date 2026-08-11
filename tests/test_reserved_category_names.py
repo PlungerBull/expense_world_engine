@@ -1,9 +1,11 @@
 """Reserved system-category names (bug 7.4).
 
-A user category claiming @Debt/@Transfer/@Opening used to succeed, after which
-every ``ensure_system_category`` seed for that key hit the LOWER(name) unique
+A user category claiming @Opening used to succeed, after which every
+``ensure_system_category`` seed for that key hit the LOWER(name) unique
 index — which the INSERT's ON CONFLICT arbiter (system_key) does not cover —
-and 500'd transfers/opening balances forever. Two layers close it:
+and 500'd opening balances forever. @Opening is the only reserved name left:
+@Debt and @Transfer went with the transfer removal (2026-08-10), which is why
+the tests below read as one name rather than three. Two layers close it:
 
   * boundary: POST /categories and PUT rename reject reserved names on
     non-system rows with 422 (system rows rename freely — lookup is by
@@ -55,7 +57,7 @@ async def test_put_rejects_renaming_user_category_to_reserved_name(client, test_
     try:
         r = await client.put(
             f"/v1/categories/{category_id}",
-            json={"name": "@transfer"},
+            json={"name": "@opening"},
             headers=_idem(),
         )
         assert r.status_code == 422, r.text
@@ -72,23 +74,23 @@ async def test_system_category_renames_freely_including_back_to_default(client, 
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             system_id = await ensure_system_category(
-                conn, test_data.user_id, SystemCategoryKey.TRANSFER
+                conn, test_data.user_id, SystemCategoryKey.OPENING_BALANCE
             )
 
     away = await client.put(
         f"/v1/categories/{system_id}",
-        json={"name": "Between accounts"},
+        json={"name": "Where tracking starts"},
         headers=_idem(),
     )
     assert away.status_code == 200, away.text
 
     back = await client.put(
         f"/v1/categories/{system_id}",
-        json={"name": SYSTEM_CATEGORY_DEFAULT_NAMES[SystemCategoryKey.TRANSFER]},
+        json={"name": SYSTEM_CATEGORY_DEFAULT_NAMES[SystemCategoryKey.OPENING_BALANCE]},
         headers=_idem(),
     )
     assert back.status_code == 200, back.text
-    assert back.json()["name"] == "@Transfer"
+    assert back.json()["name"] == "@Opening"
 
 
 @pytest.mark.asyncio
@@ -108,13 +110,13 @@ async def test_seeding_over_prefix_squatter_row_raises_409_not_500():
             await conn.execute(
                 """INSERT INTO expense_categories
                     (id, user_id, name, color, is_system, sort_order, created_at, updated_at)
-                   VALUES ($1, $2, '@transfer', '#111111', false, 1, now(), now())""",
+                   VALUES ($1, $2, '@opening', '#111111', false, 1, now(), now())""",
                 str(uuid.uuid4()), squat_user_id,
             )
             with pytest.raises(AppError) as exc_info:
                 async with conn.transaction():
                     await ensure_system_category(
-                        conn, squat_user_id, SystemCategoryKey.TRANSFER
+                        conn, squat_user_id, SystemCategoryKey.OPENING_BALANCE
                     )
             assert exc_info.value.status_code == 409
         finally:

@@ -12,9 +12,11 @@ Covers the wire-contract guarantees clients depend on:
     (the /sync sibling test went with the endpoint, sql/023). There is
     one amount to flip now, not two.
   * The system_key column on expense_categories survives a display-name
-    rename — a renamed @Transfer / @Debt is still found by the transfer
-    pipeline, so subsequent transfers reuse the same row instead of
-    lazily creating a duplicate. This was the bug Sprint 1.1 fixed.
+    rename — a renamed @Opening is still found by the opening-balance
+    pipeline, so subsequent opening balances reuse the same row instead of
+    lazily creating a duplicate. This was the bug Sprint 1.1 fixed (then on
+    @Transfer / @Debt, which left with the transfer removal, 2026-08-10;
+    `opening_balance` is the one system key remaining).
 
 Run: .venv/bin/pytest tests/test_audit_response_shape.py -v
 """
@@ -93,7 +95,6 @@ async def test_inbox_response_carries_no_home_value_or_rate(client, test_data):
         assert body["amount_cents"] == 1000  # stored positive
         for gone in (
             "amount_home_cents",
-            "transfer_amount_home_cents",
             "exchange_rate",
         ):
             assert gone not in body, f"{gone} should be absent, not null: {body}"
@@ -233,126 +234,120 @@ async def test_debit_as_negative_flips_inbox_expense_amounts(client, test_data):
 
 @pytest.mark.asyncio
 async def test_system_category_survives_rename(client, test_data):
-    """The transfer pipeline auto-seeds @Transfer (system_key='transfer')
-    on first use. After a user renames the display name, a subsequent
-    transfer must REUSE the same category row — looking up by system_key,
-    not by name. Pre-Sprint-1.1 this lazily created a new @Transfer row
-    every time, fragmenting category history.
+    """The opening-balance pipeline auto-seeds @Opening
+    (system_key='opening_balance') on first use. After a user renames the
+    display name, a subsequent opening balance must REUSE the same category
+    row — looking up by system_key, not by name. Pre-Sprint-1.1 this lazily
+    created a new system row every time, fragmenting category history.
     """
-    # Need a second account to enable transfer.
-    second_account_id = str(uuid.uuid4())
+    # One opening balance per account, so the two seeds need two accounts.
+    account_a_id = str(uuid.uuid4())
+    account_b_id = str(uuid.uuid4())
     async with db.pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO expense_bank_accounts
-                (id, user_id, name, currency_code, is_person, color,
-                 is_archived, sort_order, created_at, updated_at)
-            VALUES ($1, $2, 'rename-target', 'PEN', false, '#abcdef',
-                    false, 9, now(), now())
-            """,
-            second_account_id, test_data.user_id,
-        )
+        for account_id in (account_a_id, account_b_id):
+            await conn.execute(
+                """
+                INSERT INTO expense_bank_accounts
+                    (id, user_id, name, currency_code, is_person, color,
+                     is_archived, sort_order, created_at, updated_at)
+                VALUES ($1, $2, $3, 'PEN', false, '#abcdef',
+                        false, 9, now(), now())
+                """,
+                account_id, test_data.user_id, f"rename-target-{account_id[:8]}",
+            )
 
-    primary_a = sibling_a = primary_b = sibling_b = None
-    transfer_category_id = None
+    opening_a = opening_b = None
+    opening_category_id = None
+    original_name = None
 
     try:
-        # First transfer — auto-seeds @Transfer.
-        primary_a = str(uuid.uuid4())
-        sibling_a = str(uuid.uuid4())
+        # First opening balance — auto-seeds @Opening.
+        opening_a = str(uuid.uuid4())
         r1 = await client.post(
-            "/v1/transactions",
+            f"/v1/accounts/{account_a_id}/opening-balance",
             json={
-                "id": primary_a,
-                "title": f"transfer-1-{uuid.uuid4()}",
-                "amount_cents": -300,
+                "transaction_id": opening_a,
+                "amount_cents": 300,
                 "date": "2026-04-12T12:00:00Z",
-                "account_id": test_data.account_id,
-                "category_id": test_data.category_id,
-                "transfer": {
-                    "id": sibling_a,
-                    "account_id": second_account_id,
-                    "amount_cents": 300,
-                },
+                "title": f"opening-1-{uuid.uuid4()}",
             },
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
         assert r1.status_code == 201, r1.text
         first_category_id = r1.json()["category_id"]
 
-        # Look up the seeded @Transfer row by system_key.
+        # Look up the seeded @Opening row by system_key.
+        opening_row = None
         async with db.pool.acquire() as conn:
-            transfer_row = await conn.fetchrow(
+            opening_row = await conn.fetchrow(
                 """
                 SELECT id, name FROM expense_categories
-                WHERE user_id = $1 AND system_key = 'transfer' AND deleted_at IS NULL
+                WHERE user_id = $1 AND system_key = 'opening_balance'
+                  AND deleted_at IS NULL
                 """,
                 test_data.user_id,
             )
-        assert transfer_row is not None, "Transfer should have seeded a system_key='transfer' row"
-        transfer_category_id = str(transfer_row["id"])
-        original_name = transfer_row["name"]
-        assert first_category_id == transfer_category_id
+        assert opening_row is not None, (
+            "Opening balance should have seeded a system_key='opening_balance' row"
+        )
+        opening_category_id = str(opening_row["id"])
+        original_name = opening_row["name"]
+        assert first_category_id == opening_category_id
 
         # Rename the display name.
-        new_name = f"MyTransfersRenamed-{uuid.uuid4()}"
+        new_name = f"MyOpeningsRenamed-{uuid.uuid4()}"
         rename_r = await client.put(
-            f"/v1/categories/{transfer_category_id}",
+            f"/v1/categories/{opening_category_id}",
             json={"name": new_name},
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
         assert rename_r.status_code == 200, rename_r.text
         assert rename_r.json()["name"] == new_name
 
-        # Second transfer — engine must reuse the same row, NOT auto-create a new @Transfer.
-        primary_b = str(uuid.uuid4())
-        sibling_b = str(uuid.uuid4())
+        # Second opening balance — engine must reuse the same row, NOT
+        # auto-create a new @Opening.
+        opening_b = str(uuid.uuid4())
         r2 = await client.post(
-            "/v1/transactions",
+            f"/v1/accounts/{account_b_id}/opening-balance",
             json={
-                "id": primary_b,
-                "title": f"transfer-2-{uuid.uuid4()}",
-                "amount_cents": -200,
+                "transaction_id": opening_b,
+                "amount_cents": 200,
                 "date": "2026-04-12T12:00:00Z",
-                "account_id": test_data.account_id,
-                "category_id": test_data.category_id,
-                "transfer": {
-                    "id": sibling_b,
-                    "account_id": second_account_id,
-                    "amount_cents": 200,
-                },
+                "title": f"opening-2-{uuid.uuid4()}",
             },
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
         assert r2.status_code == 201, r2.text
         second_category_id = r2.json()["category_id"]
 
-        assert second_category_id == transfer_category_id, (
+        assert second_category_id == opening_category_id, (
             f"Renamed system category should be reused; "
-            f"first transfer used {transfer_category_id}, second used {second_category_id}"
+            f"first seed used {opening_category_id}, second used {second_category_id}"
         )
 
-        # Confirm there's still exactly ONE active row with system_key='transfer'.
+        # Confirm there's still exactly ONE active row with
+        # system_key='opening_balance'.
         async with db.pool.acquire() as conn:
             count = await conn.fetchval(
                 """
                 SELECT count(*) FROM expense_categories
-                WHERE user_id = $1 AND system_key = 'transfer' AND deleted_at IS NULL
+                WHERE user_id = $1 AND system_key = 'opening_balance'
+                  AND deleted_at IS NULL
                 """,
                 test_data.user_id,
             )
-        assert count == 1, f"Expected 1 active transfer system row, found {count}"
+        assert count == 1, f"Expected 1 active opening_balance system row, found {count}"
 
     finally:
         # Restore the original display name so subsequent test runs are deterministic.
-        if transfer_category_id:
+        if opening_category_id and original_name is not None:
             async with db.pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE expense_categories SET name = $1 WHERE id = $2",
-                    original_name, transfer_category_id,
+                    original_name, opening_category_id,
                 )
-        # Delete the test transfer transactions.
-        ids = [tid for tid in (primary_a, sibling_a, primary_b, sibling_b) if tid]
+        # Delete the seeded opening-balance transactions.
+        ids = [tid for tid in (opening_a, opening_b) if tid]
         if ids:
             async with db.pool.acquire() as conn:
                 await conn.execute(
@@ -363,10 +358,9 @@ async def test_system_category_survives_rename(client, test_data):
                     "DELETE FROM expense_transactions WHERE id = ANY($1::uuid[]) AND user_id = $2",
                     ids, test_data.user_id,
                 )
-        # Restore primary account balance (we created two outflows of 300 and 200).
-        # Drop the second account.
+        # Drop the two accounts.
         async with db.pool.acquire() as conn:
             await conn.execute(
-                "DELETE FROM expense_bank_accounts WHERE id = $1 AND user_id = $2",
-                second_account_id, test_data.user_id,
+                "DELETE FROM expense_bank_accounts WHERE id = ANY($1::uuid[]) AND user_id = $2",
+                [account_a_id, account_b_id], test_data.user_id,
             )

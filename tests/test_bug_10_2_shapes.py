@@ -1,6 +1,6 @@
 """Bug 10.2 — error/shape consistency fixes (2026-08-07).
 
-Pins five behaviors:
+Pins three behaviors:
 
   * `/reports/monthly` validation errors never carry null-valued keys in
     `fields` — a key is present iff it has a message.
@@ -9,11 +9,10 @@ Pins five behaviors:
   * `GET /exchange-rates` treats an unsupported currency as a 422 field error
     (same as the write paths), reserving 404 for a supported pair with no rate
     row on/before the date.
-  * The transfer id-collision check (`transfer.id == id`) is accumulated with
-    the other field errors — one 422, all failing fields — on both
-    `POST /transactions` and the promote path.
-  * Promoting a transfer draft links BOTH ledger legs back to the inbox row
-    via `inbox_id` (amended 2026-08-07; previously primary only).
+
+(The two transfer pins — the `transfer.id == id` collision accumulating with
+the other field errors, and promote backlinking both legs — left with the
+transfer feature, 2026-08-10.)
 """
 
 import uuid
@@ -114,22 +113,16 @@ async def test_user_category_has_null_system_key(client):
 
 @pytest.mark.asyncio
 async def test_system_category_exposes_its_key(client, test_data):
-    """Creating a transfer auto-creates @Transfer; its key must be on the wire."""
-    sibling = await _make_account(test_data.user_id, "syskey-sibling")
+    """Seeding an opening balance auto-creates @Opening; its key must be on the wire."""
+    account_id = await _make_account(test_data.user_id, "syskey-opening")
     try:
         r = await client.post(
-            "/v1/transactions",
+            f"/v1/accounts/{account_id}/opening-balance",
             json={
-                "id": str(uuid.uuid4()),
-                "title": f"syskey-{uuid.uuid4().hex[:8]}",
-                "amount_cents": -1200,
+                "transaction_id": str(uuid.uuid4()),
+                "amount_cents": 5000,
                 "date": PAST_DATE,
-                "account_id": test_data.account_id,
-                "transfer": {
-                    "id": str(uuid.uuid4()),
-                    "account_id": sibling,
-                    "amount_cents": 1200,
-                },
+                "title": f"syskey-{uuid.uuid4().hex[:8]}",
             },
             headers=_idem(),
         )
@@ -137,9 +130,9 @@ async def test_system_category_exposes_its_key(client, test_data):
 
         cats = await client.get("/v1/categories", params={"limit": 200})
         keys = {c["system_key"] for c in cats.json()["items"] if c["is_system"]}
-        assert "transfer" in keys
+        assert "opening_balance" in keys
     finally:
-        await _cleanup_account(sibling)
+        await _cleanup_account(account_id)
 
 
 # ---------------------------------------------------------------------------
@@ -233,115 +226,3 @@ async def test_inbox_put_rejects_explicit_null_title(client, test_data):
 
     await client.delete(f"/v1/inbox/{inbox_id}", headers=_idem())
 
-
-# ---------------------------------------------------------------------------
-# transfer.id == id — accumulated, not a second round trip
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_transfer_id_collision_accumulates_with_other_errors(client, test_data):
-    sibling = await _make_account(test_data.user_id, "collision-sibling")
-    shared_id = str(uuid.uuid4())
-    try:
-        r = await client.post(
-            "/v1/transactions",
-            json={
-                "id": shared_id,
-                "title": "collision",
-                "amount_cents": -5000,
-                "date": PAST_DATE,
-                "account_id": test_data.account_id,
-                "transfer": {
-                    "id": shared_id,       # collision
-                    "account_id": sibling,
-                    "amount_cents": 0,      # second, independent failure
-                },
-            },
-            headers=_idem(),
-        )
-        assert r.status_code == 422, r.text
-        fields = r.json()["error"]["fields"]
-        # Both failures in ONE response — the collision check no longer fires
-        # on its own after the accumulator has already raised.
-        assert "transfer.id" in fields
-        assert "transfer.amount_cents" in fields
-    finally:
-        await _cleanup_account(sibling)
-
-
-@pytest.mark.asyncio
-async def test_promote_transfer_id_collision_accumulated(client, test_data):
-    sibling = await _make_account(test_data.user_id, "promote-collision")
-    try:
-        draft = await client.post(
-            "/v1/inbox",
-            json={
-                "id": str(uuid.uuid4()),
-                "title": f"promote-collision-{uuid.uuid4().hex[:8]}",
-                "amount_cents": -3000,
-                "date": PAST_DATE,
-                "account_id": test_data.account_id,
-                "transfer": {"account_id": sibling, "amount_cents": 3000},
-            },
-            headers=_idem(),
-        )
-        assert draft.status_code == 201, draft.text
-        inbox_id = draft.json()["id"]
-
-        shared_id = str(uuid.uuid4())
-        r = await client.post(
-            f"/v1/inbox/{inbox_id}/promote",
-            json={"id": shared_id, "transfer_id": shared_id},
-            headers=_idem(),
-        )
-        assert r.status_code == 422, r.text
-        assert "transfer_id" in r.json()["error"]["fields"]
-
-        await client.delete(f"/v1/inbox/{inbox_id}", headers=_idem())
-    finally:
-        await _cleanup_account(sibling)
-
-
-# ---------------------------------------------------------------------------
-# Promote links BOTH legs to the inbox row
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_promote_sets_inbox_id_on_both_legs(client, test_data):
-    sibling = await _make_account(test_data.user_id, "backlink-sibling")
-    try:
-        draft = await client.post(
-            "/v1/inbox",
-            json={
-                "id": str(uuid.uuid4()),
-                "title": f"backlink-{uuid.uuid4().hex[:8]}",
-                "amount_cents": -4000,
-                "date": PAST_DATE,
-                "account_id": test_data.account_id,
-                "transfer": {"account_id": sibling, "amount_cents": 4000},
-            },
-            headers=_idem(),
-        )
-        assert draft.status_code == 201, draft.text
-        inbox_id = draft.json()["id"]
-
-        primary_id, sibling_id = str(uuid.uuid4()), str(uuid.uuid4())
-        r = await client.post(
-            f"/v1/inbox/{inbox_id}/promote",
-            json={"id": primary_id, "transfer_id": sibling_id},
-            headers=_idem(),
-        )
-        assert r.status_code == 200, r.text
-
-        async with db.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT id, inbox_id FROM expense_transactions WHERE id = ANY($1::uuid[])",
-                [primary_id, sibling_id],
-            )
-        assert len(rows) == 2
-        for row in rows:
-            assert str(row["inbox_id"]) == inbox_id, (
-                f"leg {row['id']} lost its inbox backlink"
-            )
-    finally:
-        await _cleanup_account(sibling)

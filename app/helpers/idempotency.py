@@ -238,7 +238,7 @@ async def run_idempotent(
     update/delete/restore paths, the inbox row on promote — never on the account.
     Their purpose is to keep a read-modify-write sequence coherent: the
     before/after pair written to ``activity_log`` must describe one state of the
-    row, and the transfer-pair invariants must see a stable sibling.
+    row.
 
     (Until sql/022 this convention was documented in ``app/helpers/balance.py``
     and cross-referenced from five other modules. It lived there because the

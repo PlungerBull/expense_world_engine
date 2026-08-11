@@ -1,11 +1,14 @@
 """Every request model fails closed: unknown fields 422, never dropped.
 
 Bloat audit 2026-08-06, Correctness §2: `extra="forbid"` was copy-pasted onto
-11 request models and missing from 10 — including the two nested transfer
-fragments (TransferField, InboxTransferField), where Pydantic's non-propagating
-model_config silently re-opened the hole inside `transfer: {...}` even though
-the parent model forbade extras. All request models now inherit
+11 request models and missing from 10. All request models now inherit
 schemas.StrictModel; these tests pin the previously-leaky shapes.
+
+The nested-fragment pins left with the transfer removal (2026-08-10): the only
+nested request fragments were TransferField / InboxTransferField, where
+Pydantic's non-propagating model_config silently re-opened the hole inside
+`transfer: {...}` even though the parent forbade extras. No nested fragment
+exists to pin today — the next one must bring its own pin.
 
 Pattern per test_wp5_schema_slimming.py: 422, VALIDATION_ERROR, junk key named
 in `fields` (nested keys as dotted paths, per errors.py's loc join).
@@ -106,57 +109,3 @@ async def test_batch_rejects_unknown_fields_top_level_and_per_item(client, test_
         headers=_idem(),
     )
     _assert_rejects(r, "transactions.0.bogus")
-
-
-@pytest.mark.asyncio
-async def test_transaction_create_rejects_junk_inside_transfer(client, test_data):
-    """The nested-model hole: TransferField was plain BaseModel, so junk under
-    the `transfer` key was dropped even though the parent forbade extras."""
-    r = await client.post(
-        "/v1/transactions",
-        json={
-            "id": str(uuid.uuid4()),
-            "title": "strict transfer",
-            "amount_cents": -100,
-            "date": "2026-08-01T12:00:00Z",
-            "account_id": test_data.account_id,
-            "transfer": {
-                "id": str(uuid.uuid4()),
-                "account_id": test_data.account_id,
-                "amount_cents": 100,
-                "bogus": 1,
-            },
-        },
-        headers=_idem(),
-    )
-    _assert_rejects(r, "transfer.bogus")
-
-
-@pytest.mark.asyncio
-async def test_inbox_create_and_update_reject_junk_inside_transfer(client, test_data):
-    r = await client.post(
-        "/v1/inbox",
-        json={
-            "id": str(uuid.uuid4()),
-            "title": "strict draft",
-            "transfer": {
-                "account_id": test_data.account_id,
-                "amount_cents": 100,
-                "bogus": 1,
-            },
-        },
-        headers=_idem(),
-    )
-    _assert_rejects(r, "transfer.bogus")
-    r = await client.put(
-        f"/v1/inbox/{test_data.inbox_id}",
-        json={
-            "transfer": {
-                "account_id": test_data.account_id,
-                "amount_cents": 100,
-                "bogus": 1,
-            }
-        },
-        headers=_idem(),
-    )
-    _assert_rejects(r, "transfer.bogus")

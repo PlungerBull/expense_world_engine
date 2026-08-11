@@ -8,26 +8,11 @@ from app.constants import InboxStatus, TransactionType
 from app.schemas import StrictModel, audit_fields, opt_id, owned_fields
 
 
-class InboxTransferField(StrictModel):
-    """The sibling leg of a transfer draft.
-
-    Deliberately NOT ``TransferField`` (``schemas/transactions.py``). That model
-    requires an ``id`` — the sibling ledger row's client-supplied UUID — which is
-    meaningless on an inbox row: no ledger rows exist yet, and the sibling's id
-    arrives later as ``InboxPromoteRequest.transfer_id``. The inbox required it
-    at the schema layer and then discarded it, so the documented request shape
-    422'd and a supplied value was silently dropped
-    (WP7.2, docs/audit-2026-08-01-remediation-plan.md:221).
-    """
-
-    account_id: UUID
-    amount_cents: int  # signed: negative=outflow from the sibling, positive=inflow
-
-
 class InboxCreateRequest(StrictModel):
     # Unknown fields 422. The inbox is loose about WHICH fields are null, never
     # about what a field means — and `exchange_rate` no longer means anything
-    # (sql/021), so accepting it silently would be the looser of the two.
+    # (sql/021), nor does `transfer` (removed 2026-08-10), so accepting either
+    # silently would be the looser of the two.
     id: UUID
     title: Optional[str] = None
     description: Optional[str] = None
@@ -36,7 +21,6 @@ class InboxCreateRequest(StrictModel):
     # UUID-typed like `id` — malformed FKs 422 at the boundary (open-bugs 6.6).
     account_id: Optional[UUID] = None
     category_id: Optional[UUID] = None
-    transfer: Optional[InboxTransferField] = None
 
 
 class InboxUpdateRequest(StrictModel):
@@ -46,13 +30,10 @@ class InboxUpdateRequest(StrictModel):
     date: Optional[AwareDatetime] = None
     account_id: Optional[UUID] = None
     category_id: Optional[UUID] = None
-    # Explicit null clears the transfer — see update_inbox_item.
-    transfer: Optional[InboxTransferField] = None
 
 
 class InboxPromoteRequest(StrictModel):
-    id: UUID  # target ledger transaction id (primary leg for transfer promotes)
-    transfer_id: Optional[UUID] = None  # sibling ledger transaction id for transfer promotes
+    id: UUID  # target ledger transaction id
 
 
 class InboxResponse(BaseModel):
@@ -65,9 +46,7 @@ class InboxResponse(BaseModel):
     # frozen before the draft even had a date — which is precisely how a $100
     # receipt used to promote as 100 PEN cents.
     amount_cents: Optional[int] = None
-    # Direction of the PRIMARY leg (the inbox row itself) when this is a
-    # transfer draft. Nullable: a sparse draft with no amount yet has no
-    # direction. The sibling's direction is the inverse and is never stored.
+    # Direction. Nullable: a sparse draft with no amount yet has no direction.
     # Enum-typed like the ledger twin; sql/020 CHECKs the column (with an
     # explicit IS NULL arm).
     transaction_type: Optional[TransactionType] = None
@@ -77,8 +56,6 @@ class InboxResponse(BaseModel):
     # PENDING or PROMOTED — a dismissed row is PENDING + deleted_at, never a
     # third value. sql/029 CHECKs the column.
     status: InboxStatus
-    transfer_account_id: Optional[str] = None
-    transfer_amount_cents: Optional[int] = None  # always positive
     created_at: datetime
     updated_at: datetime
     version: int
@@ -86,19 +63,15 @@ class InboxResponse(BaseModel):
 
 
 def inbox_from_row(row) -> dict:
-    amount_cents = row["amount_cents"]
-    transfer_amount_cents = row["transfer_amount_cents"]
     return InboxResponse(
         **owned_fields(row),
         title=row["title"],
         description=row["description"],
-        amount_cents=amount_cents,
+        amount_cents=row["amount_cents"],
         transaction_type=row["transaction_type"],
         date=row["date"],
         account_id=opt_id(row["account_id"]),
         category_id=opt_id(row["category_id"]),
         status=row["status"],
-        transfer_account_id=opt_id(row["transfer_account_id"]),
-        transfer_amount_cents=transfer_amount_cents,
         **audit_fields(row),
     ).model_dump(mode="json")

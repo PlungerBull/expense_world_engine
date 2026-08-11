@@ -26,9 +26,9 @@ class CategoryResponse(BaseModel):
     name: str
     color: str
     is_system: bool
-    # Immutable discriminator ('debt' / 'transfer' / 'opening_balance'), null for
-    # user categories. Not an IDs-only violation: it is identity, not a hydrated
-    # copy of the renameable display name.
+    # Immutable discriminator ('opening_balance'), null for user categories.
+    # Not an IDs-only violation: it is identity, not a hydrated copy of the
+    # renameable display name.
     system_key: Optional[str] = None
     sort_order: int
     created_at: datetime

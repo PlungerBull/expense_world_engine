@@ -11,8 +11,6 @@ These tests pin what that buys and what it costs:
     wearing a home label.
   * `/dashboard` and `/reports/monthly` agree about the same month, because
     they share `compute_month_flow`.
-  * A cross-currency transfer now shows the FX spread the bank charged. It used
-    to be forced to zero at write time by direct assignment.
   * Correcting a rate corrects every past report that used it.
   * `exchange_rate` on any write request is a `422`, not a silent drop.
   * A row's rate date resolves in the user's `display_timezone` — the same zone
@@ -44,7 +42,7 @@ from app import db
 from app.helpers.exchange_rate import clear_rate_cache
 
 
-# 2022-05-10 is this file's working rate date; the transfer scenarios are dated
+# 2022-05-10 is this file's working rate date; the priceable scenarios are dated
 # to it. 3.58 is the rate docs/currency-model-decision.md uses in its worked
 # example, kept so the numbers below read the same as the design record.
 RATE_DATE = date(2022, 5, 10)
@@ -126,11 +124,6 @@ async def fx(test_data, db_pool):
                 data.txn_ids,
             )
             await conn.execute(
-                "UPDATE expense_transactions SET transfer_transaction_id = NULL"
-                " WHERE id = ANY($1::uuid[])",
-                data.txn_ids,
-            )
-            await conn.execute(
                 "DELETE FROM expense_transactions WHERE id = ANY($1::uuid[])",
                 data.txn_ids,
             )
@@ -170,8 +163,6 @@ async def _create(client, fx: Fixtures, **overrides) -> dict:
     assert r.status_code == 201, r.text
     body = r.json()
     fx.txn_ids.append(body["id"])
-    if body.get("transfer_transaction_id"):
-        fx.txn_ids.append(body["transfer_transaction_id"])
     return body
 
 
@@ -286,78 +277,6 @@ async def test_dashboard_and_monthly_report_agree_about_the_same_month(client, f
     assert dashboard["month"] == {"year": now.year, "month": now.month}
     assert dashboard["totals"] == report["totals"]
     assert _category(dashboard, fx.category_id) == _category(report, fx.category_id)
-
-
-# ---------------------------------------------------------------------------
-# Transfers: the FX spread stops being hidden
-# ---------------------------------------------------------------------------
-@pytest.mark.asyncio
-async def test_a_cross_currency_transfer_reports_the_fx_spread(client, fx):
-    """Send $1,000, receive S/3,450, market rate 3.58 → @Transfer shows −S/130.
-
-    That S/130 is a real cost really paid — the spread the bank charged — and it
-    used to be invisible. The old dominant-side rule valued one leg and then
-    ASSIGNED the other leg the same home value, so the pair summed to exactly
-    zero by construction whatever the market said.
-
-    So `@Transfer != 0` now means one of exactly two things: an FX spread, or a
-    loan/repayment with a person whose other leg landed in @Debt with nothing to
-    cancel against. There is deliberately no separate @FX category — owner
-    decision, 2026-08-05; see docs/currency-model-decision.md.
-    """
-    await _create(
-        client, fx,
-        account_id=fx.usd_account_id,
-        amount_cents=-100000,          # $1,000.00 out
-        transfer={
-            "id": str(uuid.uuid4()),
-            "account_id": fx.pen_account_id,
-            "amount_cents": 345000,    # S/3,450.00 in
-        },
-    )
-
-    report = await _report(client, 2022, 5)
-    transfer_cat = next(
-        (c for c in report["categories"] if c["name"] == "@Transfer"), None,
-    )
-    assert transfer_cat is not None, "the engine must have created @Transfer"
-
-    # USD leg: −round(100000 * 3.58) = −358000. PEN leg: +345000.
-    assert transfer_cat["spent_home_cents"] == -13000
-    assert transfer_cat["unconverted_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_a_same_currency_transfer_still_cancels_exactly(client, fx):
-    """USD → USD under a PEN home: both legs price at the same rate, so they cancel.
-
-    Nothing forces this any more. The legs cancel because they are equal amounts
-    in the same currency on the same date, which is the only reason they ever
-    should have.
-
-    This is also open bug 1.3's ground: a USD→USD transfer used to reach a
-    `raise RuntimeError` and return an uncaught 500, because the dominant-side
-    rule had no branch for "neither leg is the home currency". There is no rule
-    left to fall off.
-    """
-    await _create(
-        client, fx,
-        account_id=fx.usd_account_id,
-        amount_cents=-50000,
-        transfer={
-            "id": str(uuid.uuid4()),
-            "account_id": fx.usd_account_2_id,
-            "amount_cents": 50000,
-        },
-    )
-
-    report = await _report(client, 2022, 5)
-    transfer_cat = next(
-        (c for c in report["categories"] if c["name"] == "@Transfer"), None,
-    )
-    assert transfer_cat is not None
-    assert transfer_cat["spent_home_cents"] == 0
-    assert transfer_cat["unconverted_count"] == 0
 
 
 # ---------------------------------------------------------------------------

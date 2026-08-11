@@ -5,7 +5,7 @@ the same hazard one layer deeper. FK fields in request bodies are typed
 ``uuid.UUID`` like the ``id`` PKs beside them, so garbage 422s at the schema
 boundary with the standard envelope instead of reaching SQL as a bind param
 and 500ing. Field keys follow the handler's dotted-loc convention
-(``transfer.account_id``, ``transactions.0.category_id``).
+(``transactions.0.category_id``).
 """
 import pytest
 
@@ -24,13 +24,6 @@ DATE = "2026-01-15T12:00:00Z"
             {"id": VALID, "title": "t", "amount_cents": -100, "date": DATE,
              "account_id": "not-a-uuid", "category_id": VALID},
             "account_id",
-        ),
-        (
-            "POST", "/v1/transactions",
-            {"id": VALID, "title": "t", "amount_cents": -100, "date": DATE,
-             "account_id": VALID,
-             "transfer": {"id": VALID, "account_id": "not-a-uuid", "amount_cents": 100}},
-            "transfer.account_id",
         ),
         (
             "PUT", f"/v1/transactions/{VALID}",

@@ -7,7 +7,6 @@ This module is the most complex service in the codebase because transactions
 intersect with every other domain:
 
   * hashtag junction rows (via the private ``_sync_hashtags``)
-  * transfer pair atomicity (via helpers.transfers.create_transfer_pair)
   * reconciliation field-locking and cascade unassignment
 
 ## Account balances are not written here
@@ -28,29 +27,21 @@ The ``FOR UPDATE`` locks in ``update_transaction``, ``delete_transaction`` and
 ``restore_transaction`` are still load-bearing, but **not for the reason they
 were added.** They were introduced to stop a concurrent write changing
 ``amount_cents`` between our read and our balance reversal — a lost update on a
-stored balance, which is now unrepresentable. What they still protect:
-
-  * **The activity-log pair.** Every one of these flows reads a ``before_row``,
-    mutates, then writes both snapshots. Without the lock the two halves can
-    describe two different states and the audit trail records a change that
-    never happened.
-  * **Transfer-pair invariants.** ``restore_transaction`` refuses to restore one
-    leg of an asymmetric pair; that check is only sound if the sibling is pinned
-    while it runs.
+stored balance, which is now unrepresentable. What they still protect: **the
+activity-log pair.** Every one of these flows reads a ``before_row``, mutates,
+then writes both snapshots. Without the lock the two halves can describe two
+different states and the audit trail records a change that never happened.
 
 Stated explicitly because the stale rationale would otherwise invite the next
 reader to delete the locks as vestigial. They are not.
 
 ## "No-split zones"
 
-Two flows are tight atomic units that must not be decomposed further:
+One flow is a tight atomic unit that must not be decomposed further: the
+dynamic field-mutation chain in ``update_transaction`` — each conditional
+depends on whether specific keys are present in ``fields``.
 
-  * ``create_transfer_pair`` (transfer orchestration — stays intact in
-    ``app.helpers.transfers``)
-  * The dynamic field-mutation chain in ``update_transaction`` — each
-    conditional depends on whether specific keys are present in ``fields``
-
-``create_batch``'s balance-delta accumulation loop used to be a third. It is
+``create_batch``'s balance-delta accumulation loop used to be a second. It is
 gone: it existed only to turn N per-item balance writes into K UPDATEs, and it
 carried its own hand-rolled copy of the sign matrix to do so.
 """
@@ -64,7 +55,6 @@ from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import (
     dynamic_update,
-    fetch_owned_row,
     fetch_owned_row_or_404,
     soft_delete,
 )
@@ -91,13 +81,6 @@ from app.schemas.transactions import (
     infer_transaction_type,
     transaction_from_row,
 )
-
-# Fields a transfer leg may change via PUT — everything else in ``fields`` is
-# rejected by the guard in ``update_transaction``. See the comment there for
-# why these three are safe and why ``hashtag_ids``/``reconciliation_id`` are
-# absent (they never enter ``fields``).
-ALLOWED_ON_TRANSFER_LEG = {"title", "description", "cleared"}
-
 
 # ---------------------------------------------------------------------------
 # hashtag_ids attach helpers (shared by every transaction-returning endpoint)
@@ -196,7 +179,7 @@ async def _cascade_junctions_delete(
     """Soft-delete the transaction's active ledger junction rows.
 
     The single producer of junction ``deleted_at`` markers — used by the
-    delete cascade (both transfer legs) and by ``_sync_hashtags`` step 1.
+    delete cascade and by ``_sync_hashtags`` step 1.
 
     **The marker is load-bearing.** Postgres ``now()`` returns
     ``transaction_timestamp()`` — one value per DB transaction — so every
@@ -363,19 +346,18 @@ async def insert_transaction_row(
     category_id,
     cleared: bool = False,
     inbox_id=None,
-    transfer_transaction_id=None,
 ) -> asyncpg.Record:
-    """The one INSERT INTO expense_transactions (create, batch, promote, and
-    both transfer legs). Every column always appears in the column list —
-    absent concepts bind NULL/False — so a future column cannot be silently
-    missed at one of five sites (the create_batch sign-matrix incident's
-    failure shape). ``reconciliation_id`` is deliberately not a parameter:
-    no insert path assigns it; it is only ever set by later UPDATEs.
+    """The one INSERT INTO expense_transactions (create, batch, promote).
+    Every column always appears in the column list — absent concepts bind
+    NULL/False — so a future column cannot be silently missed at one of the
+    sites (the create_batch sign-matrix incident's failure shape).
+    ``reconciliation_id`` is deliberately not a parameter: no insert path
+    assigns it; it is only ever set by later UPDATEs.
 
     Values are the STORAGE forms: ``amount_cents`` positive with
     ``transaction_type`` carrying direction, ``title`` as the caller wants
     it stored (create/batch strip request input; promote copies the inbox
-    title verbatim — it was normalized at inbox-write time).
+    title verbatim — see open-bugs "inbox-title").
 
     Owns the single UniqueViolation → 409 translation for this table.
     """
@@ -385,9 +367,9 @@ async def insert_transaction_row(
             INSERT INTO expense_transactions
                 (id, user_id, title, description, amount_cents,
                  transaction_type, date, account_id, category_id,
-                 cleared, inbox_id, transfer_transaction_id,
+                 cleared, inbox_id,
                  created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                     now(), now())
             RETURNING *
             """,
@@ -402,7 +384,6 @@ async def insert_transaction_row(
             category_id,
             cleared,
             inbox_id,
-            transfer_transaction_id,
         )
     except asyncpg.UniqueViolationError:
         raise conflict(f"A transaction with id '{transaction_id}' already exists.")
@@ -417,15 +398,11 @@ async def create_transaction(
     user_id: str,
     body: TransactionCreateRequest,
 ) -> dict:
-    """Create a transaction (either a normal ledger entry or a transfer pair).
+    """Create a transaction in the ledger.
 
-    Branches on ``body.transfer`` — if present, delegates to
-    ``create_transfer_pair`` (which handles the dual-insert + dual-balance
-    update atomically) and then syncs hashtags on the primary leg.
-
-    Otherwise validates account/category existence, infers
-    ``transaction_type`` from the sign of ``amount_cents``, inserts the row,
-    applies the balance delta, syncs hashtags, and writes an activity log entry.
+    Validates account/category existence, infers ``transaction_type`` from
+    the sign of ``amount_cents``, inserts the row, syncs hashtags, and
+    writes an activity log entry.
 
     **No currency work happens here.** The row is stored in its account's own
     currency and converted at read time (helpers/home_currency.py). Recording
@@ -446,49 +423,11 @@ async def create_transaction(
     if body.amount_cents == 0:
         errors["amount_cents"] = MSG_NOT_ZERO
 
-    # category_id is required for normal transactions but ignored for
-    # transfers — the transfer engine auto-assigns @Transfer/@Debt and
-    # discards any category_id passed in. Only enforce it on the non-transfer
-    # path so callers aren't forced to send a value the engine throws away.
-    if body.transfer is None and not body.category_id:
-        errors["category_id"] = "Required for non-transfer transactions."
-
     if body.date > await db_now(conn):
         errors["date"] = MSG_NOT_FUTURE
 
     if errors:
         raise validation_error("Transaction validation failed.", errors)
-
-    # ----- Transfer branch -----
-    if body.transfer is not None:
-        # Imported lazily to avoid a circular import: transfers.py itself
-        # imports transaction_from_row from schemas, not from this module,
-        # but keeping the import local makes the dependency obvious.
-        from app.helpers.transfers import create_transfer_pair
-
-        primary_response, _sibling = await create_transfer_pair(
-            conn=conn,
-            user_id=user_id,
-            primary_id=body.id,
-            sibling_id=body.transfer.id,
-            primary_title=title,
-            primary_description=body.description,
-            primary_amount_cents=body.amount_cents,
-            primary_account_id=body.account_id,
-            primary_date=body.date,
-            primary_cleared=body.cleared if body.cleared is not None else False,
-            transfer_account_id=body.transfer.account_id,
-            transfer_amount_cents=body.transfer.amount_cents,
-        )
-
-        # Hashtags on primary only
-        if body.hashtag_ids:
-            await _sync_hashtags(conn, primary_response["id"], user_id, body.hashtag_ids)
-
-        await attach_hashtag_ids(conn, primary_response)
-        return primary_response
-
-    # ----- Normal (non-transfer) branch -----
 
     # Validate account and category via shared helpers. These raise
     # AppError on failure, which the router surfaces as a 422 — matches
@@ -567,11 +506,6 @@ async def update_transaction(
     completed reconciliation, certain fields are immutable and the
     service raises 422 rather than silently dropping them.
 
-    Transfer edit guard: if this transaction is part of a transfer pair,
-    only the fields in ``ALLOWED_ON_TRANSFER_LEG`` (title, description,
-    cleared) may change; anything else is rejected with 422 (transfers
-    are edited by deleting and recreating).
-
     Args:
         fields: columns to update, after ``hashtag_ids`` and
             ``reconciliation_id`` have been removed by the caller.
@@ -645,35 +579,6 @@ async def update_transaction(
             raise validation_error(
                 "Reconciliation validation failed.",
                 {"reconciliation_id": "Cannot assign transactions to a completed reconciliation."},
-            )
-
-    # Transfer edit guard — allow-list. On a transfer leg, only fields with
-    # no cross-leg invariant may change; everything else is rejected, so a
-    # column added to TransactionUpdateRequest later is blocked here by
-    # default. Transfers are otherwise edited by delete + recreate.
-    #
-    # Why the allowed three are safe: ``title`` and ``description`` are pure
-    # display; ``cleared`` is genuinely per-leg (each leg clears at its own
-    # bank on its own schedule). ``hashtag_ids`` and ``reconciliation_id``
-    # never appear in ``fields`` — the router passes them as separate
-    # parameters — and both are per-leg too (a reconciliation is scoped to
-    # one account, and the legs are on different accounts), so they need no
-    # handling here.
-    #
-    # Why the rest are blocked: a one-sided ``amount_cents`` change breaks
-    # the pair's netting; ``account_id`` moves a leg to an account the pair
-    # was never between; ``date`` lands the legs in different months, which
-    # is what would let @Transfer report a spread that was never paid; and
-    # ``category_id`` moves one leg out of @Transfer/@Debt, stranding the
-    # sibling with nothing to cancel against. Blocked outright rather than
-    # mirrored — the legs legitimately hold *different* categories (@Debt on
-    # a person leg, @Transfer on the real one).
-    if before_row["transfer_transaction_id"] is not None:
-        blocked = set(fields) - ALLOWED_ON_TRANSFER_LEG
-        if blocked:
-            raise validation_error(
-                "Transfer edits not yet supported.",
-                {f: "Cannot modify on a transfer transaction." for f in sorted(blocked)},
             )
 
     # Process amount_cents change
@@ -777,15 +682,20 @@ async def _recon_warning(conn: asyncpg.Connection, user_id: str, recon_id) -> Op
     return None
 
 
-async def _delete_leg(
+async def delete_transaction(
     conn: asyncpg.Connection,
     user_id: str,
-    row: asyncpg.Record,
+    transaction_id: str,
 ) -> dict:
-    """Soft-delete one transaction row: snapshot, delete, cascade junctions, log.
+    """Soft-delete a transaction.
 
-    Runs once per leg of a transfer pair (and once for a plain
-    transaction). The caller holds the row's ``FOR UPDATE`` lock.
+    The response carries ``warnings: list[str]`` — always present on this
+    endpoint, empty when the delete is clean: a transaction sitting in a
+    completed reconciliation contributes a staleness note.
+
+    The row is locked with ``FOR UPDATE`` before mutation so the
+    activity-log before/after snapshots describe one state of the row —
+    same hazard as ``update_transaction``, same mitigation.
 
     Not routed through ``query_builder.soft_delete_with_audit``: the
     after-snapshot needs the *async* ``attach_hashtag_ids``, and it must
@@ -793,7 +703,11 @@ async def _delete_leg(
     wire state (``[]``) — ``_mutate_with_audit``'s sync ``serialize`` can
     express neither.
     """
-    transaction_id = str(row["id"])
+    row = await fetch_owned_row_or_404(
+        conn, "expense_transactions", transaction_id, user_id, "transaction",
+        for_update=True,
+    )
+
     before = transaction_from_row(row)
     # Pre-delete hashtag_ids — captured BEFORE the junction cascade below,
     # otherwise the snapshot is empty and the audit trail can't tell what
@@ -816,26 +730,111 @@ async def _delete_leg(
         before_snapshot=before,
         after_snapshot=after,
     )
-    return after
+
+    # Warnings channel — always present (null-over-omission).
+    warnings: list[str] = []
+    warning = await _recon_warning(conn, user_id, row["reconciliation_id"])
+    if warning is not None:
+        warnings.append(warning)
+
+    return {**after, "warnings": warnings}
 
 
-async def _restore_leg(
+# ---------------------------------------------------------------------------
+# Restore
+# ---------------------------------------------------------------------------
+
+async def restore_transaction(
     conn: asyncpg.Connection,
     user_id: str,
-    row: asyncpg.Record,
-    *,
-    unlink: bool,
+    transaction_id: str,
 ) -> dict:
-    """Restore one soft-deleted transaction row: snapshot, un-delete
-    (conditionally clearing ``reconciliation_id``), re-activate junctions, log.
+    """Undo a soft-delete on a transaction.
 
-    The caller locked ``row`` with ``deleted=True, for_update=True``,
-    which is why the UPDATE below needs no ``deleted_at IS NOT NULL``
-    predicate — the row is known soft-deleted and can't change under us.
-    ``query_builder.restore`` is not used because it hard-codes its SET
-    list and cannot express the conditional unlink.
+    Inverse of ``delete_transaction``. Re-activates the cascaded hashtag
+    junction rows (matched by exact ``deleted_at`` timestamp). The whole
+    flow is atomic — caller owns ``conn.transaction()``.
+
+    **Reconciliation handling.** The transaction's ``reconciliation_id``
+    survived the delete on the soft-deleted row. On restore the link is
+    conditionally cleared:
+
+      * recon is null                         → no action
+      * recon is missing or soft-deleted      → unlink, emit warning
+      * recon ``status = COMPLETED``          → unlink, emit warning
+      * recon is DRAFT and active             → keep the link
+
+    The COMPLETED case must unlink because completed reconciliations
+    lock four fields (``amount_cents``, ``account_id``, ``title``,
+    ``date``) on assigned transactions. Silently re-linking would
+    leave the restored row immutable, which the user wouldn't expect.
+    The DRAFT-and-active case is the user's good-path expectation —
+    they were reconciling, deleted by mistake, and want the row back
+    in the same batch without a re-assignment ceremony.
+
+    **Junction rows.** Restored precisely by exact ``deleted_at`` match —
+    see ``_cascade_junctions_delete`` for the marker contract.
+
+    This intentionally differs from ``restore_hashtag`` /
+    ``restore_reconciliation`` which both opt NOT to cascade-restore.
+    The asymmetry is correct: hashtag-restore would silently re-tag
+    dozens of transactions (high blast radius), but transaction-restore
+    re-tags ONE transaction and matches the user's "undo the delete"
+    mental model.
+
+    Validation runs BEFORE any mutation, so a 422 leaves the soft-deleted
+    state untouched.
+
+    Raises:
+        not_found: no soft-deleted transaction with that id.
+        validation_error: account/category is no longer active (or the
+            account is archived). All field-level errors collected into
+            one ``fields`` dict before raising.
     """
-    transaction_id = str(row["id"])
+    # 1. Lock the soft-deleted row. The lock is why the UPDATE below needs
+    #    no ``deleted_at IS NOT NULL`` predicate — the row is known
+    #    soft-deleted and can't change under us.
+    row = await fetch_owned_row_or_404(
+        conn, "expense_transactions", transaction_id, user_id, "transaction",
+        deleted=True, for_update=True,
+    )
+
+    # 2. Validate prerequisites (collect-all-failures pattern).
+    errors: dict = {}
+
+    if await active_account_row(conn, row["account_id"], user_id) is None:
+        errors["account_id"] = MSG_ACTIVE_ACCOUNT
+
+    if await active_category_row(conn, row["category_id"], user_id) is None:
+        errors["category_id"] = MSG_ACTIVE_CATEGORY
+
+    if errors:
+        raise validation_error(
+            "Cannot restore transaction: prerequisites failed.", errors
+        )
+
+    # 3. Resolve the reconciliation decision.
+    unlink = False
+    warning: Optional[str] = None
+    if row["reconciliation_id"] is not None:
+        recon = await fetch_recon_status(conn, user_id, row["reconciliation_id"])
+        if recon is None or recon["deleted_at"] is not None:
+            unlink = True
+            warning = (
+                "Transaction's previous reconciliation no longer exists. "
+                "Link removed on restore."
+            )
+        elif recon["status"] == ReconciliationStatus.COMPLETED:
+            unlink = True
+            warning = (
+                "Transaction's previous reconciliation is completed. "
+                "Link removed on restore — reassign manually if needed."
+            )
+
+    # 4. Restore: snapshot, un-delete (conditionally clearing
+    #    ``reconciliation_id``), re-activate junctions, log.
+    #    ``query_builder.restore`` is not used because it hard-codes its
+    #    SET list and cannot express the conditional unlink.
     before = transaction_from_row(row)
     # Soft-deleted state: cascade-soft-deleted junctions resolve to [] here.
     await attach_hashtag_ids(conn, before)
@@ -868,214 +867,11 @@ async def _restore_leg(
         before_snapshot=before,
         after_snapshot=after,
     )
-    return after
 
-
-async def delete_transaction(
-    conn: asyncpg.Connection,
-    user_id: str,
-    transaction_id: str,
-) -> dict:
-    """Soft-delete a transaction, reverse its balance, and cascade the transfer sibling.
-
-    If the target transaction is part of a transfer pair, the sibling is
-    also soft-deleted and its balance is also reversed (the whole pair
-    disappears atomically, which matches the invariant that transfer
-    pairs are never orphaned).
-
-    The response carries ``warnings: list[str]`` — always present on this
-    endpoint, empty when the delete is clean. The completed-reconciliation
-    check runs per leg: either leg of a transfer pair sitting in a
-    completed reconciliation contributes a note (the sibling's prefixed
-    ``"Transfer sibling: "``, mirroring restore), so clients can surface
-    that the reconciliation totals may now be stale.
-
-    Both the primary and the sibling (if any) are locked with
-    ``FOR UPDATE`` before their balance is reversed — same hazard as
-    ``update_transaction``, same mitigation.
-    """
-    # Fetch under a row-level lock. Previously this fetch lived
-    # outside the transaction, so a concurrent update could change
-    # `amount_cents` before we reversed the balance, causing a
-    # lost-update and silently corrupting the account balance.
-    row = await fetch_owned_row_or_404(
-        conn, "expense_transactions", transaction_id, user_id, "transaction",
-        for_update=True,
-    )
-
-    # Lock the transfer sibling too, so its state can't change between
-    # its before-snapshot and after-snapshot.
-    sibling_row = None
-    if row["transfer_transaction_id"] is not None:
-        # Non-raising fetch: a missing sibling is tolerated (asymmetric pairs
-        # can exist after a one-legged delete), so no _or_404 here.
-        sibling_row = await fetch_owned_row(
-            conn, "expense_transactions", str(row["transfer_transaction_id"]),
-            user_id, for_update=True,
-        )
-
-    # Sibling leg first — its activity-log entry has always preceded the
-    # primary's on a pair delete, and restore mirrors the same order.
-    if sibling_row is not None:
-        await _delete_leg(conn, user_id, sibling_row)
-    after = await _delete_leg(conn, user_id, row)
-
-    # Warnings channel — always present (null-over-omission), checked per leg.
+    # 5. Build warnings list (always present; empty when restore is clean).
     warnings: list[str] = []
-    primary_warning = await _recon_warning(conn, user_id, row["reconciliation_id"])
-    if primary_warning is not None:
-        warnings.append(primary_warning)
-    if sibling_row is not None:
-        sibling_warning = await _recon_warning(
-            conn, user_id, sibling_row["reconciliation_id"]
-        )
-        if sibling_warning is not None:
-            warnings.append("Transfer sibling: " + sibling_warning)
-
-    return {**after, "warnings": warnings}
-
-
-# ---------------------------------------------------------------------------
-# Restore
-# ---------------------------------------------------------------------------
-
-async def restore_transaction(
-    conn: asyncpg.Connection,
-    user_id: str,
-    transaction_id: str,
-) -> dict:
-    """Undo a soft-delete on a transaction, atomically with its sibling.
-
-    Inverse of ``delete_transaction``. Re-applies the balance impact,
-    re-activates the cascaded hashtag junction rows (matched by exact
-    ``deleted_at`` timestamp), and cascades to the transfer sibling for
-    transfer pairs. The whole flow is atomic — caller owns
-    ``conn.transaction()``.
-
-    **Reconciliation handling (per leg).** The transaction's
-    ``reconciliation_id`` survived the delete on the soft-deleted row.
-    On restore the link is conditionally cleared:
-
-      * recon is null                         → no action
-      * recon is missing or soft-deleted      → unlink, emit warning
-      * recon ``status = COMPLETED``          → unlink, emit warning
-      * recon is DRAFT and active             → keep the link
-
-    The COMPLETED case must unlink because completed reconciliations
-    lock four fields (``amount_cents``, ``account_id``, ``title``,
-    ``date``) on assigned transactions. Silently re-linking would
-    leave the restored row immutable, which the user wouldn't expect.
-    The DRAFT-and-active case is the user's good-path expectation —
-    they were reconciling, deleted by mistake, and want the row back
-    in the same batch without a re-assignment ceremony.
-
-    **Junction rows.** Restored precisely by exact ``deleted_at`` match —
-    see ``_cascade_junctions_delete`` for the marker contract.
-
-    This intentionally differs from ``restore_hashtag`` /
-    ``restore_reconciliation`` which both opt NOT to cascade-restore.
-    The asymmetry is correct: hashtag-restore would silently re-tag
-    dozens of transactions (high blast radius), but transaction-restore
-    re-tags ONE transaction and matches the user's "undo the delete"
-    mental model.
-
-    Validation runs BEFORE any mutation, so a 422 leaves the soft-deleted
-    state untouched.
-
-    Raises:
-        not_found: no soft-deleted transaction with that id.
-        conflict: the row is part of a transfer pair but the sibling is
-            missing or no longer soft-deleted (integrity break — refuse
-            to restore an asymmetric pair).
-        validation_error: account/category (or sibling's) is no longer
-            active (or the account is archived). All field-level errors
-            collected into one ``fields`` dict before raising.
-    """
-    # 1. Lock the soft-deleted primary row.
-    row = await fetch_owned_row_or_404(
-        conn, "expense_transactions", transaction_id, user_id, "transaction",
-        deleted=True, for_update=True,
-    )
-
-    is_transfer = row["transfer_transaction_id"] is not None
-
-    # 2. Lock the sibling (transfer case). Both must be soft-deleted —
-    #    refuse to restore one leg of a half-deleted pair, which would
-    #    be an integrity violation on the transfer invariant.
-    sibling_row = None
-    sibling_id: Optional[str] = None
-    if is_transfer:
-        sibling_id = str(row["transfer_transaction_id"])
-        # Non-raising fetch: a miss here is a pair-integrity break, which is
-        # a conflict — not a not_found — so no _or_404.
-        sibling_row = await fetch_owned_row(
-            conn, "expense_transactions", sibling_id, user_id,
-            deleted=True, for_update=True,
-        )
-        if sibling_row is None:
-            raise conflict(
-                "Transfer sibling row could not be located in a soft-deleted "
-                "state. Refusing to restore one leg of an asymmetric pair."
-            )
-
-    # 3. Validate prerequisites (collect-all-failures pattern).
-    errors: dict = {}
-
-    if await active_account_row(conn, row["account_id"], user_id) is None:
-        errors["account_id"] = MSG_ACTIVE_ACCOUNT
-
-    if await active_category_row(conn, row["category_id"], user_id) is None:
-        errors["category_id"] = MSG_ACTIVE_CATEGORY
-
-    if is_transfer and sibling_row is not None:
-        if await active_account_row(conn, sibling_row["account_id"], user_id) is None:
-            errors["transfer.account_id"] = MSG_ACTIVE_ACCOUNT
-
-        if await active_category_row(conn, sibling_row["category_id"], user_id) is None:
-            errors["transfer.category_id"] = MSG_ACTIVE_CATEGORY
-
-    if errors:
-        raise validation_error(
-            "Cannot restore transaction: prerequisites failed.", errors
-        )
-
-    # 4. Resolve the reconciliation decision per leg.
-    async def _resolve_recon_unlink(recon_id) -> tuple[bool, Optional[str]]:
-        if recon_id is None:
-            return False, None
-        recon = await fetch_recon_status(conn, user_id, recon_id)
-        if recon is None or recon["deleted_at"] is not None:
-            return True, (
-                "Transaction's previous reconciliation no longer exists. "
-                "Link removed on restore."
-            )
-        if recon["status"] == ReconciliationStatus.COMPLETED:
-            return True, (
-                "Transaction's previous reconciliation is completed. "
-                "Link removed on restore — reassign manually if needed."
-            )
-        return False, None
-
-    primary_unlink, primary_warning = await _resolve_recon_unlink(row["reconciliation_id"])
-    sibling_unlink = False
-    sibling_warning: Optional[str] = None
-    if is_transfer and sibling_row is not None:
-        sibling_unlink, sibling_warning = await _resolve_recon_unlink(
-            sibling_row["reconciliation_id"]
-        )
-
-    # 5. Restore both legs — sibling first (its activity-log entry has
-    #    always preceded the primary's; matches delete_transaction's order).
-    if is_transfer and sibling_row is not None:
-        await _restore_leg(conn, user_id, sibling_row, unlink=sibling_unlink)
-    after = await _restore_leg(conn, user_id, row, unlink=primary_unlink)
-
-    # 6. Build warnings list (always present; empty when restore is clean).
-    warnings: list[str] = []
-    if primary_warning is not None:
-        warnings.append(primary_warning)
-    if sibling_warning is not None:
-        warnings.append("Transfer sibling: " + sibling_warning)
+    if warning is not None:
+        warnings.append(warning)
 
     return {**after, "warnings": warnings}
 
@@ -1092,16 +888,7 @@ async def create_batch(
     """Atomic batch create.
 
     Validates the entire batch first (collects per-item errors and fails
-    fast if any), then inserts all rows and applies balance deltas as a
-    single dict-aggregated update per account. This is a "no-split zone"
-    — the balance-delta accumulation and per-item INSERT must stay in a
-    single loop or the optimisation (K UPDATEs for N items, where K is
-    distinct accounts) is lost.
-
-    Transfers are NOT supported in batch creates — they're rejected at
-    the validation phase with a clear error. Transfers require the full
-    ``create_transfer_pair`` orchestration which doesn't compose cleanly
-    with the batch's delta-accumulation model.
+    fast if any), then inserts all rows in one loop.
 
     Returns a dict ``{"created": list[dict]}`` — the caller wraps this
     in a JSONResponse with status 201.
@@ -1112,14 +899,6 @@ async def create_batch(
             {"transactions": "Must not be empty."},
         )
 
-    # Transfers are not supported in batch creates
-    for i, item in enumerate(body.transactions):
-        if item.transfer is not None:
-            raise validation_error(
-                "Transfers are not supported in batch creates.",
-                {f"transactions[{i}].transfer": "Must not be present in batch."},
-            )
-
     # One clock read for the whole batch, not one per item.
     now = await db_now(conn)
 
@@ -1129,12 +908,7 @@ async def create_batch(
     # validate them in 2 queries. Membership is then checked in memory.
     # A 100-item batch drops from 200 validation queries to 2.
     requested_account_ids = {item.account_id for item in body.transactions}
-    # category_id may be None now that the schema makes it optional; drop None
-    # from the lookup set (missing-category items are caught by the presence
-    # check below) so we never pass NULL into the uuid[] membership query.
-    requested_category_ids = {
-        item.category_id for item in body.transactions if item.category_id
-    }
+    requested_category_ids = {item.category_id for item in body.transactions}
 
     valid_account_ids = await active_account_ids(
         conn, requested_account_ids, user_id
@@ -1160,12 +934,7 @@ async def create_batch(
         if str(item.account_id) not in valid_account_ids:
             item_errors["account_id"] = MSG_ACTIVE_ACCOUNT
 
-        # category_id is optional on the schema (transfers waive it), but batch
-        # rejects transfers, so it's always required here. Report a clean
-        # "required" message instead of a misleading referential error.
-        if not item.category_id:
-            item_errors["category_id"] = "Required for non-transfer transactions."
-        elif str(item.category_id) not in valid_category_ids:
+        if str(item.category_id) not in valid_category_ids:
             item_errors["category_id"] = MSG_ACTIVE_CATEGORY
 
         item_id_str = str(item.id)

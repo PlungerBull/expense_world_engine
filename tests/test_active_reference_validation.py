@@ -84,7 +84,7 @@ async def test_vectorised_helpers_exclude_deleted_archived_and_foreign(test_data
 
 @pytest.mark.asyncio
 async def test_message_constants_reach_the_wire(client, test_data):
-    """The shared strings are what endpoints emit — batch and transfer sites."""
+    """The shared strings are what endpoints emit — batch and single-create sites."""
     # Batch: unknown account + unknown category on one item.
     r = await client.post(
         "/v1/transactions/batch",
@@ -107,27 +107,57 @@ async def test_message_constants_reach_the_wire(client, test_data):
     assert fields["account_id"] == MSG_ACTIVE_ACCOUNT
     assert fields["category_id"] == MSG_ACTIVE_CATEGORY
 
-    # Transfer: both legs referencing unknown accounts.
-    r = await client.post(
-        "/v1/transactions",
-        json={
-            "id": str(uuid.uuid4()),
-            "title": "active-ref transfer",
-            "amount_cents": -1000,
-            "date": "2024-03-15T12:00:00Z",
-            "account_id": str(uuid.uuid4()),
-            "transfer": {
+    # Single create: the raising wrappers, one reference at a time. It reaches
+    # the same two constants by a different route from the batch accumulator
+    # above, so each is separately capable of drifting off them.
+    deleted_account_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO expense_bank_accounts
+                (id, user_id, name, currency_code, is_person, color,
+                 is_archived, sort_order, created_at, updated_at, deleted_at)
+               VALUES ($1, $2, 'active-ref create deleted', 'PEN', false,
+                 '#000000', false, 0, now(), now(), now())""",
+            deleted_account_id, test_data.user_id,
+        )
+    try:
+        r = await client.post(
+            "/v1/transactions",
+            json={
                 "id": str(uuid.uuid4()),
-                "account_id": str(uuid.uuid4()),
-                "amount_cents": 1000,
+                "title": "active-ref create",
+                "amount_cents": -1000,
+                "date": "2024-03-15T12:00:00Z",
+                "account_id": deleted_account_id,
+                "category_id": str(uuid.uuid4()),
             },
-        },
-        headers=_idem(),
-    )
-    assert r.status_code == 422, r.text
-    fields = r.json()["error"]["fields"]
-    assert fields["account_id"] == MSG_ACTIVE_ACCOUNT
-    assert fields["transfer.account_id"] == MSG_ACTIVE_ACCOUNT
+            headers=_idem(),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["error"]["fields"]["account_id"] == MSG_ACTIVE_ACCOUNT
+
+        # Same path, active account, unknown category — the account check
+        # raises first, so the category constant needs its own probe.
+        r = await client.post(
+            "/v1/transactions",
+            json={
+                "id": str(uuid.uuid4()),
+                "title": "active-ref create category",
+                "amount_cents": -1000,
+                "date": "2024-03-15T12:00:00Z",
+                "account_id": test_data.account_id,
+                "category_id": str(uuid.uuid4()),
+            },
+            headers=_idem(),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["error"]["fields"]["category_id"] == MSG_ACTIVE_CATEGORY
+    finally:
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM expense_bank_accounts WHERE id = $1",
+                deleted_account_id,
+            )
 
 
 @pytest.mark.asyncio

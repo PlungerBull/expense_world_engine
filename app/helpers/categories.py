@@ -47,8 +47,8 @@ def _reject_reserved_name(name: str) -> None:
 
     Without this, the user's category squats the name and every later
     ``ensure_system_category`` seed hits the LOWER(name) unique index —
-    which its ON CONFLICT arbiter does not cover — 500ing transfers and
-    opening balances forever (bug 7.4).
+    which its ON CONFLICT arbiter does not cover — 500ing opening
+    balances forever (bug 7.4).
     """
     if name.lower() in RESERVED_CATEGORY_NAMES:
         raise validation_error(
@@ -65,7 +65,7 @@ async def ensure_system_category(
     """Return the ID of a system category, seeding it on first use.
 
     Lookup is by the immutable ``system_key`` column, not by display name,
-    so the category row survives renames without the transfer pipeline
+    so the category row survives renames without the owning flow
     fragmenting into duplicates.
 
     The ON CONFLICT clause makes concurrent first-time seeding race-safe:

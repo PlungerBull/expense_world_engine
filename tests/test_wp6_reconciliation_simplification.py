@@ -310,8 +310,7 @@ async def test_account_list_orders_by_date_start_nulls_last(client, fx):
 @pytest.mark.asyncio
 async def test_difference_cents_is_the_unexplained_remainder(client, fx, test_data):
     """begin 100000, end 150000 → the statement claims +50000 happened.
-    Assigned: +70000 inflow, −25000 outflow, and a −5000 transfer leg
-    (an ordinary row per WP1 — transfer legs are never excluded from sums).
+    Assigned: +70000 inflow, −25000 outflow and a second −5000 outflow.
     Signed sum 40000, so 10000 is left to explain.
     """
     recon_id = await _create_recon(
@@ -328,27 +327,9 @@ async def test_difference_cents_is_the_unexplained_remainder(client, fx, test_da
     await _assign(client, inflow, recon_id)
     await _assign(client, outflow, recon_id)
 
-    # Transfer out of the reconciled account; the outgoing leg joins the batch.
-    r = await client.post(
-        "/v1/transactions",
-        json={
-            "id": str(uuid.uuid4()),
-            "title": "WP6 transfer",
-            "amount_cents": -5_000,
-            "date": SEED_DATE,
-            "account_id": fx.account_id,
-            "transfer": {
-                "id": str(uuid.uuid4()),
-                "account_id": fx.second_account_id,
-                "amount_cents": 5_000,
-            },
-        },
-        headers=_idem(),
-    )
-    assert r.status_code == 201, r.text
-    leg_id = r.json()["id"]
-    fx.txn_ids.extend([leg_id, r.json()["transfer_transaction_id"]])
-    await _assign(client, leg_id, recon_id)
+    # A third movement out of the reconciled account joins the batch.
+    second_outflow = await _post_txn(client, fx, -5_000)
+    await _assign(client, second_outflow, recon_id)
 
     r = await client.get(f"/v1/reconciliations/{recon_id}")
     assert r.status_code == 200, r.text

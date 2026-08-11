@@ -34,10 +34,9 @@ class SystemCategoryKey(str, Enum):
 
     Stored in ``expense_categories.system_key``. The display ``name`` can be
     renamed by the user freely; the engine identifies the category by this
-    immutable key so transfer pairs always resolve to the same row.
+    immutable key, so renames never break the flow that owns the row.
+    (``DEBT``/``TRANSFER`` were deleted with the transfer feature, 2026-08-10.)
     """
-    DEBT = "debt"
-    TRANSFER = "transfer"
     OPENING_BALANCE = "opening_balance"
 
 
@@ -45,8 +44,6 @@ class SystemCategoryKey(str, Enum):
 # first seeded. Users are free to rename afterwards; the engine never
 # reads the display name to locate a system row.
 SYSTEM_CATEGORY_DEFAULT_NAMES: dict[SystemCategoryKey, str] = {
-    SystemCategoryKey.DEBT: "@Debt",
-    SystemCategoryKey.TRANSFER: "@Transfer",
     SystemCategoryKey.OPENING_BALANCE: "@Opening",
 }
 
@@ -55,14 +52,16 @@ class TransactionType(IntEnum):
     """Which way money moved on this row's account. Nothing else.
 
     Present on every ledger row, never null, CHECK-enforced by sql/020.
-    There is deliberately no ``TRANSFER`` member: a transfer is two ordinary
-    rows, one OUTFLOW and one INFLOW, paired by ``transfer_transaction_id``.
-    That column is the discriminator — "the counterparty is an account you
-    also own" is a fact about the pairing, not about the direction.
+    There is deliberately no third member: direction is the only fact this
+    column encodes. (When the transfer feature existed, letting a second
+    fact into this column — value 3 meaning "transfer" — is what forced
+    direction into a separate ``transfer_direction`` column; sql/020's
+    header records why the two facts were separated. The feature is gone,
+    the lesson stays.)
 
-    The names are OUTFLOW/INFLOW rather than EXPENSE/INCOME because these
-    values type transfer legs too, and a transfer's outgoing leg is not an
-    expense. sql/020's header records why the two facts were separated.
+    The names are OUTFLOW/INFLOW rather than EXPENSE/INCOME because
+    direction is not semantics: an outgoing half of an account-to-account
+    move is not an expense, yet it is an OUTFLOW.
     """
     OUTFLOW = 1
     INFLOW = 2

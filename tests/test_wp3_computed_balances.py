@@ -94,7 +94,6 @@ async def fx(test_data, db_pool):
                WHERE user_id = $1 AND resource_id = ANY($2::uuid[])""",
             test_data.user_id, account_ids + data.txn_ids,
         )
-        # Both legs of a transfer point at each other, so neither can go first.
         await conn.execute(
             """DELETE FROM expense_transactions
                WHERE user_id = $1 AND account_id = ANY($2::uuid[])""",
@@ -241,30 +240,45 @@ async def test_moving_a_transaction_between_accounts_moves_the_money(client, fx,
 
 
 @pytest.mark.asyncio
-async def test_a_transfer_moves_both_accounts_and_nets_to_zero(client, fx, test_data):
-    """Both legs are ordinary rows, so both balances move by construction."""
+async def test_a_move_recorded_as_two_ordinary_rows_nets_to_zero(client, fx, test_data):
+    """Moving money between two accounts IS two ordinary rows.
+
+    This is the whole workflow after the transfer removal (owner decision
+    2026-08-10): an outflow on the source account, an inflow on the
+    destination, each with an ordinary user category, no pairing and no
+    netting. Nothing links them — which is why the invariant worth pinning is
+    arithmetic rather than structural: both balances move, and the two deltas
+    cancel, because the same magnitude left one account and arrived in the
+    other.
+    """
     before_primary = await _balance(test_data.user_id, fx.account_id)
     before_secondary = await _balance(test_data.user_id, fx.second_account_id)
 
+    outflow_id = await _post_txn(client, fx, -7500)
+
+    inflow_id = str(uuid.uuid4())
     r = await client.post(
         "/v1/transactions",
         json={
-            "id": str(uuid.uuid4()),
-            "title": "WP3 transfer",
-            "amount_cents": -7500,
+            "id": inflow_id,
+            "title": "WP3 movement in",
+            "amount_cents": 7500,
             "date": SEED_DATE,
-            "account_id": fx.account_id,
-            "transfer": {
-                "id": str(uuid.uuid4()),
-                "account_id": fx.second_account_id,
-                "amount_cents": 7500,
-            },
+            "account_id": fx.second_account_id,
+            "category_id": fx.category_id,
         },
         headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
     assert r.status_code == 201, r.text
-    body = r.json()
-    fx.txn_ids.append(body["id"])
+    fx.txn_ids.append(inflow_id)
+    assert r.json()["transaction_type"] == 2  # INFLOW
+
+    async with db.pool.acquire() as conn:
+        outflow_type = await conn.fetchval(
+            "SELECT transaction_type FROM expense_transactions WHERE id = $1",
+            outflow_id,
+        )
+    assert outflow_type == 1  # OUTFLOW
 
     after_primary = await _balance(test_data.user_id, fx.account_id)
     after_secondary = await _balance(test_data.user_id, fx.second_account_id)

@@ -13,7 +13,7 @@ from app.constants import InboxStatus
 from app.deps import CurrentUser, DebitAsNegative, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES
 from app.helpers import inbox as inbox_service
-from app.helpers.formatting import apply_debit_as_negative_inbox
+from app.helpers.formatting import apply_debit_as_negative
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
@@ -55,8 +55,7 @@ async def list_inbox(
             # block (helpers/inbox.py) in both directions: everything listed
             # here must promote, and everything that promotes must be listed.
             # The two are written separately — SQL here, Python there — which is
-            # exactly how they drifted (WP7.2/7.3), so
-            # tests/test_inbox_transfers.py promotes every row this returns.
+            # exactly how they drifted (WP7.2/7.3).
             conditions.append("i.title IS NOT NULL")
             conditions.append("i.title != 'UNTITLED'")
             conditions.append("i.amount_cents IS NOT NULL")
@@ -74,28 +73,15 @@ async def list_inbox(
                 "WHERE a.id = i.account_id AND a.user_id = i.user_id "
                 "AND a.deleted_at IS NULL AND a.is_archived = false)"
             )
-            # Category must be active (an inbox row pointing at a deleted
-            # category isn't promotable — promote would 422 on the same
-            # guard, so excluding it from `?ready=true` keeps the
+            # Category must be present and active (an inbox row pointing at a
+            # deleted category isn't promotable — promote would 422 on the
+            # same guard, so excluding it from `?ready=true` keeps the
             # client-facing list honest).
-            #
-            # Transfers are exempt: promote auto-assigns @Transfer/@Debt and
-            # never looks at category_id, so requiring one here hid every
-            # promotable transfer item from the list.
             conditions.append(
-                "(i.transfer_account_id IS NOT NULL OR ("
-                "i.category_id IS NOT NULL AND EXISTS ("
+                "(i.category_id IS NOT NULL AND EXISTS ("
                 "SELECT 1 FROM expense_categories c "
                 "WHERE c.id = i.category_id AND c.user_id = i.user_id "
-                "AND c.deleted_at IS NULL)))"
-            )
-            # ...and the sibling account gets the same check the primary does,
-            # for the same reason: promote 422s on an archived one.
-            conditions.append(
-                "(i.transfer_account_id IS NULL OR EXISTS ("
-                "SELECT 1 FROM expense_bank_accounts ta "
-                "WHERE ta.id = i.transfer_account_id AND ta.user_id = i.user_id "
-                "AND ta.deleted_at IS NULL AND ta.is_archived = false))"
+                "AND c.deleted_at IS NULL))"
             )
 
         if overdue:
@@ -115,7 +101,7 @@ async def list_inbox(
 
         data = [inbox_from_row(row) for row in rows]
         if debit_as_negative:
-            data = [apply_debit_as_negative_inbox(d) for d in data]
+            data = [apply_debit_as_negative(d) for d in data]
         return paginated_response(data, total, limit, offset)
 
 
@@ -153,7 +139,7 @@ async def get_inbox_item(
         )
         data = inbox_from_row(row)
         if debit_as_negative:
-            data = apply_debit_as_negative_inbox(data)
+            data = apply_debit_as_negative(data)
         return data
 
 
@@ -218,7 +204,7 @@ async def restore_inbox_item(
 # ---------------------------------------------------------------------------
 # POST /inbox/{inbox_id}/promote
 # ---------------------------------------------------------------------------
-# Promote returns the ledger row the draft became (primary leg for transfers).
+# Promote returns the ledger row the draft became.
 @router.post("/{inbox_id}/promote", response_model=TransactionResponse)
 async def promote_inbox_item(
     inbox_id: UUID,
@@ -231,6 +217,6 @@ async def promote_inbox_item(
         x_idempotency_key,
         status_code=200,
         work=lambda conn: inbox_service.promote_inbox_item(
-            conn, auth_user.id, inbox_id, body.id, body.transfer_id,
+            conn, auth_user.id, inbox_id, body.id,
         ),
     )

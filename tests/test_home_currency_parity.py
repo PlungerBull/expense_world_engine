@@ -274,11 +274,8 @@ async def test_home_currency_row_needs_no_rate(fx, test_data):
 
 # (label, transaction_type, expected sign)
 #
-# Two cases, not four. A transfer leg is an ordinary row after WP1 — its
-# direction lives in transaction_type like every other row's — so "transfer
-# credit" and "transfer debit" are not separate classifications to test, they
-# are inflow and outflow. sql/020 makes any third value unstorable, which is
-# asserted directly in tests/test_wp1_transfer_collapse.py.
+# Two cases, and only ever two: direction lives in transaction_type on every
+# row, and sql/020 makes any third value unstorable.
 SIGN_CASES = [
     ("inflow", int(TransactionType.INFLOW), 1),
     ("outflow", int(TransactionType.OUTFLOW), -1),

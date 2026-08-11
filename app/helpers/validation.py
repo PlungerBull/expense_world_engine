@@ -1,7 +1,7 @@
 """Shared validation helpers for resource lookups.
 
 Consolidates account/category validation that was duplicated across
-transactions.py, inbox.py, reconciliations.py, and transfers.py.
+transactions.py, inbox.py, and reconciliations.py.
 
 Two flow styles, one implementation. The non-raising helpers
 (``active_account_row`` / ``active_category_row``, and the vectorised
@@ -111,8 +111,9 @@ async def active_account_row(
     user_id: str,
 ) -> Optional[asyncpg.Record]:
     """The active-account reference rule: active (not soft-deleted) AND
-    non-archived, tenant-scoped. Returns the full row (transfers reads
-    ``is_person`` off it) or ``None`` — callers own their error handling.
+    non-archived, tenant-scoped. Returns the full row (the opening-balance
+    guard reads ``is_person`` off it via ``validate_active_account``) or
+    ``None`` — callers own their error handling.
     """
     return await conn.fetchrow(
         """
