@@ -11,6 +11,14 @@ by the transfer collapse); account balances keep their home value, which the
 "Where currency appears" table denied; and reconciliations lost theirs, which the
 same table had flagged as a "known inconsistency, deliberately left".
 
+**Amended 2026-08-10: the transfer feature was removed entirely** (owner decision;
+`sql/030`, entry in `client-breaking-changes.md`). The currency model itself is
+untouched — native storage, read-time conversion, null-and-flag all stand — but
+the transfer-specific sections below (`@Transfer` semantics, the transfer row
+examples, the `@FX` deferral) are deleted or reduced to tombstones. A move
+between accounts is now two ordinary rows; its legs convert independently like
+any other rows, and monthly totals include them.
+
 ---
 
 ## The decision, in one sentence
@@ -71,13 +79,12 @@ Recorded so a future reader inherits the price instead of rediscovering it:
 
 - `INSERT ... RETURNING *` cannot join to `expense_bank_accounts` or
   `exchange_rates`, so **every write path would need a follow-up read** inside its
-  transaction — ~14 sites across `helpers/transactions.py`, `helpers/transfers.py`
-  and `helpers/inbox.py`.
+  transaction — a dozen-plus sites across `helpers/transactions.py` and
+  `helpers/inbox.py`.
 - Those write paths would each need the user's `display_timezone`, which they do not
   load today.
-- The inbox needs the join **twice** — `account_id` and `transfer_account_id` are
-  different accounts — and `helpers/home_currency.py` hardcodes its table aliases, so
-  it would need alias-parameterised builders.
+- `helpers/home_currency.py` hardcodes its table aliases, so any second join
+  context would need alias-parameterised builders.
 - Account and reconciliation values would need `get_home_balance` and
   `resolve_home_rates` rebuilt, along with the rate-date and duplicate-settings
   problems that deleting them solved.
@@ -134,9 +141,10 @@ reporting choice:
 - **A PEN card used at a foreign merchant.** The bank already converted; the
   transaction is S/148 on a PEN account. The foreign price is not modelled at all.
   **Not a fact — there is no field for it.**
-- **Cross-currency transfer.** Here a real rate exists. But the pair already
-  stores `primary.amount_cents = 100000` (USD) and `sibling.amount_cents = 345000`
-  (PEN). **The rate is `345000 ÷ 100000`.** The column stores a value derivable
+- **Two rows of a cross-currency move** *(argued when the since-removed transfer
+  feature paired them; the argument survives the pairing)*. Here a real rate
+  exists. But the two rows already store `100000` (USD side) and `345000` (PEN
+  side). **The rate is `345000 ÷ 100000`.** The column stored a value derivable
   from two values already present.
 
 **Therefore `expense_transactions.exchange_rate` never held information that was
@@ -231,91 +239,13 @@ Consequence: a wrong rate is no longer permanent. Fix the rate table once and
 every historical report corrects itself. Under the stored model a bad rate — for
 example one written by the old silent `1.0` fallback — was wrong forever.
 
-### Same-currency transfer
-
-S/500, Savings → Checking.
-
-```
-leg A:  amount_cents=50000   (PEN account, debit)
-leg B:  amount_cents=50000   (PEN account, credit)
-```
-
-Both convert at 1.0 → `−500 + 500 = 0`. Cancels exactly, as before.
-
-### Cross-currency transfer
-
-Send $1,000, receive S/3,450. Market rate that day 3.58.
-
-```
-before:  leg A: amount_cents=100000  exchange_rate=3.45  amount_home_cents=345000  ← FORCED
-         leg B: amount_cents=345000  exchange_rate=1.0   amount_home_cents=345000
-
-after:   leg A: amount_cents=100000   (USD account)
-         leg B: amount_cents=345000   (PEN account)
-```
-
-No new column — the two legs already store their own native amounts. The rate is
-recoverable as `3450 ÷ 1000 = 3.45` for display.
-
-At read time:
-
-```
-USD leg:  100000 × 3.58  =  −S/ 3,580
-PEN leg:  345000 × 1.00  =  +S/ 3,450
-                            ───────────
-                     net  =  −S/   130      ← the spread the bank charged
-```
-
-**Before, that S/130 was hidden** by forcing leg A's home value to 345000 instead
-of 358000. It is a real cost really paid, and it now appears.
-
-### USD → USD transfer (audit finding WP1.3)
-
-```
-before:  500 INTERNAL_ERROR — neither leg matches PEN, so the dominant-side
-         rule reaches `raise RuntimeError` (transfers.py:166)
-
-after:   leg A: amount_cents=50000
-         leg B: amount_cents=50000
-         report: both × 3.58 → −1790 + 1790 = 0
-```
-
-No home-currency match is needed because nothing stored requires one. **The bug
-becomes unrepresentable.**
-
----
-
-## `@Transfer` semantics
-
-**`@Transfer` nets to zero only when both legs of a pair land in it.** Each leg is
-categorised by its own account, independently (`transfers.py:99-108`):
-
-```python
-SystemCategoryKey.DEBT if primary_is_person else SystemCategoryKey.TRANSFER   # primary
-SystemCategoryKey.DEBT if transfer_is_person else SystemCategoryKey.TRANSFER  # sibling
-```
-
-| Transfer | Primary leg → | Sibling leg → | `@Transfer` shows | New? |
-|---|---|---|---|---|
-| real ↔ real, same currency | @Transfer | @Transfer | **0** | no |
-| real ↔ real, cross currency | @Transfer | @Transfer | **the FX spread** | ✅ **new** |
-| real ↔ person | @Transfer | @Debt | **the full amount** | no — ships today |
-| person ↔ person | @Debt | @Debt | untouched (`@Debt` gets 0 or the spread) | no |
-
-So `@Transfer ≠ 0` means exactly one of two things:
-
-1. **an FX spread** — both legs in, valued at different home amounts (new), or
-2. **a loan or repayment with a person** — one leg in, nothing to cancel against.
-
-Case 2 is pre-existing and documented: *"`spent_cents` can be negative for
-income-dominant categories or for lending-out months on `@Transfer`/`@Debt`"*
-(see git history for `docs/roadmap.md`).
-
-Both legs of a pair always share `primary_date` (`transfers.py:199,229`), so a
-transfer can never straddle a month boundary and produce a false non-zero.
-
-This preserves the standing rule that transfers stay visible in dashboards and
-reports and are never excluded from totals.
+*(Three further worked examples — same-currency transfer, cross-currency
+transfer with its FX-spread arithmetic, and the USD→USD case of audit finding
+WP1.3 — were deleted 2026-08-10 with the transfer feature, along with the
+`@Transfer` semantics section that assigned meaning to a non-zero `@Transfer`
+month. Git history holds them. A move between accounts is now two ordinary
+rows; each converts independently by its own date's rate, and any FX spread
+between them simply appears in whatever user categories the two rows carry.)*
 
 ---
 
@@ -395,90 +325,48 @@ Two consequences to know:
 
 ---
 
-## Deferred: `@FX`
+## ~~Deferred: `@FX`~~ — mooted 2026-08-10
 
-**Not shipping. Reaffirmed by the owner on 2026-08-05, when WP2 made the spread
-visible for the first time and the question became live rather than theoretical.**
-
-> ⚠️ Two forward-looking notes elsewhere promised the opposite — the WP1 postscript
-> in the deletion program's README (now in git history) and the closing bullet of
-> the 2026-08-05 entry in `docs/client-breaking-changes.md` both said WP2 would
-> introduce `@FX`. Both are superseded. The spread lands in `@Transfer`.
-
-Free to add later.
-
-Splitting the FX spread into its own `@FX` category would let `@Transfer` mean
-only "lending flow" and read 0 for every currency exchange:
-
-```
-shipping:   @Transfer  −S/ 130
-deferred:   @Transfer     S/   0
-            @FX        −S/ 130
-```
-
-This is what double-entry systems do — GnuCash routes cross-currency transfers
-through per-currency *currency trading accounts* so the transaction stays
-balanced in each currency separately, and the residual lands as an ordinary
-income/expense line.
-
-**Why it is deferred, not rejected.** `@FX` cannot be a normal category:
-
-- **It cannot hold real transactions.** An FX row needs an `account_id` (the
-  column is `NOT NULL`), but the spread lives *between* two accounts. And its
-  value derives from that day's market rate, so storing it would re-introduce a
-  stored derived value — precisely what this decision removes.
-- **So it must be synthetic** — computed at report time by pairing legs on
-  `transfer_transaction_id` and splitting the result:
-  `@Transfer ← −3580 + 3580 = 0`, `@FX ← 3450 − 3580 = −130`.
-- **Synthetic breaks an invariant.** A category's total is currently the sum of
-  its transactions. `@FX` would have zero transactions and a non-zero total, and
-  the rule that `hashtag_breakdown` rows sum to the parent total *by construction*
-  would need a special case.
-
-**Deferring costs nothing.** The stored facts are byte-identical either way — two
-legs, two native amounts, no rate. Adding `@FX` later is a report-layer change
-only: no migration, no data change, no write-contract change.
-
-**Revisit when:** `@Transfer` carrying two meanings at once (money moved to a
-person / cost of exchanging currency) becomes annoying in daily use. That is the
-real argument for it, and real usage should decide. As of 2026-08-05 the ledger
-holds no real transactions, so there is no usage to decide with — which is the
-whole reason the answer stayed "later".
+*(This section argued against splitting the FX spread of a cross-currency
+transfer out of `@Transfer` into a synthetic `@FX` category — deferred by the
+owner on 2026-08-05. The transfer removal of 2026-08-10 deleted both categories
+the argument was about; there is no paired spread to split. Git history holds
+the full analysis, including why a synthetic category breaks the
+category-total-equals-sum-of-transactions invariant — read it before ever
+proposing a report-computed category.)*
 
 ---
 
 ## Decided: system categories are engine-assigned only
 
-**Owner decision, 2026-08-01.** `@Transfer`, `@Debt` and `@Opening` may be
-attached to a transaction **only** by the engine flow that owns them. Clients may
-never set them by hand.
+**Owner decision, 2026-08-01; scope reduced to `@Opening` on 2026-08-10** (the
+transfer removal deleted `@Transfer` and `@Debt`). A system category may be
+attached to a transaction **only** by the engine flow that owns it. Clients may
+never set one by hand.
 
-Without this, the `@Transfer` semantics above are unenforceable — the two
-non-zero cases stop being the *only* two, and the category is no longer a
-trustworthy FX indicator.
+Without this, `@Opening`'s exclusion from flow reports is unenforceable — a user
+filing an ordinary expense under `@Opening` would silently drop it from every
+monthly report while it still moves the balance.
 
-### Three holes, two still open
+### The remaining holes (open-bugs 6.7)
 
 | # | Hole | Where |
 |---|---|---|
-| 1 | `POST /transactions` accepts a system `category_id` | `validate_active_category` (`helpers/validation.py:94-114`) checks `deleted_at` and `is_archived` but **not `is_system`**; no other guard found |
+| 1 | `POST /transactions` accepts a system `category_id` | `validate_active_category` (`helpers/validation.py`) checks `deleted_at` and `is_archived` but **not `is_system`**; no other guard found |
 | 2 | `PUT /transactions/{id}` can move an ordinary transaction *into* a system category | same missing check |
-| 3 | ~~`PUT /transactions/{id}` can move a transfer leg *out of* `@Transfer`~~ | **Closed 2026-08-07** (was bug 6.5): the transfer edit guard in `helpers/transactions.update_transaction` is now an allow-list (`ALLOWED_ON_TRANSFER_LEG = {title, description, cleared}`), so `category_id` — and any future field — is blocked on a transfer leg by default. |
 
-Hole 3 was the mirror image of 1 and 2 and broke the invariant just as
-effectively: re-categorising one leg of a pair leaves the other stranded in
-`@Transfer` with nothing to cancel against — indistinguishable from a loan.
+*(A third hole — moving a transfer leg out of `@Transfer` — was closed 2026-08-07
+as bug 6.5 via the transfer edit guard, then became unrepresentable when the
+transfer feature was removed 2026-08-10.)*
 
 ### Fix (for the two still open)
 
 - Reject `is_system = true` category targets at the **public boundary** (request
-  validation), returning `422`. The internal paths must keep working:
-  `create_transfer_pair` assigns `@Transfer`/`@Debt`, and
+  validation), returning `422`. The internal path must keep working:
   `create_opening_balance` delegates to `create_transaction` with `@Opening`.
   Same public-boundary-plus-internal-path shape as bug 7.4's reserved-name
-  check (closed 2026-08-07), which rejects reserved system-category *names* at
-  the same boundary. Together they make `@Transfer` mean exactly what this
-  document says it means.
+  check (closed 2026-08-07), which rejects the reserved system-category *name* at
+  the same boundary.
 
 ---
 
@@ -510,9 +398,8 @@ amount, and does it by storing a **second amount** ("this cost me S/152"), never
 rate. That shape is strictly better — an amount is readable off a statement; a
 rate has to be computed to enter and re-multiplied to use. It is also unnecessary
 here: under account-governs-currency there is no second amount to record for an
-ordinary transaction, and the only place two real amounts exist — a cross-currency
-transfer — already stores both. If per-transaction foreign amounts are ever
-wanted, the correct model is an amount pair, as a new feature, not a rate column.
+ordinary transaction. If per-transaction foreign amounts are ever wanted, the
+correct model is an amount pair, as a new feature, not a rate column.
 
 ---
 

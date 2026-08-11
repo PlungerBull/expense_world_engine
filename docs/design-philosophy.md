@@ -32,7 +32,7 @@ Track what you spend, who owes whom, and where your money goes.
 ### Core Tracking
 
 - **Inbox/ledger structure:** Log any expense fast — incomplete entries go to the inbox. When all mandatory fields are present and the date is today or past, the item shows a "ready" indicator and a Promote button. The user taps Promote to move it to the ledger. This lets users add optional fields (hashtags, description, receipt photo) before confirming. The ledger enforces completeness — nothing lives there without all required fields. Items already in the ledger can still be edited.
-- **Flat categories** — no hierarchy. Every category is directly assignable. Two system categories exist: `@Debt` (auto-assigned to person account transactions) and `@Transfer` (auto-assigned to both legs of a transfer between real accounts). Both are created automatically on first use and cannot be renamed or deleted.
+- **Flat categories** — no hierarchy. Every category is directly assignable. One system category exists: `@Opening` (auto-assigned to opening-balance seeds), created automatically on first use; system categories can be renamed but never deleted. *(The `@Debt`/`@Transfer` system categories left with the auto-paired transfer feature, removed 2026-08-10 — a move between accounts is two ordinary rows with ordinary categories.)*
 - **Hashtags** — multiple per expense, freeform, available on both inbox and ledger items.
 - **Description** — optional free text directly on any transaction (inbox or ledger).
 - **Multiple bank accounts** — each account has a single currency. A real-world multi-currency card is modeled as separate accounts, one per currency.
@@ -52,14 +52,15 @@ Track what you spend, who owes whom, and where your money goes.
 
 - **Reconciliation:** Match expenses against bank statements via reconciliation batches. On completion, four fields lock: original amount, bank account, title, date. All other fields remain editable. Batches can be un-reconciled (reverted to draft), which unlocks all fields.
 
-### People & Transfers (unified `/` syntax)
+### People (debt tracking)
 
-People are bank accounts with `is_person = true`. The `/` syntax creates a paired transaction on any account — unifying debt tracking and inter-account transfers into one mechanism.
+People are bank accounts with `is_person = true`. Money lent or borrowed is recorded as ordinary transactions against the person's account — the account's balance *is* the debt. Created explicitly via the People API only, never as a side effect of another write.
 
-- **Shared expense:** `-60 Lunch @Food $Chase /Eliana +30` → -60 on Chase (@Food), +30 on Eliana (@Debt). Eliana owes you 30.
-- **Settlement:** `+30 Settlement $Chase /Eliana -30` → Eliana's balance returns to 0.
-- **Someone else pays:** `-30 Lunch @Food $Eliana` → single transaction on Eliana's account. You owe her 30.
-- **Inter-account transfer:** `-60 Exchange $Chase /Chase_Credit +60` → same mechanism, category @Other for both.
+- **You lend:** an outflow on your real account, an inflow on the person's account (two ordinary rows). Their balance shows what they owe you.
+- **Settlement:** the mirror pair, returning the person's balance to 0.
+- **Someone else pays for you:** `-30 Lunch @Food $Eliana` → single transaction on Eliana's account. You owe her 30.
+
+*(The former unified `/` syntax — one entry auto-creating the paired row, for both debt and inter-account transfers — was removed with the transfer feature, 2026-08-10. The pairing convenience can return someday as pure client-side sugar emitting two ordinary creates; the engine no longer models it.)*
 
 Cross-user sharing: link a person account to a real user. Shared expenses are visible to both parties sign-flipped. One transaction record, two readers, no duplication. Both confirm before lockable fields are sealed.
 

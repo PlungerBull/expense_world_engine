@@ -1,6 +1,6 @@
 ---
 name: audit-business-logic
-description: Audits the expense_world_engine codebase for spec compliance — checking that every endpoint and service correctly implements the rules defined in engine-spec.md. Use this skill whenever asked to audit business logic, check spec compliance, find missing validations, or verify that the engine implementation matches the spec. Covers sign conventions, atomicity, promotion logic, field locking, transfer pairing, reconciliation state machine, balance updates, and more.
+description: Audits the expense_world_engine codebase for spec compliance — checking that every endpoint and service correctly implements the rules defined in engine-spec.md. Use this skill whenever asked to audit business logic, check spec compliance, find missing validations, or verify that the engine implementation matches the spec. Covers sign conventions, atomicity, promotion logic, field locking, reconciliation state machine, balance updates, and more.
 ---
 
 # Business Logic Audit
@@ -76,23 +76,20 @@ Every agent should check these universal rules first, then the domain-specific r
 **Categories domain:**
 - System categories (`is_system = true`) cannot be renamed or deleted — returns `403`
 - `DELETE /categories/{id}`: returns `409` if referenced by any non-deleted transaction
-- `@Debt` and `@Transfer` are auto-created by the engine on first use, never via this endpoint
+- `@Opening` is auto-created by the engine on first use (opening-balance seeding), never via this endpoint — the only system category since the transfer removal (2026-08-10) deleted `@Debt`/`@Transfer`
 
 **Hashtags domain:**
 - `DELETE /hashtags/{id}`: removes all `expense_transaction_hashtags` rows for this hashtag atomically in the same operation
 
 **Inbox domain:**
 - `POST /inbox` and `PUT /inbox/{id}`: auto-populate `exchange_rate` when both `date` and `account_id` are present; fall back to most recent available rate if no exact date match
-- **The inbox is a draft ledger row.** Its looseness is confined to *which fields may be null*; the *encoding* of every field matches `expense_transactions` exactly. `amount_cents` and `transfer_amount_cents` are stored positive, and `transaction_type` alone carries direction (`transfer_direction` was deleted by `sql/020`). A diff that reintroduces a signed stored amount, or a second way of expressing direction, is wrong — that was audit finding WP7.2, fixed in `sql/019`.
-- `POST /inbox` / `PUT /inbox/{id}` with a `transfer` object: takes `account_id` + `amount_cents` and **no `id`** (unlike `POST /transactions`). `transfer.amount_cents` must be signed opposite to the item's own `amount_cents` — same sign is `422`. `transaction_type` must be assigned exactly once per request; if an `amount_cents` in the same body can overwrite `TRANSFER`, that is the WP7.2 ordering bug regressing. `"transfer": null` clears the transfer and is the only explicit null the inbox accepts.
-- `POST /inbox/{id}/promote`: enforces all seven promotion conditions before proceeding, accumulating **all** failures into one response:
+- **The inbox is a draft ledger row.** Its looseness is confined to *which fields may be null*; the *encoding* of every field matches `expense_transactions` exactly. `amount_cents` is stored positive, and `transaction_type` alone carries direction (`transfer_direction` was deleted by `sql/020`). A diff that reintroduces a signed stored amount, or a second way of expressing direction, is wrong — that was audit finding WP7.2, fixed in `sql/019`.
+- `POST /inbox/{id}/promote`: enforces all five promotion conditions before proceeding, accumulating **all** failures into one response:
   1. `title` is present and not `'UNTITLED'`
   2. `amount_cents` is present and not zero
   3. `date` is present and `≤ now()`
   4. `account_id` references an active, non-archived account
-  5. `category_id` references an active category — **non-transfer items only**; transfers auto-assign the system category
-  6. `transfer_account_id` references an active, non-archived account — transfer items only
-  7. `transfer_id` is present for a transfer item and absent for a non-transfer one
+  5. `category_id` references an active category
   - Returns `422` with the specific failing fields if any condition fails
 - `GET /inbox?ready=true` must be the exact complement of that list — every row it returns promotes, every row that promotes appears in it. The two are written separately (SQL in the router, Python in the helper), which is how they drifted into WP7.3; check them against each other, not just against the spec.
 - Promotion is atomic — all five steps happen in one DB transaction:
@@ -109,18 +106,11 @@ Every agent should check these universal rules first, then the domain-specific r
 - `PUT /transactions/{id}` field locking: if `reconciliation_id` is set and reconciliation `status = 2`, these four fields are read-only: `amount_cents`, `account_id`, `title`, `date`. Attempts to update them return `422`.
 - `PUT /transactions/{id}` date change: no re-rating. `amount_home_cents` and `exchange_rate` were deleted by `sql/021`; conversion is a read-time lookup.
 - `PUT /transactions/{id}` amount/account change: no balance write. Changing the row changes what it contributes; changing `account_id` moves that contribution between accounts, in the same `UPDATE`.
-- `DELETE /transactions/{id}`: no balance write — the sum excludes soft-deleted rows. If `transfer_transaction_id` is set, soft-deletes both the transaction and its paired sibling atomically
+- `DELETE /transactions/{id}`: no balance write — the sum excludes soft-deleted rows
 - `DELETE /transactions/{id}` on completed reconciliation: allows deletion but includes a warning in response body (reconciliation totals become stale — engine does not auto-adjust)
 - `POST /transactions/batch`: all operations wrapped in a single DB transaction — all succeed or all fail
 
-**Transfers domain (via `POST /transactions` or `POST /inbox` with a `transfer` field):**
-- Creates both the primary and paired transaction atomically
-- Links both via `transfer_transaction_id` (each row points to the other)
-- Auto-assigns categories correctly: person account side gets `@Debt`, real account transfer side gets `@Transfer`. These override any `category_id` passed in the request.
-- Auto-creates `@Debt` or `@Transfer` system categories if they don't exist yet
-- Zero-sum validation: enforces that the two transactions are directionally opposite (one negative, one positive). Returns `422` if both are the same sign. Does NOT enforce equal raw amounts (different currencies allowed).
-- Both account balances move by construction — each leg is an ordinary row on its own account and the balance is a sum over rows. There is no balance step to check for.
-- Writes `activity_log` entries for both transactions
+**No transfers domain.** The auto-paired transfer feature was removed 2026-08-10 (`sql/030`): there is no `transfer` request field, no `transfer_transaction_id`, no `@Transfer`/`@Debt`. A move between accounts is two ordinary rows. **Flag any reappearance of pairing machinery as a spec violation** — the spec's "Moves between accounts" convention is the rule to audit against.
 
 **Reconciliations domain:**
 - `POST /reconciliations/{id}/complete`: returns `422` if no transactions are assigned; sets field locks on all assigned transactions

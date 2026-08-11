@@ -15,7 +15,7 @@ The Brain. A Python (FastAPI) backend, backed by Postgres. It is the single sour
 | `docs/open-bugs.md` | **Known defects, by severity.** A work queue, not a document — delete a row when it is fixed rather than annotating it done. Read before assuming something is broken by accident. |
 | `docs/design-philosophy.md` | UX philosophy and product vision. |
 | `docs/client-breaking-changes.md` | Engine changes that require work in a client repo. Append here whenever a change breaks the CLI/iOS/web contract. |
-| `docs/currency-model-decision.md` | How multi-currency works: native storage, conversion at read time, what `@Transfer ≠ 0` means. Read before touching exchange rates or home-currency conversion. |
+| `docs/currency-model-decision.md` | How multi-currency works: native storage, conversion at read time. Read before touching exchange rates or home-currency conversion. |
 
 ## Who this is for
 
@@ -46,17 +46,20 @@ Never let CLI/iOS/web convenience justify keeping a bad shape in the engine.
 Corollaries:
 
 - **Fix at the root, not at the call site.** A guard added to stop one symptom is a
-  smell — ask what design let the symptom exist. (Standing example: the transfer-leg
-  field guard shipped as a deny-list and forgot `category_id` — bug 6.5, closed
-  2026-08-07. The root fix was inverting it to an allow-list, not adding one more
-  field; `ALLOWED_ON_TRANSFER_LEG` now blocks every future field by default.)
+  smell — ask what design let the symptom exist. (Standing example, from the
+  since-removed transfer feature: its per-leg field guard shipped as a deny-list
+  and forgot `category_id` — bug 6.5, closed 2026-08-07. The root fix was
+  inverting it to an allow-list, not adding one more field. The guard left with
+  the feature in 2026-08-10's removal; allow-list-over-deny-list is the pattern.)
 - **Fail closed.** Enumerate what is *permitted*, never what is forbidden. New
   fields must default to blocked, unknown input must 422 rather than be silently
   dropped, and missing data must surface as `null` + a flag rather than a
   convenient substitute value. For request bodies this is structural: every
-  request model — including nested fragments like `transfer` — inherits
+  request model — including any nested fragment, should one exist again — inherits
   `schemas.StrictModel`, the single `extra="forbid"` implementation
-  (per-model copies were the drift that left 10 models leaky until 2026-08-06).
+  (per-model copies were the drift that left 10 models leaky until 2026-08-06,
+  and the nested fragments were the leak's blind spot: Pydantic config does not
+  propagate into nested models).
 - **Breaking a client is a documented cost, not a blocker.** Record it in
   `docs/client-breaking-changes.md` and proceed.
 
@@ -77,14 +80,14 @@ is not a factor.
 These apply everywhere, no exceptions:
 
 **Sign convention**
-- Requests: `amount_cents` is signed. Negative = outflow. Positive = inflow. The engine infers `transaction_type` from the sign — callers never set it manually. Transfers are identified by the presence of a `transfer` field, not by sign.
+- Requests: `amount_cents` is signed. Negative = outflow. Positive = inflow. The engine infers `transaction_type` from the sign — callers never set it manually.
 - Storage: `amount_cents` is always stored as a positive integer. `transaction_type` (1 = outflow, 2 = inflow) encodes direction, on **every** row, never null. Enforced by the database — `CHECK (transaction_type IN (1, 2))` and `CHECK (amount_cents > 0)` (`sql/020`).
 - Responses: `amount_cents` is always positive. `transaction_type` tells direction. The `?debit_as_negative=true` flag is a caller-side preference, not a schema property.
-- **A transfer is two ordinary rows paired by `transfer_transaction_id`.** That FK is the *only* discriminator — there is no transfer transaction type, and a transfer leg is an ordinary outflow or inflow. "Who the counterparty was" is a fact about the pairing; "which way the money moved" is a fact about the row. Keeping them in one column is what forced direction into a second column in the first place (`transaction_type = 3` + `transfer_direction`, deleted by `sql/020`).
+- **A move between accounts is two ordinary rows** — an outflow and an inflow, with ordinary user categories, no pairing and no netting; monthly totals include them by owner decision (2026-08-10, the transfer removal — `sql/030`). Direction never shares a column with any other fact: when the auto-paired transfer feature existed, letting "who the counterparty was" into the type column is what forced direction into a second column (`transaction_type = 3` + `transfer_direction`, deleted by `sql/020`). The feature is gone; the lesson stays.
 - **No column's sign means anything, anywhere.** Direction is always a separate typed column. `infer_transaction_type` (`app/schemas/transactions.py`) is the **single** place a sign is read — adding a second is the bug, not the fix. Its former twin `infer_transfer_direction` was byte-identical, which is what the duplication cost.
 - **One rendering of the sign matrix, and it is now in SQL only.** `helpers/home_currency.signed_expr` is the single implementation; `monthly_report.py`, `dashboard.py` and `account_balance.py` call it rather than carrying their own copies — four literal copies drifting is finding 9.1 of the 2026-08-01 audit (in git history). The Python twin (`helpers/balance._delta_for_apply`) went with the stored balance in `sql/022`, and it had *already* sprouted a third copy inline in `transactions.create_batch` that no grep for `apply_balance` surfaced and no test covered. Writes read no sign matrix at all now: recording a row is the whole of the write.
-- **This holds on the inbox identically.** The inbox is a draft ledger row: looser about *which fields are null*, never about *how a field encodes its meaning*. `transfer_amount_cents` was the one exception — signed until `sql/019` (2026-08-03), which is what let a same-sign transfer draft promote with a leg silently flipped (finding 7.2 of the 2026-08-01 audit — not the WP7 work package). The lesson: a table that mirrors another copies the whole encoding or none of it — a half-copied convention makes the missing half load-bearing without anyone deciding it should be.
-- ⚠️ **When a CHECK enforces a closed enum, spell out `IS NOT NULL`.** A `CHECK` rejects a row only when it evaluates to `FALSE`; `NULL` passes. `transaction_type IN (1, 2)` is `NULL` — not `FALSE` — on a null column, so a coherence constraint written that way silently admits the row it was added to forbid. `sql/020`'s `inbox_transfer_fields_coherent` carries the explicit guard and a test pins it.
+- **This holds on the inbox identically.** The inbox is a draft ledger row: looser about *which fields are null*, never about *how a field encodes its meaning*. (Historical worked example: the inbox's `transfer_amount_cents` stayed signed until `sql/019` while the ledger stored positive-plus-type, letting a same-sign transfer draft promote with a leg silently flipped — finding 7.2 of the 2026-08-01 audit. The column left with the transfer feature, `sql/030`.) The lesson: a table that mirrors another copies the whole encoding or none of it — a half-copied convention makes the missing half load-bearing without anyone deciding it should be.
+- ⚠️ **When a CHECK enforces a closed enum, spell out `IS NOT NULL`.** A `CHECK` rejects a row only when it evaluates to `FALSE`; `NULL` passes. `transaction_type IN (1, 2)` is `NULL` — not `FALSE` — on a null column, so a coherence constraint written that way silently admits the row it was added to forbid. (Worked example, now historical: `sql/020`'s `inbox_transfer_fields_coherent` carried the explicit guard until `sql/030` dropped the columns it policed.)
 
 **Home currency**
 **The engine is the only thing that does currency conversion. Clients never compute it.** That part is absolute.
@@ -160,7 +163,7 @@ Before writing a new helper, utility, or service function, check if one already 
 | 4 | Accounts, Categories, Hashtags | ✅ Done |
 | 5 | Inbox + Promote | ✅ Done |
 | 6 | Transactions (Ledger) | ✅ Done |
-| 7 | Transfers | ✅ Done |
+| 7 | ~~Transfers~~ | ⛔ Removed 2026-08-10 (`sql/030`) — auto-pairing retired by owner decision; a move is two ordinary rows |
 | — | **Phase 1 complete. Deployed to Render.** | ✅ Done |
 | 8 | Reconciliations | ✅ Done |
 | 9 | ~~Sync~~ (deleted 2026-08-06, `sql/023`), Dashboard, Reports, Activity reads, Exchange rates | ✅ Done |

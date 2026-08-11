@@ -27,11 +27,11 @@ Three types of findings:
 
 Do two things in parallel:
 
-1. **Map the spec:** Read `docs/engine-spec.md` and list every documented endpoint (`METHOD /path`) and every documented business rule. Group by resource domain (Auth, Accounts, Categories, Hashtags, Inbox, Transactions, Transfers, Reconciliations, Sync, Dashboard, Exchange Rates).
+1. **Map the spec:** Read `docs/engine-spec.md` and list every documented endpoint (`METHOD /path`) and every documented business rule. Group by resource domain (Auth, Accounts, Categories, Hashtags, Inbox, Transactions, Reconciliations, Sync, Dashboard, Exchange Rates).
 
 2. **Map the code:** List all non-test `.py` files outside `.venv/`. Note their paths and line counts. Identify which files belong to which resource domain (usually inferrable from filenames like `routes/accounts.py`, `services/inbox.py`).
 
-Budget ceiling: max 9 domain agents + 1 assembler = 10 total. Group smaller domains (e.g., Categories + Hashtags, Sync + Dashboard + Exchange Rates) to stay within budget. Prioritize giving complex domains (Inbox, Transactions, Transfers) their own agent.
+Budget ceiling: max 9 domain agents + 1 assembler = 10 total. Group smaller domains (e.g., Categories + Hashtags, Sync + Dashboard + Exchange Rates) to stay within budget. Prioritize giving complex domains (Inbox, Transactions) their own agent.
 
 Produce the assignment plan before proceeding:
 
@@ -42,9 +42,8 @@ Assignment plan:
 - Agent 3: Categories + Hashtags — spec §Categories + §Hashtags + relevant code
 - Agent 4: Inbox — spec §Inbox + routes/inbox.py + services/inbox.py
 - Agent 5: Transactions — spec §Transactions (Ledger) + routes/transactions.py + services/transactions.py
-- Agent 6: Transfers — spec §Transfers + relevant code
-- Agent 7: Reconciliations — spec §Reconciliations + relevant code
-- Agent 8: Sync + Dashboard + Exchange Rates — spec §Sync + §Dashboard & Reporting + §Exchange Rates + relevant code
+- Agent 6: Reconciliations — spec §Reconciliations + relevant code
+- Agent 7: Sync + Dashboard + Exchange Rates — spec §Sync + §Dashboard & Reporting + §Exchange Rates + relevant code
 - Assembler: receives all findings
 ```
 

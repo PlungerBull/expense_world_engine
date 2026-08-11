@@ -11,6 +11,68 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-10 — the transfer feature is removed (was: auto-paired legs via a `transfer` request field)
+
+**Engine change** (`helpers/transfers.py` deleted; `helpers/transactions.py`,
+`helpers/inbox.py`, `schemas/transactions.py`, `schemas/inbox.py`,
+`routers/inbox.py`, `constants.py`; `sql/030`; owner decision 2026-08-10).
+Auto-paired transfers are gone: no request may carry a `transfer` object, no
+ledger row is paired to a sibling, and the `@Transfer`/`@Debt` system
+categories no longer exist. A move between accounts is recorded as **two
+ordinary rows** — one outflow, one inflow, ordinary user categories — and
+monthly inflow/outflow totals include such moves (owner-accepted). `is_person`
+and every person read surface (`?include_people`, the dashboard `people`
+panel) are **kept**; `POST /people` ships later as its own item.
+
+### What breaks
+
+- **`POST /transactions`**: the `transfer` object 422s as an unknown field
+  (`fields.transfer`, `extra="forbid"`). `category_id` is now
+  **unconditionally required** — omitting it 422s as a plain missing field
+  (`fields: {"category_id": "Field required"}`); the old conditional message
+  `"Required for non-transfer transactions."` is gone.
+- **`POST /inbox` / `PUT /inbox/{id}`**: the `transfer` object 422s as
+  unknown. `"transfer": null` — formerly the inbox's only explicit-null
+  field — is likewise rejected; no inbox field accepts explicit null now.
+- **`POST /inbox/{id}/promote`**: `transfer_id` 422s as unknown; the body is
+  `{"id": …}` alone.
+- **Responses**: `transfer_transaction_id` is gone from every transaction
+  payload; `transfer_account_id` and `transfer_amount_cents` are gone from
+  every inbox payload. Deleted, not nulled — same treatment as
+  `exchange_rate` (`sql/021`).
+- **`GET /inbox?ready=true`**: no transfer arms — every ready row simply has
+  title/amount/date/account/category present.
+- **`DELETE`/`restore /transactions/{id}`**: no sibling cascade, and the
+  `"Transfer sibling: "` warning prefix can no longer occur. The `warnings`
+  channel itself stays (reconciliation-staleness notes are real).
+- **Batch**: the "transfers not supported in batch" rejection is gone —
+  a `transfer` key on an item now fails as an unknown field like any other.
+
+### What does *not* change
+
+- `is_person`, `?include_people`, the dashboard `people` panel, and the
+  person guard on opening balances.
+- `@Opening` and the whole opening-balance flow; `system_key` on category
+  responses (values shrink to `'opening_balance'`).
+- Sign convention, computed balances, read-time conversion, idempotency,
+  activity logging — untouched.
+
+### What the CLI must do
+
+1. Remove the transfer commands and any `transfer`/`transfer_id` payload
+   fields; drop `transfer_transaction_id`/`transfer_account_id`/
+   `transfer_amount_cents` from response models.
+2. Always send `category_id` on ledger creates.
+3. If a paired-entry convenience is ever wanted, build it client-side as two
+   ordinary `POST /transactions` calls.
+
+### Engine references
+
+- `tests/test_request_strictness.py`, `tests/test_uuid_body_fields.py`
+  (updated), new pins in the C3 removal commit
+- `docs/engine-spec.md` — "Moves between accounts" convention;
+  `docs/currency-model-decision.md` — 2026-08-10 amendment; `sql/030`
+
 ## 2026-08-08 — account routes 422 `SETTINGS_MISSING` when settings are absent (was: silent null home balances)
 
 **Engine change** (`helpers/account_balance.py`, `helpers/settings.py`;

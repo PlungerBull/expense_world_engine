@@ -16,13 +16,15 @@
 
 **Idempotency:** Write operations (`POST`, `PUT`, `DELETE`) should include `X-Idempotency-Key: <uuid>`. The engine records `(user_id, key) → (response_body, response_status, request_hash)` in `idempotency_keys` and acquires a transaction-scoped advisory lock on every incoming request to serialize concurrent retries with the same key at the DB. Duplicate requests return the stored response **verbatim, including the original HTTP status code** — no per-route drift. Keys are **permanent** (`sql/026`): there is no TTL, no purge, and a replay works identically a year later. Replay requires the *same request* — each key stores a fingerprint (sha256 over method, path, query string, raw body), and reusing a key with a different request returns `409 CONFLICT` instead of the unrelated snapshot. One exception: `POST /auth/pat` responses are never snapshotted (they carry the one-time plaintext token); replaying that key returns `409 CONFLICT`.
 
-**Sign convention — requests:** `amount_cents` in request bodies uses a signed convention. The engine infers `transaction_type` from the sign — the caller never fills it in manually. Negative = expense/outflow (subtracts from balance). Positive = income/inflow (adds to balance). Transfers are identified by the presence of a `transfer` field in the request body, not by sign.
+**Sign convention — requests:** `amount_cents` in request bodies uses a signed convention. The engine infers `transaction_type` from the sign — the caller never fills it in manually. Negative = expense/outflow (subtracts from balance). Positive = income/inflow (adds to balance).
 
-**Sign convention — storage:** Internally, `amount_cents` is always stored as a positive integer (`CHECK (amount_cents > 0)`). `transaction_type` (1=outflow, 2=inflow, `CHECK (transaction_type IN (1, 2))` — both `sql/020`) is set by the engine from the inferred direction, on **every** row. There is no transfer type: a transfer is two ordinary rows paired by `transfer_transaction_id`, and that FK is the only discriminator. Callers never interact with `transaction_type` on writes.
+**Sign convention — storage:** Internally, `amount_cents` is always stored as a positive integer (`CHECK (amount_cents > 0)`). `transaction_type` (1=outflow, 2=inflow, `CHECK (transaction_type IN (1, 2))` — both `sql/020`) is set by the engine from the inferred direction, on **every** row. There is no third value: direction is the only thing the column encodes. Callers never interact with `transaction_type` on writes.
 
-This holds on **every** amount-bearing column in **every** table, including the inbox's `transfer_amount_cents` — no column's sign carries meaning anywhere in the engine. On an inbox transfer draft, `transaction_type` describes the primary leg (the inbox row itself) and the sibling's direction is its inverse. ⚠️ The inbox was the one exception until 2026-08-03: it had transfer columns but no direction column, so the sign was load-bearing (audit WP7.2, `sql/019`; the direction column itself was then folded into `transaction_type` by `sql/020`).
+This holds on **every** amount-bearing column in **every** table — no column's sign carries meaning anywhere in the engine, and direction is always a separate typed column, never inferred from a stored sign.
 
-**Sign convention — responses:** `amount_cents` in responses is always positive. `transaction_type` tells the client the direction. Pass `?debit_as_negative=true` on any amount-bearing read endpoint to receive negative amounts for expenses and outflows — useful for clients that prefer signed display. Supported on: `/transactions` list + detail, `/inbox` list + detail, `/reconciliations/{id}`. On an inbox transfer row the flag negates *both* legs, in opposite directions — an inbox row carries the sibling amount too, and a transfer whose two amounts point the same way is nonsense. Not a parameter of `/dashboard` or `/reports/monthly` — their aggregates are already signed by construction (category spent is positive for income and negative for expense; totals return split positive inflow/outflow). *(Until 2026-08-08 those two routes accepted the flag as a documented no-op; the parameter was removed outright — FastAPI ignores unknown query params, so a stale caller sending it is unaffected.)*
+**Sign convention — responses:** `amount_cents` in responses is always positive. `transaction_type` tells the client the direction. Pass `?debit_as_negative=true` on any amount-bearing read endpoint to receive negative amounts for expenses and outflows — useful for clients that prefer signed display. Supported on: `/transactions` list + detail, `/inbox` list + detail, `/reconciliations/{id}`. Not a parameter of `/dashboard` or `/reports/monthly` — their aggregates are already signed by construction (category spent is positive for income and negative for expense; totals return split positive inflow/outflow). *(Until 2026-08-08 those two routes accepted the flag as a documented no-op; the parameter was removed outright — FastAPI ignores unknown query params, so a stale caller sending it is unaffected.)*
+
+**Moves between accounts:** The engine has **no transfer concept** (removed 2026-08-10, owner decision — the auto-paired implementation was retired; see `docs/client-breaking-changes.md`). Moving money between two accounts is recorded as **two ordinary rows** — an outflow on one account and an inflow on the other — categorized with ordinary user categories. There is no pairing, no netting, and no system category marking them, and monthly inflow/outflow totals **include** such moves; that is accepted, not an oversight.
 
 **Null over omission:** All optional fields are always present in responses, set to `null` when empty. The response shape never changes based on data presence.
 
@@ -53,7 +55,7 @@ This holds on **every** amount-bearing column in **every** table, including the 
 
 **Optimistic locking:** All mutable resources include a `version` field in responses, incremented on every update. Clients can use this for conflict detection.
 
-**Unknown request fields:** Every request body rejects unknown fields with `422 VALIDATION_ERROR` — no endpoint silently drops input (fail-closed). Since 2026-08-06 this is enforced structurally: all request models inherit `schemas.StrictModel` (`extra="forbid"`), including nested request objects (`transfer` on transactions and inbox) — Pydantic config does not propagate into nested models, so a nested fragment must inherit the base itself. The error names the offending key in `fields`, nested keys as dotted paths (`transfer.bogus`, `transactions.0.bogus`). Per-endpoint "unknown fields 422" notes below call out cases where the rejection carries extra meaning (a deliberately-deleted field, a locked field); the rule itself is global.
+**Unknown request fields:** Every request body rejects unknown fields with `422 VALIDATION_ERROR` — no endpoint silently drops input (fail-closed). Since 2026-08-06 this is enforced structurally: all request models inherit `schemas.StrictModel` (`extra="forbid"`). Any future nested request object must inherit the base itself — Pydantic config does not propagate into nested models (no nested fragment exists today; the last one, `transfer`, left with the 2026-08-10 removal). The error names the offending key in `fields`, nested keys as dotted paths (`transactions.0.bogus`). Per-endpoint "unknown fields 422" notes below call out cases where the rejection carries extra meaning (a deliberately-deleted field, a locked field); the rule itself is global.
 
 **Datetime inputs:** All datetime fields in request bodies must be RFC 3339 with a timezone offset. Accepted: `2026-04-25T16:30:00Z`, `2026-04-25T16:30:00+00:00`, `2026-04-25T11:30:00-05:00`. Rejected with `422 VALIDATION_ERROR`: naive datetimes (`2026-04-25T16:30:00`, `2026-04-25 16:30`, `2026-04-25`). Clients are responsible for resolving the user's local timezone and emitting canonical RFC 3339 — the engine never guesses a timezone for unqualified input. Response datetimes are always emitted in UTC with a `Z` suffix.
 
@@ -66,10 +68,10 @@ This holds on **every** amount-bearing column in **every** table, including the 
 | 1 | Auth bootstrap, Accounts, Categories, Inbox, Transactions (ledger), Hashtags | Core tracking — fully working expense logger |
 | 2 | ~~Sync endpoints~~ *(built, then deleted 2026-08-06 — `sql/023`)*, Activity log reads, Dashboard + reporting | Reportable |
 | 3 | Reconciliations | Bank statement matching |
-| 4 | Transfers + People (`/` syntax, person accounts) | Debt tracking |
+| 4 | ~~Transfers~~ *(shipped with Step 7, removed 2026-08-10 — owner decision, see "Moves between accounts")* + People (person accounts) | Debt tracking |
 | 5 | CSV import, split transactions, Recurrence | Power features |
 
-Shipped ahead of plan: `POST /transactions/batch` landed with Step 6 rather than Phase 5 — the CLI needed bulk historical entry before CSV import existed. Phase 5 retains the CSV layer on top of it. Transfers (Phase 4) also shipped early with Step 7; only the People API half of Phase 4 remains.
+Shipped ahead of plan: `POST /transactions/batch` landed with Step 6 rather than Phase 5 — the CLI needed bulk historical entry before CSV import existed. Phase 5 retains the CSV layer on top of it. Only the People API half of Phase 4 remains.
 
 Each phase is verified via Swagger UI before any CLI or iOS code is written.
 
@@ -132,7 +134,7 @@ Consequently there is **no home-currency recalculation pass**. `app/helpers/reca
 
 **Response shape:** the full `user_settings` row. The former `recalculation` field is **removed** — not nulled — because the operation it summarised cannot occur.
 
-**Settings preconditions:** Endpoints that read `user_settings` (dashboard, reports, transfers, and — since 2026-08-08 — every account surface that emits `current_balance_home_cents`: the accounts list, account detail, and account mutations) return `422 SETTINGS_MISSING` with `fields: {"user_settings": "Must be provisioned via POST /v1/auth/bootstrap."}` if the user has not completed bootstrap. This is a precondition-unmet state, not a conflict. *(Before the bloat-audit §15 consolidation the account routes silently emitted `current_balance_home_cents: null` instead — a state only reachable by deleting the settings row out from under a bootstrapped user.)*
+**Settings preconditions:** Endpoints that read `user_settings` (dashboard, reports, and — since 2026-08-08 — every account surface that emits `current_balance_home_cents`: the accounts list, account detail, and account mutations) return `422 SETTINGS_MISSING` with `fields: {"user_settings": "Must be provisioned via POST /v1/auth/bootstrap."}` if the user has not completed bootstrap. This is a precondition-unmet state, not a conflict. *(Before the bloat-audit §15 consolidation the account routes silently emitted `current_balance_home_cents: null` instead — a state only reachable by deleting the settings row out from under a bootstrapped user.)*
 
 **No exchange-rate preconditions on writes:** since `sql/021`, **no write path performs a rate lookup at all** — recording what happened is never blocked by a stale FX table. Conversion happens at read time, only on cross-currency aggregates; a row whose date has no resolvable rate surfaces there as `null` plus a non-zero `unconverted_count` (see Dashboard & Reporting). The former `422 RATE_UNAVAILABLE` write precondition is retired with the stored `exchange_rate`/`amount_home_cents` columns it protected.
 
@@ -235,7 +237,7 @@ Since `sql/022` it is also the **first term of the account's balance**, which is
 **Forbidden:** any unknown field → `422 VALIDATION_ERROR`.
 
 **Validation:**
-- Account must be active and non-archived (`422`, same rule as transaction creation) and must be a real account — person accounts return `422` (`@Debt` is their domain).
+- Account must be active and non-archived (`422`, same rule as transaction creation) and must be a real account — person accounts return `422` (a person's balance *is* the debt, built from recorded rows; it does not start from a seed).
 - `amount_cents` must not be zero; `date` must not be in the future (`422`).
 - **At most one active opening balance per account** — a second POST returns `409 CONFLICT`. To adjust an opening balance, edit or delete the existing seed transaction instead.
 - A `transaction_id` that already exists returns `409 CONFLICT`. Client-supplied ids make bulk-import re-runs deterministic: a replayed seed collides and is skipped, never double-applied.
@@ -269,9 +271,9 @@ Inverse of `/archive`: sets `is_archived = false` and bumps `version`. Returns `
 
 Person accounts (`is_person = true`) represent people the user lends to or borrows from (debt tracking). They share the `expense_bank_accounts` table with real accounts but are created, listed, and managed through a dedicated People API.
 
-**Design rule:** Person accounts are **only** created via the explicit People API described below. They are **never** auto-created as a side effect of creating a transfer, promoting an inbox item, or any other action. A transfer targeting a non-existent person returns `422 VALIDATION_ERROR`; the client must create the person first, then retry the transfer with the resolved `account_id`.
+**Design rule:** Person accounts are **only** created via the explicit People API described below. They are **never** auto-created as a side effect of any other write. Money to or from a person is recorded as ordinary transactions against the person account — the account's computed balance *is* the debt.
 
-**Rationale:** Explicit creation keeps the user in control of their people list, avoids mystery rows, and prevents race conditions where two devices initiating a transfer to the same new person create duplicate person accounts.
+**Rationale:** Explicit creation keeps the user in control of their people list, avoids mystery rows, and prevents race conditions where two devices writing against the same new person create duplicate person accounts.
 
 ### `POST /people` *(Phase 4 — planned, not yet implemented)*
 Creates a person account.
@@ -281,7 +283,7 @@ Creates a person account.
 
 Response shape is identical to a bank account with `is_person = true`.
 
-Until this endpoint ships, person accounts cannot be created through the API. The data path is ready (reads, balances, dashboard segregation, `@Debt` auto-categorization on transfers) — only the creation endpoint is pending.
+Until this endpoint ships, person accounts cannot be created through the API. The data path is ready (reads, balances, dashboard segregation) — only the creation endpoint is pending.
 
 ---
 
@@ -296,23 +298,21 @@ Returns all active categories, sorted by `sort_order`. System categories (`is_sy
 
 **Name normalization:** `name` is trimmed before storage. An empty-after-trim name returns `422 VALIDATION_ERROR` with `fields: {"name": "Must not be empty."}`. Uniqueness is **case-insensitive** per user: "Food", "food", and "FOOD" collide. A conflicting name returns `409 CONFLICT`. The database enforces this with a partial unique index on `(user_id, LOWER(name)) WHERE deleted_at IS NULL`, so deleting a category and creating a new one with the same name works as expected.
 
-**Reserved names:** the system-category display names (`@Debt`, `@Transfer`, `@Opening` — derived from `SYSTEM_CATEGORY_DEFAULT_NAMES`, compared case-insensitively) cannot be claimed by a user category. Attempting to returns `422 VALIDATION_ERROR` with `fields: {"name": "… is reserved for system categories."}`. Without this, a user category squatting the name would make every later system-category seed hit the `LOWER(name)` unique index — which the seed's `ON CONFLICT (user_id, system_key)` arbiter does not cover — permanently 500ing transfers or opening balances (closed bug 7.4). As defense in depth for rows created before this check existed, the seeding INSERT itself catches the violation and returns a clean `409` naming the remedy (rename the squatting category).
+**Reserved names:** the system-category display names (`@Opening` — derived from `SYSTEM_CATEGORY_DEFAULT_NAMES`, compared case-insensitively) cannot be claimed by a user category. Attempting to returns `422 VALIDATION_ERROR` with `fields: {"name": "… is reserved for system categories."}`. Without this, a user category squatting the name would make every later system-category seed hit the `LOWER(name)` unique index — which the seed's `ON CONFLICT (user_id, system_key)` arbiter does not cover — permanently 500ing opening balances (closed bug 7.4). As defense in depth for rows created before this check existed, the seeding INSERT itself catches the violation and returns a clean `409` naming the remedy (rename the squatting category).
 
-Categories carry no type restriction. The same category can be used on expenses, income, and transfers — including refunds (same category as the original expense, positive amount).
+Categories carry no type restriction. The same category can be used on expenses and income — including refunds (same category as the original expense, positive amount).
 
 **Auto-creation (engine-side, not via this endpoint):**
-- `@Debt` — auto-created the first time a person account is involved in a transaction.
-- `@Transfer` — auto-created the first time a real-account transfer is created.
 - `@Opening` — auto-created the first time an account's opening balance is seeded via `POST /accounts/{id}/opening-balance`.
-All are created with `is_system = true` and a stable `system_key` column (`"debt"` / `"transfer"` / `"opening_balance"`) — the engine looks them up by `system_key`, not by display name. This means users can freely rename the display text without breaking the pipelines that depend on them (which was a bug before the `system_key` column was added).
+It is created with `is_system = true` and a stable `system_key` column (`"opening_balance"`) — the engine looks it up by `system_key`, not by display name. This means users can freely rename the display text without breaking the flow that depends on it (which was a bug before the `system_key` column was added). *(`@Transfer` and `@Debt` — the other two system categories — were deleted with the transfer feature, 2026-08-10.)*
 
 Category responses include `system_key` (`null` for user categories) — since 2026-08-07. It is the identity the rename-safety guarantee keys off, so clients get it too; without it a client wanting to label a specific system row had to string-match a renameable display name. Not an IDs-only violation: `system_key` is an immutable discriminator, not a hydrated copy of a mutable value.
 
 ### `PUT /categories/{id}`
-System categories (`is_system = true`) CAN be renamed — the engine identifies them by `system_key`, not by `name`. Any other field is also editable. Returns `404` if the category is missing. The same name normalization rules as `POST` apply: renames are trimmed, empty names return `422`, and case-insensitive conflicts return `409`. The reserved-name rule applies to renames of **non-system** categories only: a system row may take any name, including its own default back; a user row renamed to `@Debt`/`@Transfer`/`@Opening` (any casing) returns `422`.
+System categories (`is_system = true`) CAN be renamed — the engine identifies them by `system_key`, not by `name`. Any other field is also editable. Returns `404` if the category is missing. The same name normalization rules as `POST` apply: renames are trimmed, empty names return `422`, and case-insensitive conflicts return `409`. The reserved-name rule applies to renames of **non-system** categories only: a system row may take any name, including its own default back; a user row renamed to `@Opening` (any casing) returns `422`.
 
 ### `DELETE /categories/{id}`
-Soft-delete. Returns `409` if the category is referenced by any non-deleted transaction (inbox or ledger). System categories (`is_system = true`) always return `403` — they must remain available for the transfer pipeline.
+Soft-delete. Returns `409` if the category is referenced by any non-deleted transaction (inbox or ledger). System categories (`is_system = true`) always return `403` — the opening-balance flow must always be able to find its category.
 
 ### `POST /categories/{id}/restore`
 Undoes a soft-delete. Returns `404` if no soft-deleted category with that id exists. Returns `409` if an active category already uses the same name (the name collision check prevents silent duplicates). Writes a `RESTORED` activity log entry.
@@ -351,7 +351,7 @@ Returns all active inbox items (`status = 1`, `deleted_at IS NULL`).
 
 Optional filters: `?ready=true` (only items ready to promote — all required fields present and `date ≤ now()`), `?overdue=true` (items with `date` in the past).
 
-`?ready=true` is the exact complement of the promote validation below: every row it returns promotes, and every row that promotes appears in it. In particular transfer items are **included without a `category_id`** — promote auto-assigns `@Transfer`/`@Debt` and never reads the field — and are **excluded** when their `transfer_account_id` points at a deleted or archived account, which promote rejects.
+`?ready=true` is the exact complement of the promote validation below: every row it returns promotes, and every row that promotes appears in it.
 
 ### `POST /inbox`
 Creates a new inbox item.
@@ -360,23 +360,11 @@ Creates a new inbox item.
 
 `amount_cents` follows the standard sign convention: negative = expense, positive = income. The engine infers `transaction_type` from the sign and stores `amount_cents` as positive (same as the ledger). `transaction_type` is stored on the inbox row so direction is preserved through to promotion.
 
-**The `transfer` object** marks the item as a transfer draft. It takes two fields:
+No inbox field accepts an explicit `null` — send a value or omit the key. *(The former `transfer` object, the one explicit-null exception, left with the 2026-08-10 transfer removal.)*
 
-```json
-"transfer": { "account_id": "<uuid>", "amount_cents": -5000 }
-```
+**Response shape:** native currency only, exactly as on a ledger row — `amount_cents` positive, with `transaction_type` carrying the direction. (The old response computed home-currency values from a stored `exchange_rate` whose `DEFAULT 1.0` was bug 1.4 — a $100 draft promoted as 100 PEN cents. Both columns died in `sql/021`.)
 
-Unlike `POST /transactions`, it takes **no `id`** — that field is the sibling *ledger row's* UUID, and no ledger rows exist until promotion. The sibling's id is supplied later, as `transfer_id` on the promote call.
-
-`transfer.amount_cents` is signed and must point the opposite way to the item's own `amount_cents`; a same-sign pair returns `422` on `transfer.amount_cents` — the same rule §Transfers → *Zero-sum validation* applies to `POST /transactions`, enforced here at draft time rather than deferred to promotion. When the item has no `amount_cents` yet, the sibling's sign alone determines direction.
-
-Both amounts are stored **positive**. Direction lives on `transaction_type` (1=outflow, 2=inflow), which describes the **primary** leg — the inbox row itself — exactly as it does on `expense_transactions`. The sibling's direction is its inverse and is never stored. Supplying the item's `amount_cents` in a later `PUT` restates the primary's sign and flips both legs.
-
-Send `"transfer": null` on `PUT /inbox/{id}` to clear it: the transfer columns are nulled and the item stays an ordinary outflow or inflow per its amount. This is the only field on an inbox item that accepts an explicit null.
-
-**Response shape:** native currency only, exactly as on a ledger row — `amount_cents` and `transfer_amount_cents`, both positive, with `transaction_type` carrying the primary leg's direction. (The old response computed home-currency values from a stored `exchange_rate` whose `DEFAULT 1.0` was bug 1.4 — a $100 draft promoted as 100 PEN cents. Both columns died in `sql/021`.)
-
-Pass `?debit_as_negative=true` on `GET /inbox` or `GET /inbox/{id}` to have amounts returned negated for the outflow side. For outflow items (`transaction_type = 1`) the primary `amount_cents` is negated. On a transfer the sibling is negated in the **opposite** direction — the two legs of a transfer never point the same way.
+Pass `?debit_as_negative=true` on `GET /inbox` or `GET /inbox/{id}` to have amounts returned negated for the outflow side (`transaction_type = 1`).
 
 ### `GET /inbox/{id}`
 ### `PUT /inbox/{id}`
@@ -398,29 +386,25 @@ Promotes a ready inbox item to the ledger.
 **Request body (required):**
 ```json
 {
-  "id": "<uuid>",
-  "transfer_id": "<uuid or null>"
+  "id": "<uuid>"
 }
 ```
 
 - `id` — the client-supplied UUID for the newly-created ledger `expense_transactions` row.
-- `transfer_id` — the client-supplied UUID for the paired sibling ledger row when promoting a transfer inbox item. Required when the inbox row carries transfer fields; must be `null` (or omitted) otherwise. Returns `422` in **both** directions — missing when required, and present when not. (The two transfer columns are all-present-or-all-absent by database constraint, so either one identifies a transfer row.) Must differ from `id` — the same UUID for both legs is a `422` on `transfer.id`.
 
 **Validation (engine enforces, not the client):**
 - `title` is present and not `'UNTITLED'`
 - `amount_cents` is present and not zero
 - `date` is present and `≤ now()`
 - `account_id` is present and references an active, non-archived account
-- `category_id` is present and references an active category (non-transfer items only — transfer items auto-assign the system category)
-- `transfer_account_id` references an active, non-archived account (transfer items only) — reported on `transfer.account_id`
-- `transfer_id` is present for a transfer item and absent for a non-transfer one, and must differ from `id` (reported on `transfer_id`)
+- `category_id` is present and references an active category
 
-If any condition fails, returns `422` with **all** the failing fields, not just the first. (One edge check sits outside the accumulation and surfaces on its own: a non-transfer row with an amount but a null `transaction_type` — out-of-band data only, unreachable through the API. The transfer-engine checks `transfer.account_id ≠ account_id` and `transfer.id ≠ id` are accumulated like everything else since 2026-08-07.)
+If any condition fails, returns `422` with **all** the failing fields, not just the first. (One edge check sits outside the accumulation and surfaces on its own: a row with an amount but a null `transaction_type` — out-of-band data only, unreachable through the API.)
 
-**Other statuses:** `200` on success (promote is not a pure create — the inbox row already existed). `404` when the inbox row is missing, already promoted, or soft-deleted. `409 CONFLICT` when `id` (or `transfer_id`) already exists in the ledger.
+**Other statuses:** `200` on success (promote is not a pure create — the inbox row already existed). `404` when the inbox row is missing, already promoted, or soft-deleted. `409 CONFLICT` when `id` already exists in the ledger.
 
 **On success (atomic):**
-1. Creates `expense_transactions` row(s) using the client-supplied `id` (and `transfer_id` for the sibling). `inbox_id` on **both** legs points back to this inbox item — the draft produced the pair, so lineage is a fact about both rows. *(Amended 2026-08-07: previously only the primary leg carried the backlink; rows promoted before then keep a null sibling `inbox_id`.)* Copies `transaction_type` from the inbox row; for transfers, the sibling takes its inverse. Both legs share the draft's title, description, and date; `cleared` starts `false`.
+1. Creates the `expense_transactions` row using the client-supplied `id`. `inbox_id` points back to this inbox item. Copies `transaction_type` from the inbox row. The row takes the draft's title, description, and date; `cleared` starts `false`.
 2. Sets `status = 2` (promoted) on the inbox row.
 3. Sets `deleted_at` on the inbox row (soft delete).
 4. Writes `activity_log` entry (action=1 CREATED) for the new transaction(s).
@@ -430,7 +414,7 @@ There is no balance step in this list, or in any other write flow below — an a
 
 `status = 2` distinguishes a promoted inbox item from a dismissed one (which stays at `status = 1` with `deleted_at` set) — both end up soft-deleted, but the reason is preserved via the status column. Only the PENDING + deleted combination is restorable via `POST /inbox/{id}/restore`.
 
-Returns the newly created `expense_transactions` object (primary leg for transfer promotions).
+Returns the newly created `expense_transactions` object.
 
 ---
 
@@ -455,26 +439,11 @@ Standard `?include_deleted=true`, `?debit_as_negative=true`, and `?limit` / `?of
 ### `POST /transactions`
 Creates a transaction directly in the ledger, bypassing the inbox. Used by the CLI for fast entry when all required fields are known.
 
-**Required:** `id` (client-supplied UUID), `title`, `amount_cents`, `date`, `account_id`, `category_id` (required for normal transactions; omit for transfers — the engine auto-assigns `@Transfer`/`@Debt` and discards any `category_id` passed alongside a `transfer` object)
-**Optional:** `description`, `cleared`, `hashtag_ids`, `transfer`
-**Forbidden:** any unknown field → `422 VALIDATION_ERROR` (`extra="forbid"`). This is what makes the removal of `exchange_rate` (`sql/021`) visible to a caller still sending it — the engine no longer stores a rate anywhere, and a caller who believes the value matters deserves to be told it does not.
+**Required:** `id` (client-supplied UUID), `title`, `amount_cents`, `date`, `account_id`, `category_id` *(unconditionally required since 2026-08-10 — the requirement is enforced at the schema boundary, so a missing `category_id` 422s as a plain missing field, same as omitting `title`; the former conditional waiver existed only for transfers)*
+**Optional:** `description`, `cleared`, `hashtag_ids`
+**Forbidden:** any unknown field → `422 VALIDATION_ERROR` (`extra="forbid"`). This is what makes the removal of `exchange_rate` (`sql/021`) — and of `transfer` (2026-08-10) — visible to a caller still sending it — the engine no longer implements what the field asks for, and a caller who believes the value matters deserves to be told it does not.
 
-For transfer requests, the `transfer` object additionally requires its own `id` field — the UUID of the sibling ledger row. Both `id` and `transfer.id` must be distinct and client-generated. **This is the one field that differs from `POST /inbox`'s `transfer` object, which must omit it** — a draft creates no ledger rows, so there is no sibling to name until promotion. Example:
-
-```json
-{
-  "id": "<primary_uuid>",
-  "title": "BCP to Chase",
-  "amount_cents": -6000,
-  "transfer": {
-    "id": "<sibling_uuid>",
-    "account_id": "<chase_usd_id>",
-    "amount_cents": 1500
-  }
-}
-```
-
-Returns `409 CONFLICT` if `id` or `transfer.id` already exists. No rate lookup, no conversion, no balance write — recording the row is the whole of the write.
+Returns `409 CONFLICT` if `id` already exists. No rate lookup, no conversion, no balance write — recording the row is the whole of the write.
 
 **On success (atomic):**
 1. Creates `expense_transactions` row.
@@ -492,8 +461,6 @@ The same value rules as `POST` apply: `amount_cents` must be non-zero, `title` n
 
 **Field locking:** If the transaction belongs to a completed reconciliation (`reconciliation_id` is set and reconciliation `status = 2`), these fields are read-only: `amount_cents`, `account_id`, `title`, `date`. Attempting to update them returns `422`.
 
-**Transfer edit guard:** If the transaction is part of a transfer pair (`transfer_transaction_id` is set), the guard is an **allow-list**: only `title`, `description`, `cleared`, `hashtag_ids` and `reconciliation_id` are editable per-leg (none has a cross-leg invariant — each leg clears and reconciles at its own bank, on its own account). Every other field returns `422`; a transfer must be deleted and re-created to change them. The PUT path mutates only the edited leg, so letting any paired field through would silently desync the pair: a one-sided `amount_cents` breaks the netting, `account_id` moves a leg to an account the pair was never between, a date mismatch makes `@Transfer` report a phantom spread in the month that has only one leg, and `category_id` strands the sibling in `@Transfer` with nothing to cancel against (blocked outright rather than mirrored — the legs legitimately hold *different* categories, `@Debt` on a person leg). Because it is an allow-list, any field added to the update schema later is blocked on transfer legs by default. (Closed bug 6.5; the guard was previously a deny-list that forgot `category_id`.)
-
 **Date change:** needs no rate handling — nothing on the row stores a conversion (`sql/021`); read-time conversion always uses the row's current date.
 
 **Balance:** nothing to update. Changing `amount_cents` changes what the row contributes; changing `account_id` moves that contribution from one account to the other. Both fall out of the single `UPDATE` on the transaction row.
@@ -501,12 +468,10 @@ The same value rules as `POST` apply: `amount_cents` must be non-zero, `title` n
 ### `DELETE /transactions/{id}`
 Soft-delete. The balance sum excludes soft-deleted rows, so setting `deleted_at` is the reversal — there is no separate balance write.
 
-**Response shape:** Always includes a `warnings: list[str]` field (the "Warnings channel" convention above — this endpoint and restore are its two members). Empty list when the delete is clean; populated with one or more strings when something notable happened. The completed-reconciliation check runs **per leg** (2026-08-08, matching restore): a leg that belonged to a completed reconciliation contributes `"Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."`, with the transfer sibling's occurrence prefixed `"Transfer sibling: "`. The delete is still allowed (the engine does not auto-adjust the reconciliation's totals); the field surfaces the staleness so clients can render a notice.
-
-If the transaction has a `transfer_transaction_id`, both the transaction and its paired sibling are soft-deleted atomically.
+**Response shape:** Always includes a `warnings: list[str]` field (the "Warnings channel" convention above — this endpoint and restore are its two members). Empty list when the delete is clean; populated when something notable happened: a transaction that belonged to a completed reconciliation contributes `"Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."`. The delete is still allowed (the engine does not auto-adjust the reconciliation's totals); the field surfaces the staleness so clients can render a notice.
 
 ### `POST /transactions/{id}/restore`
-Undoes a soft-delete on a transaction. Clearing `deleted_at` puts the row back into the balance sum, so the balance impact returns with no separate re-apply step. Also re-activates the cascaded hashtag junction rows, and atomically restores the transfer sibling if the row is part of a pair. Returns the restored transaction with the same `warnings: list[str]` envelope as DELETE (empty when restore is clean).
+Undoes a soft-delete on a transaction. Clearing `deleted_at` puts the row back into the balance sum, so the balance impact returns with no separate re-apply step. Also re-activates the cascaded hashtag junction rows. Returns the restored transaction with the same `warnings: list[str]` envelope as DELETE (empty when restore is clean).
 
 **Reconciliation handling:** The transaction's `reconciliation_id` survives on the soft-deleted row. On restore, the link is conditionally cleared:
 
@@ -525,64 +490,16 @@ This is intentionally asymmetric to `restore_reconciliation` (which never re-lin
 
 **Failure modes:**
 - `404 NOT_FOUND` — no soft-deleted row with that id (including "row exists but is already active").
-- `422 VALIDATION_ERROR` — the row's `account_id` or `category_id` (or the transfer sibling's) is no longer active and non-archived. All blockers reported in a single `fields` dict before any mutation, so a 422 leaves the soft-deleted row untouched.
-- `409 CONFLICT` — the row is part of a transfer pair but the sibling is missing or no longer soft-deleted (refusing to restore an asymmetric pair).
+- `422 VALIDATION_ERROR` — the row's `account_id` or `category_id` is no longer active and non-archived. All blockers reported in a single `fields` dict before any mutation, so a 422 leaves the soft-deleted row untouched.
 
 ### `POST /transactions/batch`
 Batch create. Array of transaction objects, processed as a single database transaction — all succeed or all fail.
 
-Every item in the batch must carry its own client-supplied `id`. Duplicate ids within a single batch are rejected up front with `422 VALIDATION_ERROR` (`fields.items[i].id = "Duplicate id within batch."`). Transfers are not supported in batch creates; include a `transfer` field on any item and the whole batch is rejected.
+Every item in the batch must carry its own client-supplied `id`. Duplicate ids within a single batch are rejected up front with `422 VALIDATION_ERROR` (`fields.items[i].id = "Duplicate id within batch."`).
 
 **Use cases:** Bulk historical entry. CSV import is a later phase — when implemented, it will also use this endpoint.
 
 Returns an array of created transaction objects and an array of any validation errors (with the index of the failing item).
-
----
-
-## Transfers
-
-Transfers are not a separate endpoint — they are created via `POST /transactions` or `POST /inbox` using the `transfer` field.
-
-### Transfer request shape
-Include a `transfer` object on any transaction create request:
-
-```json
-{
-  "id": "<primary_uuid>",
-  "title": "BCP to Chase",
-  "amount_cents": -6000,
-  "account_id": "<bcp_pen_id>",
-  "category_id": "<other_category_id>",
-  "date": "2024-03-15T00:00:00Z",
-  "transfer": {
-    "id": "<sibling_uuid>",
-    "account_id": "<chase_usd_id>",
-    "amount_cents": 1500
-  }
-}
-```
-
-⚠️ **The two endpoints take different `transfer` shapes.** On `POST /transactions` the object requires an `id` — the sibling ledger row's client-supplied UUID, since both rows are written immediately. On `POST /inbox` it must be **omitted**: no ledger rows exist yet and the sibling's id arrives later as `transfer_id` on the promote call. See `POST /inbox` above.
-
-**Validation (all `422 VALIDATION_ERROR`, field-scoped, accumulated into one response):**
-- **The two sides must be different accounts.** A `transfer.account_id` equal to the request's own `account_id` returns `fields: {"transfer.account_id": "Must be a different account."}` — a transfer to itself moves no money and would write two rows that cancel on one balance. Checked before either account is loaded, so it fires even for an account that doesn't exist; if the same id is also missing or archived, the existence message wins the field (the checks share one key).
-- `transfer.amount_cents` must not be zero, and must carry the opposite sign to the primary `amount_cents` (see zero-sum validation below).
-- `transfer.id` must differ from the request's own `id` — the same UUID for both legs returns `fields: {"transfer.id": "Must differ from the primary transaction id."}`.
-- Both `account_id` values must reference the caller's own active, non-archived accounts.
-
-**Business logic (atomic):**
-1. Creates the primary transaction (the one in the request body).
-2. Creates the paired transaction on `transfer.account_id` with `transfer.amount_cents`.
-3. Links both via `transfer_transaction_id` (each row points to the other).
-4. Auto-assigns categories: if either account `is_person = true`, that side gets `@Debt`; both real accounts get `@Transfer`. These override any `category_id` passed in the request.
-5. Auto-creates `@Debt` or `@Transfer` system categories if they don't exist yet.
-   - **Note:** The transfer engine does **not** auto-create person accounts. Both `account_id` values in the request must reference accounts that already exist and are non-archived. If `transfer.account_id` references a non-existent or archived person, the request returns `422 VALIDATION_ERROR`. Callers create person accounts explicitly via the People API before initiating a transfer to that person.
-6. **Zero-sum validation:** The engine does not enforce that the two `amount_cents` values are equal in raw number — they may be in different currencies. It does enforce that the two transactions are directionally opposite (one negative, one positive). Returns `422` if both are the same sign. **Explicit decision:** No magnitude equality check is performed even when both accounts share the same currency. This keeps the logic simple and allows users to record unequal amounts intentionally (e.g., fees absorbed during transfer).
-
-   **This is checked wherever both signs are supplied — including `POST`/`PUT /inbox`, before promotion.** A transfer draft is validated when it is written, not when it is promoted, because that is where the two signs still exist side by side; by promote time the row holds absolute amounts plus the primary's `transaction_type`, and the legs are re-signed from that column and cannot disagree. ⚠️ Until 2026-08-03 the inbox had no direction column and promotion *derived* the primary's sign from the sibling's, so this rule was unreachable for drafts and a same-sign pair was silently rewritten. Audit WP7.2; fixed in `sql/019`.
-7. **Cross-currency transfers store no conversion.** Each leg records what its bank actually saw, in that account's native currency — nothing else is written (`sql/021`). At read time each leg converts independently by its date's rate, so the pair generally does **not** net to zero in home currency; the difference — the spread between the rate the user got and the reference rate — surfaces in the `@Transfer` category's report figures. That is deliberate (owner decision 2026-08-05): a non-zero `@Transfer` month figure *is* the cost of moving money. No separate `@FX` category is recognized — see `docs/currency-model-decision.md`, "Deferred: @FX".
-8. Both account balances have moved by construction — each leg is an ordinary row on its own account, and the balance is a sum over rows.
-9. Writes `activity_log` entries for both transactions.
 
 ---
 
