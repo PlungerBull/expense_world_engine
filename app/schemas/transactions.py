@@ -80,14 +80,16 @@ class TransactionResponse(BaseModel):
 
 
 class TransactionWithWarningsResponse(TransactionResponse):
-    """DELETE /transactions/{id} and POST /transactions/{id}/restore only.
+    """POST /transactions/{id}/restore only.
 
     ``warnings`` carries side-effect notes (reconciliation unlink on a
-    completed reconciliation). Required, no default: those two routes always
-    emit it — empty when the operation is clean — and a path that forgot to
-    set it should fail response validation, not be papered over. Deliberately
-    NOT on other mutations: the key exists where a warning can actually occur
-    (owner decision 2026-08-07, D9 in open-bugs.md).
+    completed or vanished reconciliation). Required, no default: the route
+    always emits it — empty when the operation is clean — and a path that
+    forgot to set it should fail response validation, not be papered over.
+    Deliberately NOT on other mutations: the key exists where a warning can
+    actually occur (owner decision 2026-08-07, D9 in open-bugs.md). DELETE
+    was the second member until 2026-08-11, when its only warning became a
+    409 block (bug 5.5) and the envelope left with it.
     """
 
     warnings: list[str]

@@ -517,12 +517,15 @@ async def update_transaction(
     subsequent mutations — otherwise the lock would be released prematurely.
 
     Reconciliation field-locking: if the transaction is assigned to a
-    completed reconciliation, certain fields are immutable and the
-    service raises 422 rather than silently dropping them.
+    completed reconciliation, certain fields — and the assignment itself —
+    are immutable and the service raises 422 rather than silently
+    dropping them.
 
     Args:
         fields: columns to update, after ``hashtag_ids`` and
             ``reconciliation_id`` have been removed by the caller.
+            A validated ``reconciliation_id`` is folded back in before
+            the single UPDATE so one PUT is one version bump.
         hashtag_ids: if not None, replaces the set of linked hashtags.
             Use an empty list to clear, None to leave unchanged.
         recon_id_provided: True if the caller explicitly sent
@@ -554,12 +557,18 @@ async def update_transaction(
     # reflect the prior state per §6 aggregate exception #1.
     await attach_hashtag_ids(conn, before)
 
-    # Field locking check — reconciliation completed
+    # Field locking check — reconciliation completed. The assignment itself
+    # is locked with the fields: unassigning (or moving) a row changes the
+    # completed batch's difference_cents just as surely as editing its
+    # amount, so every door locks together (bug 5.5). Revert the
+    # reconciliation to draft to make any of these changes.
     if before_row["reconciliation_id"] is not None:
         recon = await fetch_recon_status(conn, user_id, before_row["reconciliation_id"])
         if recon and recon["status"] == ReconciliationStatus.COMPLETED:
             locked = {"amount_cents", "account_id", "title", "date"}
             attempted = locked & fields.keys()
+            if recon_id_provided:
+                attempted.add("reconciliation_id")
             if attempted:
                 raise validation_error(
                     "Transaction belongs to a completed reconciliation. These fields are locked.",
@@ -644,8 +653,16 @@ async def update_transaction(
     # might affect a balance. Moving the row IS moving both balances now: the
     # old account stops counting it and the new one starts, in the same UPDATE.
 
-    # Empty `fields` (hashtag- or reconciliation-only change) still bumps
-    # version: dynamic_update always appends updated_at/version, so the
+    # A reconciliation change rides the same UPDATE as every other column —
+    # one statement, one version bump. The separate dynamic_update that used
+    # to run after this one moved `version` by 2 on a PUT that combined
+    # `reconciliation_id` with any other field, breaking read-modify-write
+    # conflict detection (bug 5.5).
+    if recon_id_provided:
+        fields["reconciliation_id"] = recon_id_value
+
+    # Empty `fields` (hashtag-only change) still bumps version:
+    # dynamic_update always appends updated_at/version, so the
     # zero-field call is exactly the bump.
     after_row = await dynamic_update(conn, "expense_transactions", fields, transaction_id, user_id)
     if after_row is None:
@@ -654,20 +671,6 @@ async def update_transaction(
     # Sync hashtags if provided
     if hashtag_ids is not None:
         await _sync_hashtags(conn, transaction_id, user_id, hashtag_ids)
-
-    # Apply reconciliation_id change
-    if recon_id_provided:
-        after_row = await dynamic_update(
-            conn,
-            "expense_transactions",
-            {"reconciliation_id": recon_id_value},
-            transaction_id,
-            user_id,
-        )
-        # Unreachable while the FOR UPDATE lock above holds, but fail closed
-        # rather than serialize a None row if that ever changes.
-        if after_row is None:
-            raise not_found("transaction")
 
     after = transaction_from_row(after_row)
     # Post-mutation hashtag_ids — applies whether hashtag_ids was rewritten
@@ -688,23 +691,6 @@ async def update_transaction(
 # Delete
 # ---------------------------------------------------------------------------
 
-async def _recon_warning(conn: asyncpg.Connection, user_id: str, recon_id) -> Optional[str]:
-    """Warning text when a deleted leg belonged to a COMPLETED reconciliation.
-
-    Deletion is never blocked by the reconciliation — the warning tells
-    the client the reconciliation's totals may now be stale.
-    """
-    if recon_id is None:
-        return None
-    recon = await fetch_recon_status(conn, user_id, recon_id)
-    if recon and recon["status"] == ReconciliationStatus.COMPLETED:
-        return (
-            "Transaction belonged to a completed reconciliation. "
-            "Reconciliation totals may be stale."
-        )
-    return None
-
-
 async def delete_transaction(
     conn: asyncpg.Connection,
     user_id: str,
@@ -712,9 +698,13 @@ async def delete_transaction(
 ) -> dict:
     """Soft-delete a transaction.
 
-    The response carries ``warnings: list[str]`` — always present on this
-    endpoint, empty when the delete is clean: a transaction sitting in a
-    completed reconciliation contributes a staleness note.
+    A transaction assigned to a COMPLETED reconciliation cannot be
+    deleted (409): removing a row changes the completed batch's
+    ``difference_cents`` just as surely as editing its amount, and every
+    door locks together — revert the reconciliation to draft first.
+    This replaced warn-but-allow (owner decision 2026-08-11, bug 5.5);
+    the ``warnings`` envelope left this endpoint with it, making restore
+    the warnings channel's sole member.
 
     The row is locked with ``FOR UPDATE`` before mutation so the
     activity-log before/after snapshots describe one state of the row —
@@ -730,6 +720,16 @@ async def delete_transaction(
         conn, "expense_transactions", transaction_id, user_id, "transaction",
         for_update=True,
     )
+
+    # Completed-reconciliation guard — before any mutation, so a 409
+    # leaves the row untouched.
+    if row["reconciliation_id"] is not None:
+        recon = await fetch_recon_status(conn, user_id, row["reconciliation_id"])
+        if recon and recon["status"] == ReconciliationStatus.COMPLETED:
+            raise conflict(
+                "Cannot delete a transaction assigned to a completed "
+                "reconciliation. Revert the reconciliation to draft first."
+            )
 
     before = transaction_from_row(row)
     # Pre-delete hashtag_ids — captured BEFORE the junction cascade below,
@@ -754,13 +754,7 @@ async def delete_transaction(
         after_snapshot=after,
     )
 
-    # Warnings channel — always present (null-over-omission).
-    warnings: list[str] = []
-    warning = await _recon_warning(conn, user_id, row["reconciliation_id"])
-    if warning is not None:
-        warnings.append(warning)
-
-    return {**after, "warnings": warnings}
+    return after
 
 
 # ---------------------------------------------------------------------------
@@ -788,9 +782,10 @@ async def restore_transaction(
       * recon is DRAFT and active             → keep the link
 
     The COMPLETED case must unlink because completed reconciliations
-    lock four fields (``amount_cents``, ``account_id``, ``title``,
-    ``date``) on assigned transactions. Silently re-linking would
-    leave the restored row immutable, which the user wouldn't expect.
+    lock assigned transactions — the four fields (``amount_cents``,
+    ``account_id``, ``title``, ``date``), the assignment itself, and
+    delete. Silently re-linking would leave the restored row immutable,
+    which the user wouldn't expect.
     The DRAFT-and-active case is the user's good-path expectation —
     they were reconciling, deleted by mistake, and want the row back
     in the same batch without a re-assignment ceremony.

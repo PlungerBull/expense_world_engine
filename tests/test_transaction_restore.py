@@ -118,7 +118,9 @@ async def test_restore_simple_expense_round_trips_balance(client, test_data):
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
         assert delete_r.status_code == 200, delete_r.text
-        assert delete_r.json()["warnings"] == []
+        # DELETE lost its warnings envelope when its only warning became a
+        # 409 block (bug 5.5) — restore is the warnings channel's sole member.
+        assert "warnings" not in delete_r.json()
         balance_after_delete = await _get_balance(test_data.account_id)
         assert balance_after_delete == balance_after_create + 1000
 
@@ -252,20 +254,26 @@ async def test_restore_unlinks_completed_reconciliation(client, test_data):
     expect after an undo.
     """
     txn_id = str(uuid.uuid4())
+    # Second transaction: keeps the reconciliation completable after txn_id
+    # is deleted (deleting while COMPLETED is a 409 since bug 5.5 closed,
+    # so the delete must happen while the recon is still a draft — and
+    # `complete` requires at least one assigned active transaction).
+    keeper_id = str(uuid.uuid4())
     recon_id = str(uuid.uuid4())
-    create_r = await client.post(
-        "/v1/transactions",
-        json={
-            "id": txn_id,
-            "title": f"restore-recon-{uuid.uuid4()}",
-            "amount_cents": -300,
-            "date": "2026-04-12T12:00:00Z",
-            "account_id": test_data.account_id,
-            "category_id": test_data.category_id,
-        },
-        headers={"X-Idempotency-Key": str(uuid.uuid4())},
-    )
-    assert create_r.status_code == 201, create_r.text
+    for tid in (txn_id, keeper_id):
+        create_r = await client.post(
+            "/v1/transactions",
+            json={
+                "id": tid,
+                "title": f"restore-recon-{uuid.uuid4()}",
+                "amount_cents": -300,
+                "date": "2026-04-12T12:00:00Z",
+                "account_id": test_data.account_id,
+                "category_id": test_data.category_id,
+            },
+            headers={"X-Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert create_r.status_code == 201, create_r.text
 
     recon_create = await client.post(
         "/v1/reconciliations",
@@ -281,20 +289,25 @@ async def test_restore_unlinks_completed_reconciliation(client, test_data):
     assert recon_create.status_code == 201, recon_create.text
 
     try:
-        # Assign the txn to the recon, complete the recon, delete the txn.
-        await client.put(
+        # Assign both txns, delete one while the recon is still DRAFT,
+        # then complete the recon — the soft-deleted row keeps its link.
+        for tid in (txn_id, keeper_id):
+            assign_r = await client.put(
+                f"/v1/transactions/{tid}",
+                json={"reconciliation_id": recon_id},
+                headers={"X-Idempotency-Key": str(uuid.uuid4())},
+            )
+            assert assign_r.status_code == 200, assign_r.text
+        delete_r = await client.delete(
             f"/v1/transactions/{txn_id}",
-            json={"reconciliation_id": recon_id},
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
-        await client.post(
+        assert delete_r.status_code == 200, delete_r.text
+        complete_r = await client.post(
             f"/v1/reconciliations/{recon_id}/complete",
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
-        await client.delete(
-            f"/v1/transactions/{txn_id}",
-            headers={"X-Idempotency-Key": str(uuid.uuid4())},
-        )
+        assert complete_r.status_code == 200, complete_r.text
 
         # Restore — should unlink and warn.
         restore_r = await client.post(
@@ -331,7 +344,7 @@ async def test_restore_unlinks_completed_reconciliation(client, test_data):
                 "DELETE FROM expense_reconciliations WHERE id = $1 AND user_id = $2",
                 recon_id, test_data.user_id,
             )
-        await _hard_delete_txns([txn_id], test_data.user_id)
+        await _hard_delete_txns([txn_id, keeper_id], test_data.user_id)
 
 
 # ---------------------------------------------------------------------------

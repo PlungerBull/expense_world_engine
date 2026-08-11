@@ -9,7 +9,7 @@ from typing import Awaitable, Callable, Optional
 import asyncpg
 
 from app.constants import ActivityAction
-from app.errors import not_found
+from app.errors import conflict, not_found
 from app.helpers.activity_log import write_activity_log
 
 
@@ -221,6 +221,15 @@ async def _mutate_with_audit(
     before = serialize(row)
 
     after_row = await mutate(conn, table, resource_id, user_id)
+    if after_row is None:
+        # The row changed state between the caller's fetch and this UPDATE
+        # (a concurrent delete/restore won the race, so the mutate's
+        # deleted_at predicate matched nothing). Fail closed with a 409
+        # rather than serializing None into a 500 (bug 5.5).
+        raise conflict(
+            f"{resource_type} was changed by a concurrent request. "
+            "Re-fetch and retry."
+        )
     if refetch is not None:
         after_row = await refetch()
     after = serialize(after_row)

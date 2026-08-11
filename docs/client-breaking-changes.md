@@ -11,6 +11,52 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-11 — completed reconciliations fully freeze their transactions; DELETE loses its `warnings` key; one PUT is one `version` bump
+
+**Engine change** (`helpers/transactions.py`, `helpers/query_builder.py`,
+`routers/transactions.py`, `schemas/transactions.py`; open-bugs 5.5, owner
+decision 2026-08-11). Three related fixes to the transaction ↔ reconciliation
+state machine:
+
+1. **Unassigning or moving a transaction out of a completed reconciliation is
+   now locked** — `PUT /transactions/{id}` with `reconciliation_id` (null or
+   any value) on a row whose reconciliation is `status = 2` returns the same
+   `422` as the existing amount/account/title/date field lock
+   (`fields: {"reconciliation_id": "Locked by completed reconciliation."}`).
+   Previously it succeeded silently and drifted the completed batch's
+   `difference_cents`. Revert the reconciliation to draft first.
+2. **Deleting a transaction assigned to a completed reconciliation is now
+   `409 CONFLICT`** (`"Cannot delete a transaction assigned to a completed
+   reconciliation. Revert the reconciliation to draft first."`), previously a
+   `200` carrying a staleness warning. With that warning gone, **the
+   `warnings` key is removed from the `DELETE /transactions/{id}` response**
+   — it returns the plain transaction shape. `POST /transactions/{id}/restore`
+   keeps its `warnings` envelope unchanged and is now the channel's sole
+   member.
+3. **A `PUT` that changes `reconciliation_id` alongside other fields bumps
+   `version` by exactly 1**, previously 2 (two internal UPDATEs). A client
+   doing read-modify-write conflict detection sees one step per edit.
+
+Also in this batch (shared-helper hardening, no contract change for correct
+clients): a delete/restore that races a concurrent state flip on accounts,
+categories, hashtags, reconciliations, or inbox items now returns
+`409 CONFLICT` instead of an uncontrolled `500`.
+
+**What the CLI must do:** stop reading `warnings` on transaction delete
+responses (restore is unaffected); surface the new `409` on delete and the
+`reconciliation_id` field-lock `422` as "revert the reconciliation first".
+No request shape changes.
+
+### Engine references
+
+- `tests/test_reconciliation_rules.py` (new pins), `tests/test_transaction_restore.py`,
+  `tests/test_openapi_contract.py` (updated)
+- `docs/engine-spec.md` — §`PUT /transactions/{id}` (field locking, version),
+  §`DELETE /transactions/{id}`, Warnings channel convention, §Assigning
+  transactions, §complete/§revert
+
+---
+
 ## 2026-08-11 — inbox writes validate `account_id`/`category_id` references (was: stored unvalidated, rejected at promote)
 
 **Engine change** (`helpers/inbox.py`; open-bugs 7.1, the last item the 6.7

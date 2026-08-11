@@ -128,7 +128,11 @@ async def test_pagination_envelope_matches_declared(client):
 
 
 @pytest.mark.asyncio
-async def test_transaction_delete_live_shape_includes_warnings(client, test_data):
+async def test_transaction_delete_live_shape_has_no_warnings(client, test_data):
+    """DELETE returns the plain transaction shape. Its `warnings` key left
+    with its only warning, which became a 409 block (bug 5.5) — the
+    warnings channel's sole member is restore, which must still declare it.
+    """
     txn_id = str(uuid.uuid4())
     r = await client.post(
         "/v1/transactions",
@@ -147,8 +151,11 @@ async def test_transaction_delete_live_shape_includes_warnings(client, test_data
     d = await client.delete(f"/v1/transactions/{txn_id}", headers=_idem())
     assert d.status_code == 200, d.text
     declared = _declared_keys("/v1/transactions/{transaction_id}", "delete")
-    assert "warnings" in declared
+    assert "warnings" not in declared
     assert set(d.json().keys()) == declared
+    assert "warnings" in _declared_keys(
+        "/v1/transactions/{transaction_id}/restore", "post"
+    )
 
 
 # ---------------------------------------------------------------------------

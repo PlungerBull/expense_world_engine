@@ -201,7 +201,7 @@ async def update_transaction(
 # ---------------------------------------------------------------------------
 # DELETE /transactions/{transaction_id}
 # ---------------------------------------------------------------------------
-@router.delete("/{transaction_id}", response_model=TransactionWithWarningsResponse)
+@router.delete("/{transaction_id}", response_model=TransactionResponse)
 async def delete_transaction(
     transaction_id: UUID,
     auth_user: CurrentUser,

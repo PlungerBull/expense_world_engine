@@ -28,7 +28,7 @@ This holds on **every** amount-bearing column in **every** table — no column's
 
 **Null over omission:** All optional fields are always present in responses, set to `null` when empty. The response shape never changes based on data presence.
 
-**Warnings channel:** An endpoint whose operation can produce a side-effect note carries `warnings: list[str]` in its response — always present *on that endpoint*, empty when the operation is clean. Currently: `DELETE /transactions/{id}` and `POST /transactions/{id}/restore` (reconciliation-staleness notes). The key exists exactly where a warning can occur, **not** on every mutation — a deliberate scope (decision D9 in `open-bugs.md`, 2026-08-07): uniformity is for representation rules, not endpoint-specific content, and an always-empty key on every write would be structure without meaning. Null-over-omission holds within each endpoint: where the key exists, it is never omitted. An endpoint that gains a real warning to emit adopts this same envelope.
+**Warnings channel:** An endpoint whose operation can produce a side-effect note carries `warnings: list[str]` in its response — always present *on that endpoint*, empty when the operation is clean. Currently: `POST /transactions/{id}/restore` (reconciliation-unlink notes) — the sole member since 2026-08-11, when `DELETE /transactions/{id}`'s only warning became a 409 block (bug 5.5) and the envelope left that endpoint with it. The key exists exactly where a warning can occur, **not** on every mutation — a deliberate scope (decision D9 in `open-bugs.md`, 2026-08-07): uniformity is for representation rules, not endpoint-specific content, and an always-empty key on every write would be structure without meaning. Null-over-omission holds within each endpoint: where the key exists, it is never omitted. An endpoint that gains a real warning to emit adopts this same envelope.
 
 **OpenAPI is enforced, not decorative (2026-08-07, bug 10.1):** Every route declares a `response_model`, and a first-time write's body is serialized *through* that model — `run_idempotent` returns the plain dict and FastAPI validates it, so a stale declaration is a loud test failure, not doc drift. Idempotent replays bypass the model by design: they return the stored snapshot verbatim. Corollary of model-filtering: a new response field does not exist on the wire until it is added to the model (`tests/test_openapi_contract.py` pins live-vs-declared key sets). The documented 422 everywhere is the error envelope above; FastAPI's default `HTTPValidationError` stub is stripped from `openapi.json` because the app never emits it.
 
@@ -465,7 +465,9 @@ The same value rules as `POST` apply: `amount_cents` must be non-zero, `title` n
 
 **Reconciliation assignment:** `reconciliation_id` on this endpoint is the **only** way a transaction is assigned to or removed from a reconciliation batch — see *Assigning transactions* under Reconciliations below for the full rules.
 
-**Field locking:** If the transaction belongs to a completed reconciliation (`reconciliation_id` is set and reconciliation `status = 2`), these fields are read-only: `amount_cents`, `account_id`, `title`, `date`. Attempting to update them returns `422`.
+**Field locking:** If the transaction belongs to a completed reconciliation (`reconciliation_id` is set and reconciliation `status = 2`), these fields are read-only: `amount_cents`, `account_id`, `title`, `date` — and `reconciliation_id` itself: unassigning (`null`) or moving the row to another reconciliation is locked the same way, because membership changes the completed batch's `difference_cents` just as surely as an amount edit. Attempting to update any of them returns `422` naming each locked key. To make such a change, `POST /reconciliations/{id}/revert` first.
+
+**Version:** a successful `PUT` bumps `version` by exactly one, no matter how many fields change.
 
 **Date change:** needs no rate handling — nothing on the row stores a conversion (`sql/021`); read-time conversion always uses the row's current date.
 
@@ -474,10 +476,10 @@ The same value rules as `POST` apply: `amount_cents` must be non-zero, `title` n
 ### `DELETE /transactions/{id}`
 Soft-delete. The balance sum excludes soft-deleted rows, so setting `deleted_at` is the reversal — there is no separate balance write.
 
-**Response shape:** Always includes a `warnings: list[str]` field (the "Warnings channel" convention above — this endpoint and restore are its two members). Empty list when the delete is clean; populated when something notable happened: a transaction that belonged to a completed reconciliation contributes `"Transaction belonged to a completed reconciliation. Reconciliation totals may be stale."`. The delete is still allowed (the engine does not auto-adjust the reconciliation's totals); the field surfaces the staleness so clients can render a notice.
+**Completed-reconciliation guard:** a transaction assigned to a completed reconciliation cannot be deleted — `409 CONFLICT` (`"Cannot delete a transaction assigned to a completed reconciliation. Revert the reconciliation to draft first."`), checked before any mutation. Deleting the row would change the completed batch's `difference_cents` exactly like an amount edit, so delete locks together with the field lock on `PUT` (owner decision 2026-08-11, bug 5.5 — this replaced the earlier warn-but-allow behaviour). With the warning gone, the response is the plain transaction shape: no `warnings` key on this endpoint (see the Warnings channel convention — restore is its sole member).
 
 ### `POST /transactions/{id}/restore`
-Undoes a soft-delete on a transaction. Clearing `deleted_at` puts the row back into the balance sum, so the balance impact returns with no separate re-apply step. Also re-activates the cascaded hashtag junction rows. Returns the restored transaction with the same `warnings: list[str]` envelope as DELETE (empty when restore is clean).
+Undoes a soft-delete on a transaction. Clearing `deleted_at` puts the row back into the balance sum, so the balance impact returns with no separate re-apply step. Also re-activates the cascaded hashtag junction rows. Returns the restored transaction with a `warnings: list[str]` envelope (the Warnings channel convention — this endpoint is its sole member; empty when restore is clean).
 
 **Reconciliation handling:** The transaction's `reconciliation_id` survives on the soft-deleted row. On restore, the link is conditionally cleared:
 
@@ -532,7 +534,7 @@ The engine distinguishes *omitted* from *explicitly null*: leaving `reconciliati
 
 The account check uses the transaction's *effective* account — if the same `PUT` also changes `account_id`, the new value is what must match. A batch and its transactions therefore always share one account.
 
-Two behaviors of this path are **known state-machine gaps, not design** (bug 5.5 in `docs/open-bugs.md`): unassigning *away from* a completed reconciliation is currently allowed silently (the guard above only blocks assigning *into* one), and a `PUT` that supplies `reconciliation_id` bumps the transaction's `version` twice in one call (once for the column update, once for the assignment write).
+The completed lock is symmetric (since 2026-08-11, closing bug 5.5): the guard above blocks assigning *into* a completed reconciliation, and the field lock on `PUT` (see Transactions) blocks unassigning or moving a row *away from* one — both directions require a revert first. The assignment change applies in the same `UPDATE` as any other fields in the request, so the `version` bump is single either way.
 
 Unassignment also happens implicitly in two places: `DELETE /reconciliations/{id}` cascade-unassigns every linked transaction, and `POST /transactions/{id}/restore` conditionally clears the link (see its table under Transactions).
 
@@ -594,14 +596,14 @@ An empty body is a no-op returning current state (no version bump, no activity e
 Editing a balance touches **only this row** — no other reconciliation is ever rewritten as a consequence (the chaining cascade is gone, `sql/025`). `difference_cents` on the next read reflects the new figures.
 
 ### `POST /reconciliations/{id}/complete`
-Marks the reconciliation as complete (`status = 2`). From this point, the four locked fields (`amount_cents`, `account_id`, `title`, `date`) become read-only on all assigned transactions, and the reconciliation's own balance/date fields are locked (see `PUT` above).
+Marks the reconciliation as complete (`status = 2`). From this point, assigned transactions are frozen: the four locked fields (`amount_cents`, `account_id`, `title`, `date`) become read-only, the assignment itself cannot be changed (`422`), and the transaction cannot be deleted (`409`) — and the reconciliation's own balance/date fields are locked (see `PUT` above).
 
 **Atomicity:** the handler locks every assigned transaction with `SELECT ... FOR UPDATE` before flipping the status, bumps `version + updated_at` on each one, and writes the `activity_log` entry — all inside the same DB transaction. Concurrent transaction edits serialize behind the status flip, so the transaction-lock state and the reconciliation status change on the same tick.
 
 **Validation:** Returns `422` with `fields: {"transactions": "At least one transaction must be assigned."}` if no non-deleted transactions are assigned to the batch. Returns `404` if the reconciliation is missing or soft-deleted. Calling on an already-completed batch is a silent no-op returning the current row (no activity entry) — and it short-circuits before the assignment check, so a completed batch whose transactions have since all been deleted still replays as `200`.
 
 ### `POST /reconciliations/{id}/revert`
-Reverts status to draft (`status = 1`). Unlocks all fields on assigned transactions, including the reconciliation's own balance/date fields (both locks read the live status, so the flip is the unlock). Same atomicity guarantees as `complete`: assigned transactions are locked with `FOR UPDATE`, versions bumped, status flipped — all in one DB transaction. Restores only the status; nothing else on the row is rewritten. **Revert requires nothing** — the asymmetry with `complete` (which requires ≥1 assigned transaction) is deliberate: completing asserts a batch adds up, reverting merely withdraws that assertion. Returns `404` if missing or soft-deleted; reverting an already-draft batch is a silent no-op. Neither endpoint takes a request body; both honor `X-Idempotency-Key`.
+Reverts status to draft (`status = 1`). Unlocks assigned transactions entirely — fields, assignment, and delete — plus the reconciliation's own balance/date fields (all locks read the live status, so the flip is the unlock). Same atomicity guarantees as `complete`: assigned transactions are locked with `FOR UPDATE`, versions bumped, status flipped — all in one DB transaction. Restores only the status; nothing else on the row is rewritten. **Revert requires nothing** — the asymmetry with `complete` (which requires ≥1 assigned transaction) is deliberate: completing asserts a batch adds up, reverting merely withdraws that assertion. Returns `404` if missing or soft-deleted; reverting an already-draft batch is a silent no-op. Neither endpoint takes a request body; both honor `X-Idempotency-Key`.
 
 ### `DELETE /reconciliations/{id}`
 Soft-delete. Only allowed if `status = 1` (draft). Returns `409` if status is completed — revert first. Cascade-unassigns every transaction that was linked to this batch (`reconciliation_id` set back to `null` with `version + updated_at` bumps).
