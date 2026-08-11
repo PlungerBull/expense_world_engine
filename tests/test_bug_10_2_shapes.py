@@ -175,6 +175,66 @@ async def test_exchange_rate_supported_pair_without_data_is_404(client):
 
 
 # ---------------------------------------------------------------------------
+# Multi-field accumulation — one 422 carries every failing field
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_accumulates_all_failing_fields(client, test_data):
+    """POST /transactions reports every bad field in one response.
+
+    Whitespace title, zero amount and a future date are three independent
+    failures of the create accumulator (`helpers/transactions.py`); a valid
+    account and category keep the reference checks out of the way. Pinned
+    against the accumulator degrading into first-failure-wins.
+    """
+    r = await client.post(
+        "/v1/transactions",
+        json={
+            "id": str(uuid.uuid4()),
+            "title": "   ",
+            "amount_cents": 0,
+            "date": "2030-01-01T00:00:00Z",
+            "account_id": test_data.account_id,
+            "category_id": test_data.category_id,
+        },
+        headers=_idem(),
+    )
+    assert r.status_code == 422, r.text
+    fields = r.json()["error"]["fields"]
+    assert set(fields.keys()) == {"title", "amount_cents", "date"}
+
+
+# ---------------------------------------------------------------------------
+# Inbox rejects explicit null field values
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_inbox_put_rejects_explicit_null_title(client, test_data):
+    """`PUT /inbox/{id}` 422s on `{"title": null}` — null is never "clear"."""
+    draft = await client.post(
+        "/v1/inbox",
+        json={
+            "id": str(uuid.uuid4()),
+            "title": f"null-guard-{uuid.uuid4().hex[:8]}",
+            "amount_cents": -100,
+            "date": PAST_DATE,
+            "account_id": test_data.account_id,
+        },
+        headers=_idem(),
+    )
+    assert draft.status_code == 201, draft.text
+    inbox_id = draft.json()["id"]
+
+    r = await client.put(
+        f"/v1/inbox/{inbox_id}", json={"title": None}, headers=_idem()
+    )
+    assert r.status_code == 422, r.text
+    assert "title" in r.json()["error"]["fields"]
+
+    await client.delete(f"/v1/inbox/{inbox_id}", headers=_idem())
+
+
+# ---------------------------------------------------------------------------
 # transfer.id == id — accumulated, not a second round trip
 # ---------------------------------------------------------------------------
 
