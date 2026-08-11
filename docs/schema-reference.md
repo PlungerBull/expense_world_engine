@@ -4,8 +4,9 @@
 > Conventions: `../CLAUDE.md`
 >
 > Regenerated 2026-08-06 from the live catalog (`information_schema` + `pg_indexes` +
-> `pg_constraint` + `pg_policies`) after the deletion program landed (`sql/020`–`sql/025`).
-> **14 tables, 126 columns.**
+> `pg_constraint` + `pg_policies`) after the deletion program landed (`sql/020`–`sql/025`);
+> amended 2026-08-10 for the transfer removal (`sql/030` — three columns and two CHECKs dropped).
+> **14 tables, 123 columns.**
 
 ---
 
@@ -26,7 +27,7 @@ These rules apply to all mutable tables unless explicitly noted as an exception.
 
 | Field | Table | Mapping |
 |---|---|---|
-| `transaction_type` | `expense_transactions` | 1 = outflow (expense), 2 = inflow (income). **There is no value 3** — a transfer leg is an ordinary outflow or inflow, identified by `transfer_transaction_id` (`sql/020`). CHECK-enforced. |
+| `transaction_type` | `expense_transactions` | 1 = outflow (expense), 2 = inflow (income). **There is no value 3** — direction is the only fact this column encodes (`sql/020`; the transfer discriminator it once pointed at was dropped by `sql/030`). CHECK-enforced. |
 | `transaction_type` | `expense_transaction_inbox` | same enum, nullable (a draft may have no amount yet). CHECK-enforced with an explicit `IS NULL OR` arm. |
 | `status` | `expense_transaction_inbox` | 1 = pending, 2 = promoted. **There is no value 3** — a dismissed row is `status = 1` + `deleted_at` set (the status records how far the row got, `deleted_at` records that it left the inbox). CHECK-enforced (`sql/029`). |
 | `status` | `expense_reconciliations` | 1 = draft, 2 = completed. CHECK-enforced (`sql/025`). |
@@ -293,13 +294,15 @@ expense_categories
                 — display label. Free to rename, including for system categories.
   - color       text, NOT NULL, default '#6b7280'
   - is_system   boolean, NOT NULL, default false
-                — true for system-managed categories (@Transfer, @Debt, @Opening).
+                — true for system-managed categories (@Opening).
                   Cannot be deleted.
   - system_key  text, nullable
-                — immutable discriminator for system categories ('debt', 'transfer',
-                  'opening_balance'). NULL for regular user-created categories. The
-                  engine looks up system rows by (user_id, system_key) so display
-                  renames are safe — added in sql/010.
+                — immutable discriminator for system categories
+                  ('opening_balance' — the only value since the transfer removal
+                  deleted 'debt'/'transfer', 2026-08-10). NULL for regular
+                  user-created categories. The engine looks up system rows by
+                  (user_id, system_key) so display renames are safe — added in
+                  sql/010.
   - sort_order  integer, NOT NULL, default 0
   - created_at  timestamptz, NOT NULL, default now()
   - updated_at  timestamptz, NOT NULL, default now()
@@ -314,13 +317,9 @@ expense_categories
 `is_archived` was dropped in `sql/024` along with the archive/unarchive routes — after the dashboard's archived panels died in the read-time-currency rework, nothing displayed the state.
 
 **System categories (auto-seeded on first use, `is_system = true`):**
-- `@Transfer` (`system_key = 'transfer'`) — auto-assigned to both legs of a transfer between the user's own real accounts. Cannot be manually assigned to other transactions.
-- `@Debt` (`system_key = 'debt'`) — auto-assigned to transactions on person accounts (both the receivable entry and the settlement). Represents money owed to or from people.
-- `@Opening` (`system_key = 'opening_balance'`) — assigned to opening-balance seed transactions created via `POST /accounts/{id}/opening-balance`. Transactions under this category are excluded from flow reports (dashboard month panel + monthly report) but included in balances, and the category row itself is hidden from those panels.
+- `@Opening` (`system_key = 'opening_balance'`) — assigned to opening-balance seed transactions created via `POST /accounts/{id}/opening-balance`. Transactions under this category are excluded from flow reports (dashboard month panel + monthly report) but included in balances, and the category row itself is hidden from those panels. The only system category since 2026-08-10 — `@Transfer`/`@Debt` left with the auto-paired transfer feature.
 
-All display names are user-renameable; the engine always resolves system categories by `system_key`.
-
-**Category on transfers:** `category_id` is NOT NULL on all transactions, including transfers. Own-account transfers auto-receive `@Transfer`. Person-account transactions auto-receive `@Debt`. This enforces completeness without requiring the user to choose a category manually for these flows.
+The display name is user-renameable; the engine always resolves system categories by `system_key`.
 
 **Refunds:** Use the same category as the original expense. Tag the refund as an inflow (`transaction_type = 2`). The category accumulates both directions — net spend in that category across the month reflects the true cost.
 
@@ -352,13 +351,6 @@ expense_transaction_inbox
                   — 1=outflow, 2=inflow — same enum as expense_transactions, no value 3.
                   — inferred by the engine from the signed request amount_cents.
                   — nullable because a draft may not have an amount yet.
-                  — on a transfer draft this is the PRIMARY leg's direction; the
-                    sibling's is its inverse and is never stored.
-  - transfer_account_id  UUID, nullable, FK → expense_bank_accounts
-                  — destination account for the paired transfer transaction
-  - transfer_amount_cents bigint, nullable
-                  — sibling leg's amount, always positive (CHECK); the request value
-                    is signed and must oppose the primary's sign (checked at POST/PUT)
   - created_at    timestamptz, NOT NULL, default now()
   - updated_at    timestamptz, NOT NULL, default now()
   - version       integer, NOT NULL, default 1
@@ -367,11 +359,9 @@ expense_transaction_inbox
 
 **CHECK constraints:**
 - `inbox_amount_positive` — `amount_cents IS NULL OR amount_cents > 0`
-- `inbox_transfer_amount_positive` — same for `transfer_amount_cents`
 - `inbox_transaction_type_valid` — `transaction_type IS NULL OR transaction_type IN (1, 2)` (`sql/020`; there is no draft type 3)
-- `inbox_transfer_fields_coherent` — the transfer columns are all-present or all-absent, and a populated pair forces `transaction_type IS NOT NULL AND transaction_type IN (1, 2)`. The explicit `IS NOT NULL` matters: a CHECK that evaluates to NULL passes, so without it the constraint would silently admit the row it exists to forbid (`CLAUDE.md`).
 
-`exchange_rate` was dropped in `sql/021` (its `DEFAULT 1.0` was bug 1.4 — items promoted at a fabricated rate) and `transfer_direction` in `sql/020` (direction folded into `transaction_type`).
+`exchange_rate` was dropped in `sql/021` (its `DEFAULT 1.0` was bug 1.4 — items promoted at a fabricated rate), `transfer_direction` in `sql/020` (direction folded into `transaction_type`), and the transfer draft columns — `transfer_account_id`, `transfer_amount_cents`, with their `inbox_transfer_amount_positive` and `inbox_transfer_fields_coherent` CHECKs — in `sql/030` (the transfer removal, 2026-08-10).
 
 **Promotion flow:** User-initiated. When `title`, `amount_cents`, `date`, `account_id`, and `category_id` are all present and `date ≤ now()`, the item is eligible. Promoting atomically:
 1. Creates a new row in `expense_transactions` with all validated data. `transaction_type` is copied directly from the inbox row.
@@ -380,8 +370,6 @@ expense_transaction_inbox
 4. Sets `deleted_at` on this inbox row (soft delete).
 
 There is no balance step (writing the ledger row *is* the balance change — `sql/022`) and no rate lookup (conversion happens at read time — `sql/021`).
-
-**Transfer promotion:** When the transfer columns are set, promoting creates a paired transfer instead of a single transaction. The `category_id` requirement is waived — categories are auto-assigned (`@Transfer` for real accounts, `@Debt` for person accounts) — and `transfer_account_id` gets the same active/non-archived check the primary account does. The primary leg takes the draft's `transaction_type`; the sibling takes its inverse. Opposite signs on the two amounts are validated at `POST`/`PUT`, while both signals are still available (`sql/019`/`sql/020` — the old signed `transfer_amount_cents` encoding let a same-sign draft promote with a leg silently flipped).
 
 **Hashtags:** The inbox has no hashtag support — no `hashtag_ids` field on its schemas, and promotion attaches none, so tags are silently lost by drafting through the inbox. Open product question — see TODO.md.
 
@@ -407,19 +395,13 @@ expense_transactions
                               — read-only while part of a completed reconciliation.
   - transaction_type          smallint, NOT NULL
                               — 1=outflow (balance decreases), 2=inflow (balance increases)
-                              — CHECK (transaction_type IN (1, 2)); on EVERY row, transfers
-                                included. There is no value 3 (sql/020).
+                              — CHECK (transaction_type IN (1, 2)); on EVERY row.
+                                There is no value 3 (sql/020).
   - date                      timestamptz, NOT NULL, default now()
   - account_id                UUID, NOT NULL, FK → expense_bank_accounts
   - category_id               UUID, NOT NULL, FK → expense_categories
   - cleared                   boolean, NOT NULL, default false
                               — true when confirmed on a bank statement; drives reconciliation.
-  - transfer_transaction_id   UUID, nullable, FK → expense_transactions (self-referencing)
-                              — each row in a paired transfer points to the other row.
-                                This FK is the ONLY transfer discriminator: non-null means
-                                the row is a transfer leg. The pair nets to zero in native
-                                currency when both legs share a currency; a cross-currency
-                                pair records what each bank actually saw.
   - inbox_id                  UUID, nullable, FK → expense_transaction_inbox
                               — lineage back to the inbox item this was promoted from
   - reconciliation_id         UUID, nullable, FK → expense_reconciliations
@@ -429,7 +411,7 @@ expense_transactions
   - deleted_at                timestamptz, nullable
 ```
 
-Dropped by the deletion program: `transfer_direction` (`sql/020` — direction folded into `transaction_type`), `amount_home_cents` and `exchange_rate` (`sql/021` — conversion moved to read time), `parent_transaction_id` (`sql/024` — reserved for splits, never non-null; a splits migration re-adds it with the balance predicate).
+Dropped by the deletion program: `transfer_direction` (`sql/020` — direction folded into `transaction_type`), `amount_home_cents` and `exchange_rate` (`sql/021` — conversion moved to read time), `parent_transaction_id` (`sql/024` — reserved for splits, never non-null; a splits migration re-adds it with the balance predicate), `transfer_transaction_id` (`sql/030` — the self-FK that paired transfer legs, removed with the transfer feature, 2026-08-10).
 
 **Indexes (`sql/022`) — load-bearing; the computed balance depends on the first:**
 
@@ -440,7 +422,7 @@ idx_expense_transactions_user_category        (user_id, category_id)            
 idx_expense_transactions_user_reconciliation  (user_id, reconciliation_id)       WHERE reconciliation_id IS NOT NULL AND deleted_at IS NULL
 ```
 
-`sql/022`'s header records the measured plans (50k seeded rows) and the deliberate omissions — no index on `transfer_transaction_id` (no query filters on it; siblings are looked up by primary key), no `hashtag_id` index on the junction (the report joins the other direction), no `INCLUDE` columns (they defeat HOT updates). The seven `(user_id, updated_at)` sync indexes died with `/sync` (`sql/023`).
+`sql/022`'s header records the measured plans (50k seeded rows) and the deliberate omissions — no `hashtag_id` index on the junction (the report joins the other direction), no `INCLUDE` columns (they defeat HOT updates). (Its "no index on `transfer_transaction_id`" omission now describes a column `sql/030` dropped.) The seven `(user_id, updated_at)` sync indexes died with `/sync` (`sql/023`).
 
 **Field locking on reconciliation:** When `reconciliation_id` references a completed reconciliation (`status = 2`), these four fields are read-only: `amount_cents`, `account_id`, `title`, `date`. All other fields remain editable. Reverting the reconciliation to draft unlocks them.
 
@@ -567,7 +549,7 @@ Cross-user shared expenses. Deferred to the people and sharing phase. When imple
 - Conversion happens at read time, only on figures the user compares or sums across currencies (report/dashboard aggregates, `current_balance_home_cents`). Individual transactions, inbox items, and reconciliations carry native currency only.
 - A conversion is a lookup of the rate for that row's date in the user's `display_timezone`, carried forward from the most recent rate on or before it. No rate → the row converts to `null`, and every home-currency `SUM` is paired with an `unconverted_count` that nulls the total rather than understating it. `app/helpers/home_currency.py` is the single implementation.
 - The home currency is locked to `'PEN'` by a CHECK (`sql/018`); currencies are locked to USD/PEN (`sql/015`). Both are labelled scale boundaries, not defects.
-- A cross-currency transfer stores what each bank actually saw on each leg; the home-currency spread between the legs surfaces in `@Transfer` report figures (owner decision 2026-08-05 — no `@FX` category).
+- An account-to-account move is two ordinary rows (the paired-transfer machinery was removed by `sql/030`, 2026-08-10); each row converts independently by its own date's rate, so any FX spread between the two lands in whatever user categories the rows carry.
 
 ---
 
@@ -575,28 +557,20 @@ Cross-user shared expenses. Deferred to the people and sharing phase. When imple
 
 People are bank accounts with `is_person = true`. There is no separate people table. If someone shares expenses in multiple currencies, they have multiple accounts — one per currency — both shown in the People sidebar section.
 
-> ⚠️ **Structurally complete, functionally unreachable.** The engine reads `is_person` (accounts list filter, dashboard split, the transfer engine's `@Debt` branch, the opening-balance guard) but no endpoint can set it, so no row can currently be a person. Whether to build `POST /people` or delete the axis is an open product question — see TODO.md. The model below is the design the machinery implements.
+> ⚠️ **Structurally complete, functionally unreachable.** The engine reads `is_person` (accounts list filter, dashboard split, the opening-balance guard) but no endpoint can set it, so no row can currently be a person. Decided 2026-08-10: the feature stays and `POST /people` ships as its own work item — see TODO.md. The model below is the design the machinery implements.
 
-**Debt tracking model:** A person account's balance represents the financial position with that person. Positive balance = they owe you money. Negative balance = you owe them money. Transactions on person accounts use the `@Debt` system category automatically.
+**Debt tracking model:** A person account's balance represents the financial position with that person. Positive balance = they owe you money. Negative balance = you owe them money. All rows are ordinary transactions with ordinary user categories — the `@Debt` auto-assignment left with the transfer feature (`sql/030`, 2026-08-10).
 
 **Full debt cycle example (you pay $100 lunch, split $50 with John):**
 
 | Step | Transaction | Account | Category | Balance effect |
 |---|---|---|---|---|
 | 1. Pay lunch | $100 outflow | Checking | Food | Checking −100 |
-| 2. Register John's share | $50 inflow | John (person) | @Debt | John +50 (he owes you) |
-| 3. John pays you back | $50 outflow | John (person) | @Debt | John −50 = 0 |
+| 2. Register John's share | $50 inflow | John (person) | user's choice (e.g. "Loans") | John +50 (he owes you) |
+| 3. John pays you back | $50 outflow | John (person) | user's choice | John −50 = 0 |
 | 4. Receive John's payment | $50 inflow | Checking | Food | Checking +50 |
 
 End state: Checking −50 (your true out of pocket), Food −50 (your true food spend), John 0 (debt cleared).
-
-**System category assignment:**
-
-| Scenario | Primary leg category | Paired leg category |
-|---|---|---|
-| Real account → Real account | `@Transfer` (automatic) | `@Transfer` (automatic) |
-| Real account + Person account | User's chosen category | `@Debt` (automatic) |
-| Person account only | `@Debt` (automatic) | N/A |
 
 ---
 
