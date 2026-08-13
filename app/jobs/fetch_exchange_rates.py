@@ -17,6 +17,15 @@ active bank account or any user's main_currency. A single call (`@latest` return
 currencies against USD) covers all of them. Upserts are idempotent on the
 `(base_currency, target_currency, rate_date)` unique constraint — safe to re-run the
 job at any time.
+
+Provider rates are not trusted on sight: `_upsert_rate` refuses a non-positive
+rate and one that moves more than `MAX_RATE_MOVE_FRACTION` from the previous
+known rate, counting the target as a failure instead of storing it. A refused
+date simply has no row, which reads carry forward across — see the constants for
+why refusing is the safe arm. Note that the upsert is `ON CONFLICT DO NOTHING`
+and this job fires every 6h, so the FIRST rate accepted for a day is the one that
+stands: later runs cannot correct or overwrite it. That is what makes the guard
+worth having at write time rather than as an after-the-fact report.
 """
 import asyncio
 import json
@@ -24,7 +33,7 @@ import sys
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import asyncpg
@@ -41,6 +50,31 @@ HTTP_TIMEOUT_SECONDS = 30
 # loop: 30 tries, 2s apart. Far beyond a normal local start.
 DB_CONNECT_TRIES = 30
 DB_CONNECT_WAIT_SECONDS = 2
+
+# Plausibility band. A provider rate that moves further than this from the
+# previous known rate is refused rather than stored — owner decision
+# 2026-08-13, taking the "refuse" arm over "write it and flag it".
+#
+# Why refusing is the safe arm: a date with no row is not a hole. `get_rate`
+# and `home_rate_join` both resolve `rate_date <= <date>` and carry the most
+# recent earlier rate forward, so reads simply price at the last good rate —
+# roughly right, and self-healing the moment a sane rate lands. Storing a bad
+# one instead misprices every report touching that date until someone notices.
+#
+# Why 10%: real USD/PEN day-to-day movement is well under 1%, so this never
+# touches legitimate data. What it catches is the failure that actually happens
+# to currency feeds — a misplaced decimal point (33.373 for 3.3373), a zero, a
+# garbage value. Since sql/021 this table is the only source of every
+# home-currency figure, so one bad row misprices reports rather than one write.
+MAX_RATE_MOVE_FRACTION = 0.10
+
+# How far back a baseline may be drawn from. The band above asks "did this move
+# more than 10% in about a day"; across a long gap that question has no answer —
+# USD/PEN has legitimately ranged ~3.2-4.1 over recent years, so comparing
+# across one would refuse real history mid-backfill. Beyond this window there is
+# no usable baseline and the rate is accepted unchecked. The daily job is
+# unaffected either way: it always has yesterday.
+MAX_BASELINE_GAP_DAYS = 7
 
 
 async def _create_pool_waiting_for_db() -> Optional[asyncpg.Pool]:
@@ -134,6 +168,38 @@ def _fetch_currency_api(version: str = "latest") -> dict:
     }
 
 
+async def _baseline_rate(
+    conn: asyncpg.Connection,
+    target: str,
+    rate_date: date,
+) -> Optional[tuple[float, date]]:
+    """Most recent stored rate strictly before ``rate_date``, or None.
+
+    Deliberately not ``helpers.exchange_rate.get_rate``, which answers a
+    different question in all three respects that matter here: it resolves
+    ``rate_date <= as_of`` (a row for the same day would answer itself, making
+    a re-run compare a rate against itself), it caches for an hour (a baseline
+    must read what is in the table *now*), and it carries forward without limit
+    (see ``MAX_BASELINE_GAP_DAYS``).
+    """
+    row = await conn.fetchrow(
+        f"""
+        SELECT rate, rate_date FROM exchange_rates
+        WHERE base_currency = '{BASE_CURRENCY}' AND target_currency = $1
+          AND rate_date < $2
+          AND rate_date >= $3
+        ORDER BY rate_date DESC
+        LIMIT 1
+        """,
+        target,
+        rate_date,
+        rate_date - timedelta(days=MAX_BASELINE_GAP_DAYS),
+    )
+    if row is None:
+        return None
+    return (float(row["rate"]), row["rate_date"])
+
+
 async def _upsert_rate(
     conn: asyncpg.Connection,
     target: str,
@@ -142,16 +208,41 @@ async def _upsert_rate(
 ) -> bool:
     """Insert one provider rate; True if a row was written.
 
-    Raises ValueError on a non-positive rate rather than inserting it —
-    since sql/021 this table is the only source of every home-currency
-    figure, so one bad provider row misprices reports, not one write.
-    Guarded here so no caller (daily fetch, backfill) can skip it; the
-    exchange_rates_rate_positive CHECK (sql/027) is the backstop.
-    Callers catch this and count the target into the run's failures —
-    recording the rest of the day's rates is never blocked by one bad one.
+    Raises ValueError rather than inserting when the rate is non-positive or
+    implausible — since sql/021 this table is the only source of every
+    home-currency figure, so one bad provider row misprices reports, not one
+    write. Both guards live here so no caller (daily fetch, backfill) can skip
+    them; the exchange_rates_rate_positive CHECK (sql/027) backstops the first
+    and there is deliberately no SQL backstop for the second (plausibility is a
+    judgment against neighbouring data, not a property of the row).
+
+    Callers catch this and count the target into the run's failures — recording
+    the rest of the day's rates is never blocked by one bad one, and a refused
+    date is left with no row at all, which reads carry forward across.
+
+    Ordering note: positivity is checked first, so a zero or negative rate never
+    reaches the ratio below (which would divide by, or compare against, junk).
     """
     if rate <= 0:
         raise ValueError(f"non-positive rate for USD->{target} on {rate_date}: {rate}")
+
+    # A first-ever rate, or one after a gap wider than the baseline window, has
+    # nothing to be judged against and is accepted. Backfill note: it writes in
+    # fetch-completion order, not date order, so which side of a neighbouring
+    # pair gets checked is not deterministic — a bad rate landing first can push
+    # its good neighbour into `failed` instead of itself. Both dates are named
+    # in the run's stderr either way, which is what follow-up needs.
+    baseline = await _baseline_rate(conn, target, rate_date)
+    if baseline is not None:
+        baseline_rate, baseline_date = baseline
+        move = abs(rate - baseline_rate) / baseline_rate
+        if move > MAX_RATE_MOVE_FRACTION:
+            raise ValueError(
+                f"implausible rate for USD->{target} on {rate_date}: {rate} moves "
+                f"{move:.1%} from {baseline_rate} on {baseline_date} "
+                f"(limit {MAX_RATE_MOVE_FRACTION:.0%}) — refused, "
+                f"reads carry {baseline_date} forward"
+            )
     row = await conn.fetchrow(
         f"""
         INSERT INTO exchange_rates (base_currency, target_currency, rate_date, rate)
@@ -180,8 +271,9 @@ async def _apply_rates(
     differently — the daily fetch reports bare targets, the backfill prefixes
     each with its date — and a helper that printed would flatten that
     (bloat-audit §18). ``skipped`` means already-present (``ON CONFLICT DO
-    NOTHING`` hit); ``failed`` carries ``_upsert_rate``'s non-positive-rate
-    refusals, never aborts the rest of the targets.
+    NOTHING`` hit); ``failed`` carries ``_upsert_rate``'s refusals — both the
+    non-positive and the implausible kind — and never aborts the rest of the
+    targets.
     """
     tally: dict = {"inserted": [], "skipped": [], "missing": [], "failed": []}
     for target in targets:

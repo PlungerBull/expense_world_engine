@@ -785,3 +785,26 @@ Lists the stored `exchange_rates` rows, newest first, in the standard pagination
 - `rate` = units of `target` per 1 `base`, serialized as a JSON number — same convention and serialization as the lookup.
 - The `UNIQUE (base_currency, target_currency, rate_date)` constraint guarantees one row per pair per day; clients render rows verbatim, no dedup on either side.
 - Read-only reference data (same posture as `GET /activity`): standard auth, standard error envelope.
+
+### Rate ingestion: implausible rates are refused, not stored
+
+`app/jobs/fetch_exchange_rates.py` does not trust the provider on sight. `_upsert_rate` refuses, before the INSERT, a rate that is:
+
+- **non-positive** — backstopped by the `exchange_rates_rate_positive` CHECK (`sql/027`); or
+- **implausible** — more than `MAX_RATE_MOVE_FRACTION` (±10%) from the most recent stored rate for that pair, when one exists within `MAX_BASELINE_GAP_DAYS` (7 days). No SQL backstop, deliberately: plausibility is a judgment against neighbouring data, not a property of the row.
+
+A refused target is counted into the run's failures — it never aborts the other targets — and the job exits `2` with the reason on stderr.
+
+**A refused date has no row, and that is the safe outcome.** Both carry-forward implementations resolve `rate_date <= <date>`, so reads price at the last good rate: roughly right, and self-healing the moment a sane rate lands. Storing the bad rate instead would misprice every report touching that date, because since `sql/021` this table is the only source of every home-currency figure. This matters more than it looks: the upsert is `ON CONFLICT DO NOTHING` and the job fires every 6h, so the **first** rate accepted for a day is the one that stands — later runs cannot correct it.
+
+Why ±10%: real USD/PEN day-to-day movement is well under 1%, so the band never touches legitimate data. What it catches is the failure that actually happens to currency feeds — a misplaced decimal point (`33.373` for `3.3373`), a zero, a garbage value. The 7-day baseline window exists because across a longer gap a 10% move is ordinary (USD/PEN has legitimately ranged ~3.2–4.1 over recent years), and comparing across one would refuse real history mid-backfill.
+
+*Owner decision 2026-08-13, taking the "refuse" arm over "store it and flag it". Split out of bug 1.7 and fixed the same day; the remaining 1.7 parts are ⚪ lows in `docs/open-bugs.md`.*
+
+### Staleness: `rate_date` is the signal, and it needs no new endpoint
+
+`GET /exchange-rates` returns both `date` (the day you asked about) and `rate_date` (the day of the row actually used). **`rate_date < date` means the requested day has no rate of its own** and the figure is carried forward.
+
+That one comparison covers every way rate ingestion can fail — provider down, machine asleep, job crashed, rate refused as implausible — so clients wanting a staleness indicator read it from here rather than from a bespoke field. A `404` (no rate at all on or before the date) is the same condition at its extreme and should be treated as stale, not as an error to surface raw.
+
+Client note: the CLI/TUI header renders a `!` whenever `rate_date < date` (owner decision 2026-08-13, choosing the most sensitive trigger over a 2-day grace period — it will also show on an ordinary morning before the day's fetch has run).
