@@ -1004,12 +1004,6 @@ async def create_batch(
         if item.hashtag_ids:
             await _sync_hashtags(conn, str(row["id"]), user_id, item.hashtag_ids)
 
-        # Activity log
-        await write_activity_log(
-            conn, user_id, "transaction", str(row["id"]), ActivityAction.CREATED,
-            after_snapshot=response,
-        )
-
     # The accumulate-then-apply balance loop that used to close this function is
     # gone. It existed to collapse N per-item balance writes into K UPDATEs, and
     # to do that it carried its OWN copy of the sign matrix, inline — a third
@@ -1020,5 +1014,14 @@ async def create_batch(
 
     # Single round-trip resolves hashtag_ids for the whole batch.
     await attach_hashtag_ids(conn, created)
+
+    # Activity log — after the resolve above, so each CREATED snapshot carries
+    # the row's actual hashtag set per §6 aggregate exception #1 (bug 8.2: the
+    # in-loop write snapshotted transaction_from_row's [] placeholder).
+    for response in created:
+        await write_activity_log(
+            conn, user_id, "transaction", response["id"], ActivityAction.CREATED,
+            after_snapshot=response,
+        )
 
     return {"created": created}

@@ -24,12 +24,14 @@ test_audit_response_shape.py.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Iterable
 
 import pytest
 
 from app import db
+from app.constants import ActivityAction
 
 
 # ---------------------------------------------------------------------------
@@ -479,5 +481,83 @@ async def test_reconciliation_detail_embeds_hashtag_ids_per_transaction(
                 "DELETE FROM expense_reconciliations WHERE id = $1 AND user_id = $2",
                 recon_id, test_data.user_id,
             )
+        for h in tags:
+            await _cleanup_hashtag(h, test_data.user_id)
+
+
+# ---------------------------------------------------------------------------
+# Activity-log CREATED snapshots — §6 aggregate exception #1 (bug 8.2)
+#
+# Junction rows get no activity_log entries of their own, so the parent
+# transaction's CREATED snapshot is the ONLY record of the hashtags it was
+# born with. Bug 8.2: the batch path snapshotted before resolving, freezing
+# transaction_from_row's [] placeholder into the audit trail.
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_created_snapshot(txn_id: str, user_id: str) -> dict:
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT after_snapshot
+            FROM activity_log
+            WHERE resource_type = 'transaction'
+              AND resource_id = $1 AND user_id = $2
+              AND action = $3
+            """,
+            txn_id, user_id, int(ActivityAction.CREATED),
+        )
+    assert len(rows) == 1, f"expected exactly one CREATED entry, got {len(rows)}"
+    return json.loads(rows[0]["after_snapshot"])  # jsonb comes back as str
+
+
+@pytest.mark.asyncio
+async def test_batch_created_snapshots_carry_hashtag_ids(client, test_data):
+    """Bug 8.2 pin: batch CREATED snapshots record the attached hashtag set."""
+    h1 = await _create_hashtag(client, "snap-batch-a")
+    h2 = await _create_hashtag(client, "snap-batch-b")
+    items = [
+        {
+            "id": str(uuid.uuid4()),
+            "title": f"snap-batch-{i}-{uuid.uuid4()}",
+            "amount_cents": -100 - i,
+            "date": "2026-04-12T12:00:00Z",
+            "account_id": test_data.account_id,
+            "category_id": test_data.category_id,
+            "hashtag_ids": tags,
+        }
+        for i, tags in enumerate([[h1], [h1, h2], []])
+    ]
+
+    r = await client.post(
+        "/v1/transactions/batch",
+        json={"transactions": items},
+        headers=_idem(),
+    )
+    assert r.status_code == 201, r.text
+
+    try:
+        for item in items:
+            snapshot = await _fetch_created_snapshot(item["id"], test_data.user_id)
+            _assert_hashtag_ids_shape(snapshot, item["hashtag_ids"])
+    finally:
+        for item in items:
+            await _cleanup_txn(item["id"], test_data.user_id)
+        await _cleanup_hashtag(h1, test_data.user_id)
+        await _cleanup_hashtag(h2, test_data.user_id)
+
+
+@pytest.mark.asyncio
+async def test_single_created_snapshot_carries_hashtag_ids(client, test_data):
+    """The single-create path's snapshot obeys the same rule (was already
+    correct; pinned here so the two paths can't drift apart again)."""
+    tags = sorted([await _create_hashtag(client, "snap-single") for _ in range(2)])
+    txn_id, _ = await _create_txn(client, test_data, hashtag_ids=tags)
+
+    try:
+        snapshot = await _fetch_created_snapshot(txn_id, test_data.user_id)
+        _assert_hashtag_ids_shape(snapshot, tags)
+    finally:
+        await _cleanup_txn(txn_id, test_data.user_id)
         for h in tags:
             await _cleanup_hashtag(h, test_data.user_id)

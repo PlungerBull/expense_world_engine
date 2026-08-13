@@ -27,8 +27,6 @@ Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high
 ## 🟡 Medium
 
 - **1.7** Rate hygiene — provider-rate plausibility validation (positivity is now enforced — `_upsert_rate` refuses `rate <= 0` and `sql/027` backstops it; what remains is sanity against the prior day's value), negative-lookup cache TTL, archived-account currencies missing from the fetch target list, `Decimal`/`ROUND_HALF_UP` instead of float. ⚠️ **Higher stakes since `sql/021`:** `exchange_rates` is now the only source of every home-currency figure, so a bad provider row misprices reports rather than one write. The float/rounding half is why `tests/test_home_currency_parity.py` compares rates and not cents — SQL keeps full `numeric` and rounds half-away-from-zero, while `_fetch_rate_from_db` truncates to binary float and Python rounds half-to-even.
-- **8.2** CREATE snapshots record `hashtag_ids: []` on the batch path. *(The transfer path's copy of this bug left with the feature — sql/030, 2026-08-11.)*
-
 ---
 
 ## ⚪ Low

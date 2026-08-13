@@ -10,9 +10,8 @@ The open items, in execution order: the bug burn-down, the People API, and the i
 
 The 2026-08-07 verification audit confirmed every previously closed bug is genuinely fixed (each pinned by a test) and these are what remain. **Detail lives only in [docs/open-bugs.md](docs/open-bugs.md)** — this entry is the schedule, not a second copy; delete a line here when its row leaves that file.
 
-1. **8.2** — batch CREATE snapshots log `hashtag_ids: []` *(the transfer path's copy left with the feature, 2026-08-11)*.
-2. **1.7 remainder** — dedicated FX-hygiene pass: rate plausibility vs prior day, negative-lookup cache TTL, archived-account currencies in the fetch list, `Decimal`/`ROUND_HALF_UP`.
-3. **Four ⚪ lows** — `restore_category` skips the reserved-name check (7.4-r); `?hashtag_id=` filter lacks `transaction_source = 1` (hashtag-filter — or fold into the inbox-hashtags feature below, whichever ships first); inbox titles stored verbatim, whitespace-only can promote (inbox-title, found 2026-08-08 — fix wants an owner call on 422-vs-NULL); `color or` collapses an explicit empty string to the default (account-color, found 2026-08-08 — needs a reject-vs-store decision).
+1. **1.7 remainder** — dedicated FX-hygiene pass: rate plausibility vs prior day, negative-lookup cache TTL, archived-account currencies in the fetch list, `Decimal`/`ROUND_HALF_UP`.
+2. **Four ⚪ lows** — `restore_category` skips the reserved-name check (7.4-r); `?hashtag_id=` filter lacks `transaction_source = 1` (hashtag-filter — or fold into the inbox-hashtags feature below, whichever ships first); inbox titles stored verbatim, whitespace-only can promote (inbox-title, found 2026-08-08 — fix wants an owner call on 422-vs-NULL); `color or` collapses an explicit empty string to the default (account-color, found 2026-08-08 — needs a reject-vs-store decision).
 
 **When it becomes blocking:** nothing here corrupts data today — that severity tier is empty — but the burn-down should still precede any new feature work.
 
