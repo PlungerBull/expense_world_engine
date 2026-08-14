@@ -1,0 +1,41 @@
+-- 032: rewrite stored exchange rates to the digits the provider published.
+--
+-- The tail half of bug fx-store-float. The code fix (2026-08-13) parses provider
+-- JSON with `parse_float=Decimal` and stops casting back, so every rate written
+-- from that day on is exactly what the feed served. It does nothing for rows
+-- already there: `_upsert_rate` is ON CONFLICT DO NOTHING, so the job cannot
+-- correct a date it has already written -- deliberately, since that property is
+-- what stops a bad afternoon rate overwriting a good morning one.
+--
+-- What was stored: `exchange_rates.rate` is `numeric`, so binding a Python float
+-- stores the float's true binary value spelled out in full.
+--
+--   3.37515314  ->  3.3751531400000001070793587132357060909271240234375
+--
+-- All 893 rows (2024-03-02 .. 2026-08-13) look like this. Nothing was mispriced:
+-- the error is ~1e-16 relative, and it was parity-neutral besides -- SQL and
+-- Python read the same stored row, so the two implementations agreed with each
+-- other on the wrong-ish number. This migration is about the column holding what
+-- was published, which is the premise every rounding argument rests on
+-- (bug 1.7-round is what surfaced this) and the premise `helpers/exchange_rate`'s
+-- 8dp `_RATE_QUANTUM` comment already assumed.
+--
+-- Why the recovery is exact, not a guess. `rate::float8` reproduces the float the
+-- job originally bound -- the stored numeric IS that float's exact value, so the
+-- cast is lossless in that direction. float8's text output is the SHORTEST
+-- decimal that round-trips back to the same float (Postgres >= 12 default), which
+-- for any value the provider actually published is the published string itself.
+-- So this is not `round(rate, 8)`: nothing assumes a decimal place count, and a
+-- provider value with 9 or 12 places would be recovered just as exactly.
+--
+-- Verified before running: for all 893 rows, (rate::float8::text::numeric)::float8
+-- = rate::float8 -- every rewrite round-trips, so no row's value moves by even one
+-- float ulp. The WHERE clause makes the migration re-runnable and a no-op on a
+-- clean table.
+--
+-- No activity_log rows: exchange_rates is provider data, not a user-mutable
+-- domain table, and the fetch job has never logged either.
+
+UPDATE exchange_rates
+SET rate = ((rate::float8)::text)::numeric
+WHERE rate::text <> ((rate::float8)::text)::numeric::text;

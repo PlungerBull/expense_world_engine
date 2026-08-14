@@ -7,6 +7,8 @@
 > `pg_constraint` + `pg_policies`) after the deletion program landed (`sql/020`–`sql/025`);
 > amended 2026-08-10 for the transfer removal (`sql/030` — three columns and two CHECKs dropped),
 > then 2026-08-13 for the colour-format CHECKs (`sql/031` — two CHECKs added, no column changes).
+> `sql/032` is data-only (rewrote 893 `exchange_rates.rate` values to the provider's published
+> digits, bug fx-store-float) and changes nothing described here.
 > **14 tables, 123 columns.**
 
 ---
