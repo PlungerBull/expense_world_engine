@@ -24,6 +24,7 @@ from app.routers import (
     health,
     inbox,
     pat,
+    people,
     reconciliations,
     reports,
     transactions,
@@ -86,6 +87,7 @@ app.include_router(exchange_rates.router, prefix="/v1")
 app.include_router(hashtags.router, prefix="/v1")
 app.include_router(inbox.router, prefix="/v1")
 app.include_router(pat.router, prefix="/v1")
+app.include_router(people.router, prefix="/v1")
 app.include_router(reconciliations.router, prefix="/v1")
 app.include_router(reports.router, prefix="/v1")
 app.include_router(transactions.router, prefix="/v1")

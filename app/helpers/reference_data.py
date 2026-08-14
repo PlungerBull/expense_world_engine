@@ -56,16 +56,37 @@ async def next_sort_order(
     conn: asyncpg.Connection,
     table: str,
     user_id: str,
+    *,
+    scope: Optional[tuple[str, object]] = None,
 ) -> int:
     """The append slot for a new row: MAX(sort_order) + 1 within the user's
     collection, 0 when it is empty (CLAUDE.md collection ordering).
 
     Deliberately spans soft-deleted rows — a deleted row keeps its slot and
     reclaims it on restore, so a new row must not land on it.
+
+    ``scope`` narrows "the collection" to a partition of the table, as
+    ``(column, value)``. It exists because ``expense_bank_accounts`` holds two
+    collections that render as separate sections — real accounts and people
+    (``is_person``) — and CLAUDE.md's ordering rule is per-scope: slots are
+    listed ASC within one section and never compared across sections. Both
+    account creates pass it, not just the person one; scoping only people
+    would leave real accounts counting person rows in their MAX. Categories
+    and hashtags are single-collection tables and pass nothing.
+
+    Keyword-only so the three positional call sites keep working untouched.
     """
+    conditions = ["user_id = $1"]
+    params: list = [user_id]
+    if scope is not None:
+        column, value = scope
+        params.append(value)
+        conditions.append(f"{column} = ${len(params)}")
+
     return await conn.fetchval(
-        f"SELECT COALESCE(MAX(sort_order) + 1, 0) FROM {table} WHERE user_id = $1",
-        user_id,
+        f"SELECT COALESCE(MAX(sort_order) + 1, 0) FROM {table} "
+        f"WHERE {' AND '.join(conditions)}",
+        *params,
     )
 
 

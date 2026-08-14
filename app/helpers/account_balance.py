@@ -192,7 +192,7 @@ async def fetch_home_balances(
     """Convert already-fetched balances to home currency, one rate per currency.
 
     ``main_currency`` and ``today`` are caller-supplied — the dashboard reads
-    settings and the clock ONCE and converts three account slices with them,
+    settings and the clock ONCE and converts every account slice with them,
     so re-deriving either here would triple the settings read and reopen the
     per-slice midnight drift its comment guards against. Get them from
     ``settings.get_user_report_settings`` (which 422s when settings are

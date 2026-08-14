@@ -288,15 +288,30 @@ Person accounts (`is_person = true`) represent people the user lends to or borro
 
 **Rationale:** Explicit creation keeps the user in control of their people list, avoids mystery rows, and prevents race conditions where two devices writing against the same new person create duplicate person accounts.
 
-### `POST /people` *(Phase 4 — planned, not yet implemented)*
+**`POST /people` is the only route in this section.** `is_person` is a creation-time-only fact — that is the entire reason it needs its own door. Everything after creation is account behaviour and uses the account routes, which accept person rows already: rename/recolor/reorder via `PUT /accounts/{id}`, plus `DELETE`, `/restore`, `/archive`, `/unarchive`, `GET /accounts/{id}`. There is no `GET /people`; person accounts are listed by `GET /accounts?include_people=true` and split out on `/dashboard`. A parallel `/people` namespace would be a second copy of routes that already work.
+
+### `POST /people`
 Creates a person account.
 
 **Required:** `id` (client-supplied UUID), `name`, `currency_code`
 **Optional:** `color` (see **Colour format**), `sort_order`
+**Forbidden:** `is_person` (it is implied — this endpoint sets it), and any unknown field. `422 VALIDATION_ERROR`.
 
-Response shape is identical to a bank account with `is_person = true`.
+Validation is the same as `POST /accounts` and shares its implementation: `currency_code` must exist in `global_currencies` (`422`), `name` non-empty after trim (`422`), `color` a 6-digit hex value if supplied (`422`), duplicate `id` (`409`).
 
-Until this endpoint ships, person accounts cannot be created through the API. The data path is ready (reads, balances, dashboard segregation) — only the creation endpoint is pending.
+**Name uniqueness is shared with real accounts, not separate.** The key is `(user, LOWER(name), currency_code)` across the whole `expense_bank_accounts` table, so a person named "Eliana" in PEN collides with a bank account named "Eliana" in PEN and returns `409`. One name means one thing per currency, whichever list it lives in.
+
+**`sort_order` is scoped to people.** An omitted `sort_order` appends within the person collection only (`MAX(sort_order) + 1` over `is_person = true` rows, `0` when there are none) — people render as their own section, and cross-scope slot values are never compared (CLAUDE.md, Collection ordering). An explicit value is honoured verbatim, including `0`. Real accounts number independently and are unaffected.
+
+**Response** shape is identical to a bank account, with `is_person = true`. A new person has no transactions, so `current_balance_cents` is `0`.
+
+**Activity log:** a single `CREATED` entry under `resource_type = "account"` — a person *is* an account, and the snapshot carries `is_person: true`.
+
+**Person accounts cannot carry an opening balance.** `POST /accounts/{id}/opening-balance` returns `422` for them: a person's balance is built from the rows you record, not seeded. See the opening-balance rule under `POST /accounts/{account_id}/opening-balance`.
+
+**Archiving applies to people.** An archived person leaves the People list and can no longer be written against — `active_account_row` refuses archived accounts on every write path, which is the point: it stops you recording against someone you are finished with. Unarchive to resume. See `/dashboard` for where archived people surface.
+
+**A settled person is not hidden.** When a debt clears, the person's balance is `0` and she stays in the list — `0` is a balance, not a missing value (CLAUDE.md), and it is the positive statement that the account is square. This is deliberately the opposite of the flow-report rule, where a category with no transactions in the month produces no row at all: reports group over what happened, balance surfaces enumerate what exists. The engine never filters a person out on the strength of a computed balance — "settled" and "never recorded" must not look alike, a coincidental net zero (lent 200, borrowed 200) is two live debts and not nothing, and a row hidden from the list would still have to appear in the account picker. Collapsing settled people behind a "3 settled" affordance is a **client** display choice; the engine returns every person with her balance and the client decides what to fold away.
 
 ---
 
@@ -682,14 +697,15 @@ Returns the current calendar month overview. Single endpoint, one call, everythi
     "net_home_cents": 480000,
     "unconverted_count": 0
   },
-  "archived_accounts": null
+  "archived_accounts": null,
+  "archived_people": null
 }
 ```
 
 **Field rules:**
 
 - `bank_accounts` includes only `is_person = false`, `is_archived = false`, `deleted_at IS NULL`. Sorted by `sort_order`.
-- `people` includes only `is_person = true`, `deleted_at IS NULL`. Same shape as `bank_accounts`, separated for client convenience. (Currently always `[]` — no endpoint can set `is_person`; see TODO.md.)
+- `people` includes only `is_person = true`, `is_archived = false`, `deleted_at IS NULL`. Same shape and same filters as `bank_accounts`, separated because they render as their own section. **A person with a cleared debt appears here with `current_balance_cents: 0`** — she is not filtered out for being settled (see §People).
 - `categories` includes every non-deleted category, even with nothing spent (so the client can render the full category list without a second call), **except the `@Opening` system row** (`system_key = 'opening_balance'`) — see the opening-balance rule below. Sorted by `sort_order`.
 - **Aggregates are home-currency ONLY** — `spent_home_cents`, never a native `spent_cents`. `GROUP BY category_id` has no currency partition, so a category holding $15 and S/25 has no native total: `4000` would be a number in no currency at all. The only correct cross-account figures are converted ones (`CLAUDE.md`, Home currency).
 - **Every aggregate is nullable and paired with `unconverted_count`** — the number of rows in the group whose date had no resolvable rate. A non-zero count makes the figure `null` rather than a partial total: `SUM` skips nulls, and the inflow/outflow `CASE` shape scores a null row as zero, so an unflagged aggregate would understate in silence.
@@ -700,7 +716,7 @@ Returns the current calendar month overview. Single endpoint, one call, everythi
 - "Current month" means `[first_day_of_month, last_day_of_month]` in the user's `display_timezone`.
 - `?debit_as_negative` is **not** a parameter here (removed 2026-08-08) — dashboard aggregates are already signed by construction (per-category `spent_home_cents` is positive for income and negative for expense; totals return split positive `inflow_home_cents`/`outflow_home_cents` with `net_home_cents` as their difference). Same on `/reports/monthly`.
 
-**`?include_archived=true`** — when set, the response's `archived_accounts` field is populated (same row shape as `bank_accounts`; `is_person = true` excluded); when false (the default) it is `null` per the null-over-omission rule. `current_balance_cents` is the lifetime balance — no further transactions can land on archived rows in clients that respect the picker.
+**`?include_archived=true`** — when set, the response's `archived_accounts` **and `archived_people`** fields are populated (same row shape as `bank_accounts`; `archived_accounts` is `is_person = false`, `archived_people` is `is_person = true`); when false (the default) both are `null` per the null-over-omission rule. They stay two panels rather than one because people and bank accounts are separate lists on every other surface — merging them only here would make archived Eliana sit among your archived cards. `current_balance_cents` is the lifetime balance — no further transactions can land on archived rows, and that is enforced on the write path, not merely respected by clients (`active_account_row`).
 
 *(The former `archived_categories` / `archived_hashtags` lifetime panels are gone: archiving a category was never a distinct feature — soft delete already hides a row from pickers while leaving its history intact — and these panels were the `is_archived` columns' last readers. An archived **account** is different: it still holds real money, which is why that one panel survives. `sql/024`.)*
 

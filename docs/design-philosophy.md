@@ -60,6 +60,12 @@ People are bank accounts with `is_person = true`. Money lent or borrowed is reco
 - **Settlement:** the mirror pair, returning the person's balance to 0.
 - **Someone else pays for you:** `-30 Lunch @Food $Eliana` → single transaction on Eliana's account. You owe her 30.
 
+**A settled person stays on screen showing 0.** That zero is a statement — *this account is square* — and it is the only thing distinguishing a paid-back loan from one you forgot to record. Hiding people at zero was considered and rejected (2026-08-13): it would make those two cases identical, flicker a person in and out of the list as rows land, misread a coincidental net zero (lent 200, borrowed 200 — two live debts) as nothing to show, and leave her visible in the account picker but absent from the list she belongs to.
+
+The clutter that motivates it is real, and it belongs to the client: the engine returns every person with her balance, so the app can collapse the settled ones behind a single expandable "3 settled" row — out of the way, still countable, one tap from view, and reversible without touching the engine.
+
+**Archiving is the deliberate version of the same thing.** Someone you are genuinely finished with — a flatmate from years back — archives out of the People section into its own archived-people list, and the engine then refuses to record against her. That is a decision you make and can undo, not a side effect of a number reaching zero.
+
 *(The former unified `/` syntax — one entry auto-creating the paired row, for both debt and inter-account transfers — was removed with the transfer feature, 2026-08-10. The pairing convenience can return someday as pure client-side sugar emitting two ordinary creates; the engine no longer models it.)*
 
 Cross-user sharing: link a person account to a real user. Shared expenses are visible to both parties sign-flipped. One transaction record, two readers, no duplication. Both confirm before lockable fields are sealed.

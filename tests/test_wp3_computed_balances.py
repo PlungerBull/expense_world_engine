@@ -444,9 +444,10 @@ async def test_the_query_count_does_not_grow_with_the_number_of_accounts(
                 f"GET /accounts query count grew with account count: "
                 f"{accounts_with_two} → {accounts_with_five}. Statements: {statements}"
             )
-            # The dashboard renders three account panels, each of which reads its
-            # own slice's balances in one query. Three panels is a constant; the
-            # number of accounts in them is not.
+            # The dashboard renders four account panels (bank accounts, people,
+            # and — under ?include_archived — the archived half of each), every
+            # one of which reads its own slice's balances in one query. The panel
+            # count is a constant; the number of accounts in them is not.
             assert dashboard_with_five == dashboard_with_two, (
                 f"GET /dashboard query count grew with account count: "
                 f"{dashboard_with_two} → {dashboard_with_five}. Statements: {statements}"

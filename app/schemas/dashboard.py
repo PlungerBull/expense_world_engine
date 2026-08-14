@@ -99,12 +99,27 @@ class DashboardResponse(BaseModel):
     # from pickers while leaving its past transactions intact — and these panels
     # were the last readers of `is_archived` on those two tables (WP2 of the
     # deletion program, then sql/024). An archived ACCOUNT is different: it still holds real money,
-    # which is why this one panel survives.
+    # which is why these two panels survive.
+    #
+    # Two panels, not one merged archive: people and bank accounts are separate
+    # collections on every other surface, so folding them together only here
+    # would file an archived person among archived cards.
     archived_accounts: Optional[list[DashboardAccount]] = Field(
         None,
         description=(
-            "Populated only when `?include_archived=true`; null otherwise. "
-            "Same shape as `bank_accounts` — `current_balance_cents` is the "
-            "lifetime balance (no new transactions can land on archived rows)."
+            "Archived real accounts (`is_person = false`). Populated only when "
+            "`?include_archived=true`; null otherwise. Same shape as "
+            "`bank_accounts` — `current_balance_cents` is the lifetime balance "
+            "(no new transactions can land on archived rows)."
+        ),
+    )
+    archived_people: Optional[list[DashboardAccount]] = Field(
+        None,
+        description=(
+            "Archived person accounts (`is_person = true`). Populated only when "
+            "`?include_archived=true`; null otherwise. Archiving a person is how "
+            "you retire someone you are finished with — the engine then refuses "
+            "to record against them — as distinct from a settled debt, which "
+            "keeps the person in `people` with a balance of 0."
         ),
     )

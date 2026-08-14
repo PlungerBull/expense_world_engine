@@ -8,9 +8,13 @@ from app.schemas import StrictModel, audit_fields, owned_fields
 
 
 class AccountCreateRequest(StrictModel):
-    # Unknown fields (including is_person) 422 via StrictModel — person
-    # accounts are created via the dedicated People API, never through this
-    # endpoint.
+    # Serves BOTH `POST /accounts` and `POST /people` — the request bodies are
+    # identical, and `is_person` is not among them either way. On /accounts it
+    # is forbidden (people are never created as a side effect of an account
+    # write); on /people it is implied (that endpoint's whole job is to set it).
+    # Either way `StrictModel` 422s it as an unknown field, along with anything
+    # else unrecognised. One model rather than two byte-identical ones: a
+    # duplicated twin is what `infer_transfer_direction` cost us.
     id: UUID
     name: str
     currency_code: str

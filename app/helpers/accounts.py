@@ -45,8 +45,19 @@ async def create_account(
     currency_code: str,
     color: Optional[str],
     sort_order: Optional[int],
+    *,
+    is_person: bool = False,
 ) -> dict:
     """Validate currency and uniqueness, insert, and log the creation.
+
+    Serves both ``POST /accounts`` (``is_person=False``) and ``POST /people``
+    (``is_person=True``). The flag is the *only* difference between them —
+    every rule below applies identically to a person, because a person IS an
+    account: same currency validation, same name uniqueness, same colour rule,
+    same ``CREATED`` activity entry under ``resource_type = "account"``.
+    ``is_person`` is settable only here, at creation, and never through
+    ``PUT`` — which is the whole reason people need their own route rather
+    than a flag on the account one.
 
     Raises:
         validation_error: ``currency_code`` is not in ``global_currencies``,
@@ -55,7 +66,10 @@ async def create_account(
             ``DEFAULT_ACCOUNT_COLOR``.
         conflict: a non-deleted account with the same ``(name, currency_code)``
             already exists for this user (case-insensitive since sql/028), OR
-            a resource with the same id already exists.
+            a resource with the same id already exists. The uniqueness scope
+            deliberately spans people and real accounts alike — one "Eliana"
+            per currency, whichever section she renders in (owner decision
+            2026-08-13).
     """
     name = normalize_name(name)
     validate_color(color)
@@ -77,14 +91,16 @@ async def create_account(
         row = await conn.fetchrow(
             """
             INSERT INTO expense_bank_accounts
-                (id, user_id, name, currency_code, color, sort_order, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, now(), now())
+                (id, user_id, name, currency_code, is_person, color, sort_order,
+                 created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now())
             RETURNING *
             """,
             account_id,
             user_id,
             name,
             currency_code,
+            is_person,
             # `is not None`, not `or` — the same collapse that `or 0` caused for
             # sort_order below, which was fixed while this one survived: an
             # explicitly-sent color quietly became the default instead of being
@@ -94,9 +110,17 @@ async def create_account(
             color if color is not None else DEFAULT_ACCOUNT_COLOR,
             # Omitted sort_order appends; an explicit value (including 0) is
             # respected verbatim (the old `or 0` collapsed explicit zeros too).
+            # The append is scoped to this row's own section: people and real
+            # accounts are two collections in one table, listed separately, and
+            # a slot only ever means something inside its own section. Passed on
+            # BOTH branches — scoping people alone would leave a new real account
+            # counting person rows in its MAX.
             sort_order
             if sort_order is not None
-            else await next_sort_order(conn, "expense_bank_accounts", user_id),
+            else await next_sort_order(
+                conn, "expense_bank_accounts", user_id,
+                scope=("is_person", is_person),
+            ),
         )
     except asyncpg.UniqueViolationError:
         raise conflict(f"An account with id '{account_id}' already exists.")

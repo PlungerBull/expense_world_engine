@@ -562,7 +562,12 @@ Cross-user shared expenses. Deferred to the people and sharing phase. When imple
 
 People are bank accounts with `is_person = true`. There is no separate people table. If someone shares expenses in multiple currencies, they have multiple accounts — one per currency — both shown in the People sidebar section.
 
-> ⚠️ **Structurally complete, functionally unreachable.** The engine reads `is_person` (accounts list filter, dashboard split, the opening-balance guard) but no endpoint can set it, so no row can currently be a person. Decided 2026-08-10: the feature stays and `POST /people` ships as its own work item — see TODO.md. The model below is the design the machinery implements.
+`is_person` is set **only** at creation, by `POST /people`, and is not writable through any `PUT` — which is the whole reason people have their own create route (`engine-spec.md` §People). It was structurally present but functionally unreachable from `sql/003` until 2026-08-14, when that endpoint shipped.
+
+Two schema-visible consequences:
+
+- **`sort_order` is scoped by `is_person`.** People and real accounts are two collections in one table, rendered as separate sections, so each numbers from 0 independently. The column is unchanged — the scoping lives in the append query (`helpers/reference_data.next_sort_order`, which takes a `scope` predicate), and it is passed on **both** branches: scoping only people would leave a new real account counting person rows in its `MAX`. Cross-section slot values are meaningless and never compared.
+- **Name uniqueness is deliberately NOT scoped by `is_person`.** The `sql/028` partial unique index on `(user_id, LOWER(name), currency_code)` covers people and real accounts together, so one "Eliana" per currency whichever list she is in (owner decision 2026-08-13). Splitting those scopes later means reworking that index — which is why it was settled before the first person existed.
 
 **Debt tracking model:** A person account's balance represents the financial position with that person. Positive balance = they owe you money. Negative balance = you owe them money. All rows are ordinary transactions with ordinary user categories — the `@Debt` auto-assignment left with the transfer feature (`sql/030`, 2026-08-10).
 

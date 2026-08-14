@@ -24,7 +24,7 @@ async def _load_accounts(
     is_person: bool,
     archived: bool = False,
 ) -> list[dict]:
-    """Fetch one of three dashboard account slices.
+    """Fetch one of four dashboard account slices.
 
     Balances are read for exactly this slice's accounts, in one query, after the
     rows are known. Two queries per panel, and the balance one is driven by
@@ -35,37 +35,42 @@ async def _load_accounts(
     only combined figure on this endpoint is ``current_balance_home_cents``,
     which converts each account to the home currency first.
 
-    Slice selection:
-      * ``is_person=True``                  → people (no archive filter; the
-                                              People API has no archive concept yet).
-      * ``is_person=False, archived=False`` → active bank accounts (the default
-                                              `bank_accounts` panel).
-      * ``is_person=False, archived=True``  → archived bank accounts (the
-                                              `archived_accounts` panel surfaced
-                                              by `?include_archived=true`).
-    """
-    if is_person:
-        query = """
-            SELECT id, name, currency_code
-            FROM expense_bank_accounts
-            WHERE user_id = $1
-              AND deleted_at IS NULL
-              AND is_person = true
-            ORDER BY sort_order ASC, name ASC
-        """
-    else:
-        archive_clause = "is_archived = true" if archived else "is_archived = false"
-        query = f"""
-            SELECT id, name, currency_code
-            FROM expense_bank_accounts
-            WHERE user_id = $1
-              AND deleted_at IS NULL
-              AND is_person = false
-              AND {archive_clause}
-            ORDER BY sort_order ASC, name ASC
-        """
+    The two flags are a plain 2x2 — ``is_person`` picks the collection,
+    ``archived`` picks the state, and every combination is a real panel:
 
-    rows = await conn.fetch(query, user_id)
+      * ``is_person=False, archived=False`` → active bank accounts (`bank_accounts`)
+      * ``is_person=True,  archived=False`` → active people (`people`)
+      * ``is_person=False, archived=True``  → archived bank accounts
+      * ``is_person=True,  archived=True``  → archived people (`archived_people`)
+
+    The last two are surfaced only by ``?include_archived=true``. They stay two
+    panels rather than one merged list because people and bank accounts are
+    separate collections on every other surface; merging them only here would
+    file an archived person among archived cards.
+
+    ⚠️ The person slice ignored ``archived`` entirely until 2026-08-14, which
+    left a real split: ``GET /accounts?include_people=true`` filtered archived
+    rows out while this panel did not, so an archived person would have
+    vanished from one surface and persisted on the other. Never observed —
+    no person could exist before ``POST /people`` shipped in the same change.
+
+    Note what is NOT filtered here: a zero balance. A settled person reports
+    ``0`` and stays in the list — ``0`` is a balance, not a missing value, and
+    it is the only thing distinguishing a cleared debt from an unrecorded one.
+    Collapsing settled rows is a client display choice (owner decision,
+    2026-08-13).
+    """
+    query = """
+        SELECT id, name, currency_code
+        FROM expense_bank_accounts
+        WHERE user_id = $1
+          AND deleted_at IS NULL
+          AND is_person = $2
+          AND is_archived = $3
+        ORDER BY sort_order ASC, name ASC
+    """
+
+    rows = await conn.fetch(query, user_id, is_person, archived)
     balances = await fetch_balances(conn, user_id, [r["id"] for r in rows])
     # main_currency/today stay caller-supplied: get_dashboard reads settings
     # and the clock once for all three slices — no per-slice midnight drift,
@@ -104,8 +109,9 @@ async def get_dashboard(
     include_archived: bool = Query(
         False,
         description=(
-            "When true, the response includes the `archived_accounts` panel. "
-            "When false (default), that field is returned as null."
+            "When true, the response includes the `archived_accounts` and "
+            "`archived_people` panels. When false (default), both fields are "
+            "returned as null."
         ),
     ),
 ):
@@ -115,7 +121,7 @@ async def get_dashboard(
     async with db.pool.acquire() as conn:
         settings = await get_user_report_settings(conn, auth_user.id)
         year, month, start_utc, end_utc = compute_month_bounds(settings["display_timezone"])
-        # One clock read for all three account slices — no per-slice drift.
+        # One clock read for every account slice — no per-slice drift.
         today = rate_lookup_date(settings["display_timezone"])
 
         bank_accounts = await _load_accounts(
@@ -128,11 +134,18 @@ async def get_dashboard(
             conn, auth_user.id, start_utc, end_utc, settings["display_timezone"]
         )
 
+        # Both archived panels are gated on the one flag and stay `None`
+        # otherwise — null-over-omission, so the keys are always on the wire.
         archived_accounts: Optional[list[dict]] = None
+        archived_people: Optional[list[dict]] = None
         if include_archived:
             archived_accounts = await _load_accounts(
                 conn, auth_user.id, settings["main_currency"], today,
                 is_person=False, archived=True,
+            )
+            archived_people = await _load_accounts(
+                conn, auth_user.id, settings["main_currency"], today,
+                is_person=True, archived=True,
             )
 
     return DashboardResponse(
@@ -142,4 +155,5 @@ async def get_dashboard(
         categories=flow["categories"],
         totals=flow["totals"],
         archived_accounts=archived_accounts,
+        archived_people=archived_people,
     ).model_dump(mode="json")

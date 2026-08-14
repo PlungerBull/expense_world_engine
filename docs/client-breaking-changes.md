@@ -3,11 +3,136 @@
 Engine changes that require work in a client repo (`expense_world_CLI`, and any
 future iOS / web client). Newest first.
 
-Only entries that **break a client** belong here. Additive changes — a new
-endpoint, a new nullable response field — do not. If a client can ignore the
-change and keep working, it is not a breaking change.
+Two kinds of entry belong here, and each one says which it is:
 
-Each entry states what changed, what breaks, and what the client must do.
+- ⚠️ **BREAKING** — the client stops working until it changes. A removed field,
+  a new rejection, a changed shape.
+- ➕ **ADDITIVE** — nothing breaks, but new engine capability sits unusable until
+  the client builds for it. A new endpoint, a new nullable response field.
+
+The distinction matters because the two demand different urgency: a BREAKING
+entry is a bug in the client until it is addressed, an ADDITIVE one is a feature
+the client does not have yet. What they share is that the engine cannot deliver
+either alone — which is why both are written down here rather than only in the
+spec.
+
+*(The file was breaking-only until 2026-08-14 — every entry below the People one
+is unlabelled and BREAKING by construction. The People API forced the split: a
+new endpoint that no client can call is invisible to the owner, and "not
+breaking" is a bad reason to leave it unannounced.)*
+
+Purely internal changes a client can never observe do not belong here at all.
+
+Each entry states what changed, what breaks (if anything), and what the client
+must do.
+
+---
+
+## 2026-08-14 ➕ ADDITIVE — the People API ships (`POST /people`)
+
+**Engine change** (`app/routers/people.py` new; `helpers/accounts.py`,
+`helpers/reference_data.py`, `routers/dashboard.py`, `schemas/dashboard.py`,
+`schemas/accounts.py`, `main.py`; no SQL migration; owner decisions 2026-08-10
+and 2026-08-13).
+
+**Person accounts are creatable for the first time.** `is_person` has existed
+since `sql/003` and every read surface has been shipped and tested for months —
+`?include_people`, the dashboard `people` panel, the opening-balance refusal —
+but no endpoint could ever set the flag, so the People panel was permanently
+`[]`. It isn't any more.
+
+A person is a bank account with `is_person = true`. Money lent or borrowed is
+recorded as ordinary transactions against it, and the account's computed balance
+*is* the debt: positive = they owe you, negative = you owe them.
+
+### Nothing breaks
+
+No field was removed, renamed, or retyped; no request is newly rejected. The one
+new response field (`archived_people`) is nullable and additive, and the CLI
+reads dashboard panels with `body.get(...)`, so it ignores the field safely today.
+
+### What's new
+
+- **`POST /people`** — creates a person account. Required `id` (client UUID),
+  `name`, `currency_code`; optional `color`, `sort_order`. Same validation, same
+  `409` name rules, same idempotency, same `AccountResponse` shape as
+  `POST /accounts`, with `is_person: true` and `current_balance_cents: 0`.
+  `is_person` in the body is a `422` here too — the endpoint implies it.
+- **`GET /dashboard` gains `archived_people`** — same row shape as
+  `bank_accounts`, populated only under `?include_archived=true`, `null`
+  otherwise. It is a **separate panel from `archived_accounts`**, which stays
+  `is_person = false`; the two never mix.
+- **`GET /dashboard`'s `people` panel now filters `is_archived = false`.**
+  Previously it had no archive filter while `GET /accounts?include_people=true`
+  did. Unobservable before now (no person could exist), but the two surfaces
+  agree from here on.
+- **`sort_order` is scoped to `is_person`.** People number from 0 within their
+  own section; real accounts number independently. Cross-section slot values are
+  meaningless and must never be compared.
+
+### What did NOT change
+
+- **There is no `/people` namespace, and there never will be.** `POST /people`
+  is the only route, because creation is the only moment `is_person` is
+  settable. Rename, recolor, reorder, delete, restore, archive, unarchive and
+  fetch all use `/accounts/{id}`, which has always accepted person rows.
+  Listing is `GET /accounts?include_people=true` plus the dashboard split.
+  Do not wait for `GET /people` / `PUT /people/{id}` — they are not coming.
+- **Name uniqueness is shared, not scoped.** `(user, LOWER(name), currency)`
+  spans people and real accounts together, so a person named "Eliana" in PEN
+  collides with an account named "Eliana" in PEN and returns `409`.
+- **`POST /accounts` still rejects `is_person`** with `422` — people are never
+  created as a side effect of another write. Now pinned by a test.
+- **Person accounts still cannot carry an opening balance** (`422`) — a debt is
+  built from recorded rows, not seeded.
+- Sign convention, computed balances, read-time conversion, activity logging,
+  idempotency — all untouched. A person's rows are ordinary transactions with
+  ordinary user categories; there is no `@Debt` category (it left with the
+  transfer feature, `sql/030`).
+
+### ⚠️ One design rule the client must respect
+
+**A settled person is not hidden.** When a debt clears, the person stays in the
+`people` panel with `current_balance_cents: 0`. The engine will never filter a
+person out on the strength of a computed balance — this was proposed and
+rejected (owner, 2026-08-13), because it makes "she paid me back" and "I never
+recorded the loan" identical on screen, flickers people in and out of the list as
+rows land, and misreads a coincidental net zero (lent 200, borrowed 200 — two
+live debts) as nothing to show.
+
+Decluttering a long People list is a **client display choice**, and the
+recommended shape is to collapse the settled ones rather than drop them:
+
+```
+People
+  Eliana          S/ 200
+  Marco          −S/ 450
+  ▸ 3 settled
+```
+
+Archiving is the engine-side answer for someone you are finished with: it moves
+them to `archived_people` and makes the engine refuse to record against them.
+
+### What the CLI must do
+
+1. **Add a create-person command.** `expense/tui/screens/create_forms.py:7`
+   currently notes "New account is bank-only — the engine forbids `is_person`";
+   that is still true of `POST /accounts`, but `POST /people` is now the door.
+2. **Render `archived_people`** next to the existing `archived_accounts` handling
+   in `expense/commands/dashboard_cmd.py:134` and the archived view in
+   `expense/tui/screens/accounts.py`.
+3. **Collapse settled people** in the People section (`home.py:101`,
+   `outstanding.py:168`) rather than hiding zero balances outright.
+4. **Do not add a client-side people list/edit path against `/people`** — use the
+   account routes, which already work on person rows.
+
+### Engine references
+
+- `tests/test_people_api.py` (the new pins — all four shape decisions plus the
+  settled-visibility rule)
+- `docs/engine-spec.md` — §People / Person Accounts, §`GET /dashboard`
+- `docs/design-philosophy.md` — §People (debt tracking)
+- `docs/schema-reference.md` — §People Model
 
 ---
 

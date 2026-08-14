@@ -92,24 +92,33 @@ async def test_account_unarchive_404_on_missing(client):
 
 @pytest.mark.asyncio
 async def test_dashboard_default_omits_archived_accounts(client):
-    """Without the flag, `archived_accounts` is present and null.
+    """Without the flag, both archived panels are present and null.
 
-    There is exactly one archived panel. `archived_categories` and
-    `archived_hashtags` were deleted with the read-time currency work
-    (WP2, sql/021 era), and sql/024 (WP5) then dropped `is_archived` from
-    those two tables entirely.
+    There are exactly two archived panels, and both are account-shaped:
+    `archived_accounts` (real accounts) and `archived_people`. Categories and
+    hashtags have none — `archived_categories`/`archived_hashtags` were deleted
+    with the read-time currency work (WP2, sql/021 era), and sql/024 (WP5) then
+    dropped `is_archived` from those two tables entirely. The asymmetry is the
+    point: an archived account still holds real money, a category holds only
+    history.
     """
     r = await client.get("/v1/dashboard")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["archived_accounts"] is None
+    assert body["archived_people"] is None
     assert "archived_categories" not in body
     assert "archived_hashtags" not in body
 
 
 @pytest.mark.asyncio
 async def test_dashboard_include_archived_returns_accounts_only(client, test_data):
-    """The flag turns on `archived_accounts`, and nothing else."""
+    """The flag turns on the two account archives, and nothing else.
+
+    `archived_accounts` stays `is_person = false` — a real account never leaks
+    into the people archive or vice versa. The person half is covered in
+    `tests/test_people_api.py`.
+    """
     account_id = str(uuid.uuid4())
     create_r = await client.post(
         "/v1/accounts",
@@ -134,6 +143,8 @@ async def test_dashboard_include_archived_returns_accounts_only(client, test_dat
         assert body["archived_accounts"] is not None
         assert isinstance(body["archived_accounts"], list)
         assert account_id in {a["id"] for a in body["archived_accounts"]}
+        assert body["archived_people"] is not None
+        assert account_id not in {p["id"] for p in body["archived_people"]}
         assert "archived_categories" not in body
         assert "archived_hashtags" not in body
     finally:
