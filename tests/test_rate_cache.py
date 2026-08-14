@@ -23,6 +23,7 @@ code review is adequate coverage.
 Run: .venv/bin/pytest tests/test_rate_cache.py -v
 """
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
@@ -145,7 +146,7 @@ async def test_a_missing_rate_expires_sooner_than_a_real_one(client, test_data):
 
 @pytest.mark.asyncio
 async def test_same_currency_short_circuit_is_also_cached(client, test_data):
-    """from == to always returns (1.0, as_of) — this path must not skip caching.
+    """from == to always returns (Decimal(1), as_of) — must not skip caching.
 
     The ``_fetch_rate_from_db`` same-currency branch is a fast path, but
     it still goes through the cache wrapper. A regression that moves
@@ -161,5 +162,8 @@ async def test_same_currency_short_circuit_is_also_cached(client, test_data):
             conn, from_currency="EUR", to_currency="EUR", as_of=as_of,
         )
 
-    assert result == (1.0, as_of)
+    # Decimal, not 1.0: `Decimal(1) == 1.0` is True, so a float literal here
+    # would keep passing if rates silently regressed to float (bug 1.7-round).
+    assert result == (Decimal(1), as_of)
+    assert isinstance(result[0], Decimal), "rates must stay Decimal end to end"
     assert ("EUR", "EUR", as_of) in rate_module._RATE_CACHE

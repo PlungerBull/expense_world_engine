@@ -24,6 +24,7 @@ the cache grows beyond ~10K entries in practice, an LRU cap should
 be considered.
 """
 from datetime import date as date_type, datetime
+from decimal import Decimal
 import time
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -46,8 +47,32 @@ _RATE_CACHE_TTL_SECONDS = 3600  # 1 hour
 # notices.
 _NEGATIVE_RATE_CACHE_TTL_SECONDS = 60
 
-_RateResult = Optional[tuple[float, date_type]]
+# Rates are Decimal, not float. `exchange_rates.rate` is `numeric` and asyncpg
+# hands it back as Decimal already — this module used to call float() on it,
+# truncating to binary and putting Python's conversions permanently one cent
+# away from the SQL ones on half-cent values (bug 1.7-round). Keeping the
+# Decimal is the absence of a conversion, not the addition of one.
+#
+# What this does NOT claim: that the stored value is the provider's clean
+# decimal. `jobs/fetch_exchange_rates` parses provider JSON into Python floats
+# and binds those into the numeric column, so a stored rate reads back as
+# 3.3751531400000001070793587132357060909271240234375 rather than 3.37515314.
+# That noise is ~1e-16 relative — far below a cent on any balance — and it is
+# identical for both implementations, since both read the same stored row, so
+# parity is unaffected. It is a separate (open) defect on the write side, not
+# something this module can fix by reading more carefully.
+#
+# The second element stays the *resolved* rate_date, which may be earlier than
+# the requested date — carry-forward. See _fetch_rate_from_db.
+_RateResult = Optional[tuple[Decimal, date_type]]
 _RATE_CACHE: dict[tuple[str, str, date_type], tuple[_RateResult, float]] = {}
+
+# Rate quotients are quantized to this many places. Only the USD-target branch
+# needs it: `Decimal(1) / rate` is otherwise carried to the context's 28
+# significant digits, which is noise dressed as precision. Stored rates are
+# 8dp (the provider's), so matching that keeps an inverted rate the same shape
+# as a looked-up one.
+_RATE_QUANTUM = Decimal("0.00000001")
 
 
 def clear_rate_cache() -> None:
@@ -87,7 +112,7 @@ async def _fetch_rate_from_db(
       (base_currency='USD', target_currency=<X>, rate = units of X per 1 USD).
 
     Direction math:
-      - from == to:               → (1.0, as_of)
+      - from == to:               → (Decimal(1), as_of)
       - from == 'USD':            → look up (USD, to), use rate as-is
       - to   == 'USD':            → look up (USD, from), invert (1 / rate)
       - cross (neither is USD):   → unsupported under the Phase 1 PEN/USD-only
@@ -96,7 +121,7 @@ async def _fetch_rate_from_db(
     Returns None if any required rate row is missing. Callers decide the fallback.
     """
     if from_currency == to_currency:
-        return (1.0, as_of)
+        return (Decimal(1), as_of)
 
     if from_currency == BASE_CURRENCY:
         row = await conn.fetchrow(
@@ -112,7 +137,7 @@ async def _fetch_rate_from_db(
         )
         if row is None:
             return None
-        return (float(row["rate"]), row["rate_date"])
+        return (row["rate"], row["rate_date"])
 
     if to_currency == BASE_CURRENCY:
         row = await conn.fetchrow(
@@ -126,9 +151,12 @@ async def _fetch_rate_from_db(
             from_currency,
             as_of,
         )
-        if row is None or float(row["rate"]) == 0.0:
+        if row is None or row["rate"] == 0:
             return None
-        return (1.0 / float(row["rate"]), row["rate_date"])
+        return (
+            (Decimal(1) / row["rate"]).quantize(_RATE_QUANTUM),
+            row["rate_date"],
+        )
 
     # Cross-rate (neither side USD) is unsupported. Phase 1 only accepts PEN
     # and USD as currencies (sql/015 CHECK + the global_currencies FKs), so
@@ -180,7 +208,7 @@ async def batch_get_rates(
     from_currencies: set[str],
     to_currency: str,
     as_of: date_type,
-) -> dict[str, float]:
+) -> dict[str, Decimal]:
     """Resolve exchange rates for multiple source currencies to one target.
 
     Returns a ``{from_currency: rate}`` mapping. Currencies with no available
@@ -198,7 +226,7 @@ async def batch_get_rates(
     cross-rate is intentionally unsupported under the PEN/USD-only policy).
     A true single-query version is possible but requires rewriting the SQL.
     """
-    result: dict[str, float] = {}
+    result: dict[str, Decimal] = {}
     for currency in set(from_currencies):
         lookup = await get_rate(conn, currency, to_currency, as_of)
         if lookup is not None:

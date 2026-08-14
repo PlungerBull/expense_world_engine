@@ -23,11 +23,23 @@ Seeding rules this file obeys, because global rows are shared:
   * Every seeded day gets a *distinct* rate, so "resolved this rate" proves
     "resolved this row".
 
-Rates are compared, not converted cents: ``_fetch_rate_from_db`` truncates the
-stored ``numeric`` to a binary float and Python rounds half-to-even, while the SQL
-keeps full precision and rounds half-away-from-zero, so the two can legitimately
-differ by one cent on an amount. Audit WP1.7 tracks the fix; do not "strengthen"
-these into a cents comparison.
+Rates AND converted cents are both compared, exactly. That is new as of
+2026-08-13 (bug 1.7-round): this file used to compare rates only, and its
+docstring told you not to "strengthen" it, because ``_fetch_rate_from_db``
+truncated the stored ``numeric`` to a binary float and Python rounded
+half-to-even while SQL kept full precision and rounded half-away-from-zero — so
+the two could legitimately differ by a cent. Both sides are ``Decimal`` with
+``ROUND_HALF_UP`` now, so equality is exact and ``pytest.approx`` is gone with
+the float.
+
+⚠️ **The ordinary parity rows cannot catch a rounding regression.** Every seeded
+rate below has 2 decimals and ``AMOUNT_CENTS`` is 2500, so every product is a
+whole number of cents — ``2500 × 3.11 = 7775.0``, no fraction, no tie, ever. They
+would pass byte-identically under the old float ``round()``. The rounding rule is
+pinned by ``test_a_half_cent_lands_the_same_way_in_both`` alone, which seeds a
+rate chosen to produce an exact ``.5``; if that test is ever deleted or its
+fixture "tidied" to a rounder rate, this file silently stops testing the thing it
+was strengthened for.
 
 Run: .venv/bin/pytest tests/test_home_currency_parity.py -v
 """
@@ -38,6 +50,7 @@ import uuid
 import pytest
 
 from app import db
+from app.helpers.account_balance import _to_home_cents
 from app.helpers.exchange_rate import clear_rate_cache, get_rate
 from app.constants import TransactionType
 from app.helpers.home_currency import (
@@ -55,6 +68,11 @@ from app.helpers.home_currency import (
 # omitted so the carry-forward path has something to carry.
 SEEDED_RATES = [
     ("2010-06-01", "3.01"),
+    # The tie rate (TIE_* below). Placed EARLY on purpose: appended it would
+    # become the newest row and silently change what "carry-forward past the last
+    # row" resolves to — these days are load-bearing for each other. 06-02 sits
+    # between 06-01 and 06-11, a stretch no other parity case reaches.
+    ("2010-06-02", "3.3373"),
     ("2010-06-11", "3.11"),  # Friday
     ("2010-06-14", "3.14"),  # Monday
     ("2010-06-15", "3.15"),
@@ -67,6 +85,15 @@ SEEDED_DATES = [date.fromisoformat(d) for d, _ in SEEDED_RATES]
 SEEDED_ROWS = [(date.fromisoformat(d), Decimal(r)) for d, r in SEEDED_RATES]
 
 AMOUNT_CENTS = 2500
+
+# The half-cent tie. 5000 × 3.3373 = 16686.5 exactly, which is the whole point:
+# Postgres round(numeric) is half-away-from-zero → 16687, while Python's builtin
+# round() is half-to-even → 16686, and stays 16686 even when handed a Decimal.
+# That one cent is bug 1.7-round, and these three constants are the only thing in
+# this file that can observe it. Do not "simplify" the rate to 2dp.
+TIE_DATE = "2010-06-02"
+TIE_AMOUNT_CENTS = 5000
+TIE_EXPECTED_HOME_CENTS = 16687
 
 # The scaffold every caller of these fragments must provide. The accounts join is
 # a LEFT JOIN on purpose — see the module docstring in app/helpers/home_currency.
@@ -166,7 +193,8 @@ async def fx(test_data, db_pool):
 
 async def _seed_txn(conn, fx: Fixtures, user_id: str, category_id: str,
                     account_id: str, when: datetime,
-                    txn_type: int = int(TransactionType.OUTFLOW)) -> str:
+                    txn_type: int = int(TransactionType.OUTFLOW),
+                    amount_cents: int = AMOUNT_CENTS) -> str:
     """Insert one ledger row. It carries a native amount and nothing else.
 
     The row used to be seeded with ``amount_home_cents`` explicitly NULL, so that
@@ -182,7 +210,7 @@ async def _seed_txn(conn, fx: Fixtures, user_id: str, category_id: str,
              cleared, created_at, updated_at)
            VALUES ($1, $2, 'parity', $3, $4,
              $5, $6, $7, false, now(), now())""",
-        txn_id, user_id, AMOUNT_CENTS, txn_type,
+        txn_id, user_id, amount_cents, txn_type,
         when, account_id, category_id,
     )
     fx.txn_ids.append(txn_id)
@@ -236,17 +264,65 @@ async def test_sql_and_get_rate_resolve_the_same_row(
         f"{label}: SQL resolved {row['rate']!r} but get_rate resolved {py!r}"
     )
     if row["rate"] is not None:
-        assert float(row["rate"]) == pytest.approx(py[0]), (
+        # Exact, not approx: both sides are Decimal since 1.7-round, and an
+        # approximate match here would hide precisely the drift this file exists
+        # to catch.
+        assert row["rate"] == py[0], (
             f"{label}: SQL and get_rate disagree on the rate"
         )
         assert row["flag"] == 0, f"{label}: convertible row must not raise the flag"
-        assert row["home_cents"] == round(AMOUNT_CENTS * float(row["rate"])), label
+        # SQL's converted cents against the *engine's own* Python conversion —
+        # the actual parity claim. This used to recompute SQL's answer in Python
+        # with float round(), which tested the test rather than the engine.
+        assert row["home_cents"] == _to_home_cents(AMOUNT_CENTS, py[0]), label
     else:
         assert row["home_cents"] is None and row["flag"] == 1, label
 
     if expected_rate is not None:
         # Every seeded day has a distinct rate, so this pins the exact row.
-        assert float(row["rate"]) == pytest.approx(float(expected_rate)), label
+        assert row["rate"] == Decimal(expected_rate), label
+
+
+async def test_a_half_cent_lands_the_same_way_in_both(fx, test_data):
+    """The rounding rule (bug 1.7-round). **The only test here that can see it.**
+
+    Every other parity row multiplies 2500 cents by a 2-decimal rate, so the
+    product is always a whole number of cents and the rounding mode is never
+    exercised — those rows passed identically before and after the fix. This one
+    seeds a rate chosen so the product is exactly ``16686.5``.
+
+    Both answers are asserted absolutely, not merely against each other. Agreeing
+    on the *wrong* value is the failure mode a pure parity assertion cannot see,
+    and half-away-from-zero is not an arbitrary tie-break here: it is what
+    Postgres ``round(numeric)`` does, and SQL computes every report figure.
+
+    If this fails at 16686 the Python side has regressed to ``round()`` — which
+    is banker's rounding on a ``Decimal`` just as it was on a float, the trap that
+    made the original bug survive a first look at it.
+    """
+    async with db.pool.acquire() as conn:
+        txn_id = await _seed_txn(
+            conn, fx, test_data.user_id, test_data.category_id,
+            fx.usd_account_id, _midday(TIE_DATE),
+            amount_cents=TIE_AMOUNT_CENTS,
+        )
+        async with conn.transaction(isolation="repeatable_read"):
+            row = await conn.fetchrow(SCAFFOLD, txn_id, "UTC")
+            py = await get_rate(conn, "USD", "PEN", date.fromisoformat(TIE_DATE))
+
+    assert py is not None and row["rate"] == py[0] == Decimal("3.3373"), (
+        "fixture assumption: the tie rate must be the one that resolved"
+    )
+    # Sanity: this really is a tie, so the test cannot quietly stop testing
+    # rounding if someone edits the constants.
+    assert (Decimal(TIE_AMOUNT_CENTS) * py[0]) % 1 == Decimal("0.5"), (
+        "TIE_AMOUNT_CENTS × the tie rate must land exactly on a half cent"
+    )
+
+    assert row["home_cents"] == TIE_EXPECTED_HOME_CENTS, "SQL rounds half away from zero"
+    assert _to_home_cents(TIE_AMOUNT_CENTS, py[0]) == TIE_EXPECTED_HOME_CENTS, (
+        "the Python path must round the same way — round() would give 16686"
+    )
 
 
 async def test_home_currency_row_needs_no_rate(fx, test_data):

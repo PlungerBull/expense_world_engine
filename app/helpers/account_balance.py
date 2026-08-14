@@ -93,6 +93,7 @@ boundary convention.
 """
 
 from datetime import date as date_type
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Optional
 
 import asyncpg
@@ -159,6 +160,27 @@ async def fetch_balance(
     return balances[str(account_id)]
 
 
+def _to_home_cents(balance_cents: int, rate: Decimal) -> int:
+    """Convert native cents at ``rate``, rounding the way Postgres does.
+
+    **The one place this module turns a rate into money**, so that the two
+    callers below cannot drift — the same reason ``home_currency.signed_expr``
+    and ``infer_transaction_type`` are each written once.
+
+    ``ROUND_HALF_UP`` is not a style preference, it is the only mode that
+    agrees with SQL. Postgres ``round(numeric)`` is half-away-from-zero, while
+    Python's builtin ``round()`` is half-to-even — and, the trap this fix
+    exists for, ``round()`` stays half-to-even on a ``Decimal`` too, so
+    switching the rate's type without also replacing the call fixes nothing
+    (bug 1.7-round). At rate 3.3373 a $50.00 balance is 16687 in SQL and 16686
+    under ``round()``, whether the rate is a float or a Decimal.
+
+    Balances reach here already summed, so this rounds once per account — the
+    error was never cumulative, only ever a single cent, and now it is none.
+    """
+    return int((Decimal(balance_cents) * rate).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+
+
 async def fetch_home_balances(
     conn: asyncpg.Connection,
     *,
@@ -177,10 +199,7 @@ async def fetch_home_balances(
     missing and asserts the home-currency lock) + ``rate_lookup_date``.
 
     ``None`` means "no rate available for this account's currency today" —
-    wire-visible and distinct from a zero balance. ``round()`` on the float
-    rate is kept byte-for-byte from the three copies this replaces; the
-    Decimal/half-up question is open-bugs 1.7, deliberately not smuggled in
-    here.
+    wire-visible and distinct from a zero balance.
     """
     currencies = set(currency_by_id.values())
     rate_by_currency = (
@@ -191,7 +210,7 @@ async def fetch_home_balances(
     result: dict[str, Optional[int]] = {}
     for account_id, balance_cents in balances.items():
         rate = rate_by_currency.get(currency_by_id[account_id])
-        result[account_id] = round(balance_cents * rate) if rate is not None else None
+        result[account_id] = _to_home_cents(balance_cents, rate) if rate is not None else None
     return result
 
 
@@ -206,8 +225,7 @@ async def fetch_home_balance(
     The single-account twin of ``fetch_home_balances`` for the mutation paths
     and the account detail read, which each convert exactly one figure. Takes
     the balance rather than reading it so ``create_account`` can pass its
-    by-construction 0 without a wasted ledger query (``round(0 * rate)`` is
-    0, but "no rate for this currency" is still ``null``, and that
+    by-construction 0 without a wasted ledger query (0 converts to 0, but "no rate for this currency" is still ``null``, and that
     distinction is wire-visible).
 
     Reads settings itself — and therefore 422s SETTINGS_MISSING like every
@@ -224,7 +242,7 @@ async def fetch_home_balance(
     )
     if result is None:
         return None
-    return round(balance_cents * result[0])
+    return _to_home_cents(balance_cents, result[0])
 
 
 __all__ = [

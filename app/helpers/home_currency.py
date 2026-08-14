@@ -150,14 +150,23 @@ copies drifted, and the surviving copy was the buggy one. The mitigation is
 rate row. If you change the resolution logic here, that test is what catches the
 other half going stale.
 
-Known, out of scope (audit WP1.7): ``_fetch_rate_from_db`` returns
-``float(row["rate"])``, truncating the stored ``numeric`` to binary float, after
-which Python's ``round()`` applies banker's rounding. These fragments keep full
-``numeric`` precision and round half-away-from-zero. SQL and Python can therefore
-differ by one cent on a *converted amount* even when they agree on the rate, which
-is why the parity test compares rates rather than cents. The fix (``Decimal`` +
-``ROUND_HALF_UP`` throughout) is deliberately out of scope for the rework and
-remains unscheduled.
+SQL is the reference for rounding, and Python matches it
+--------------------------------------------------------
+
+``round(numeric)`` in Postgres is half-away-from-zero, and every report figure is
+computed here, so that is the engine's rounding rule by definition. The Python
+side conforms to it: ``account_balance._to_home_cents`` quantizes with
+``ROUND_HALF_UP``. Nothing in this module needs to change to keep that true — but
+if the fragments above ever stop using ``round()``, that helper is what must move
+with them.
+
+Until 2026-08-13 the two disagreed (bug 1.7-round): ``_fetch_rate_from_db``
+truncated the stored ``numeric`` to a binary float and the callers used Python's
+``round()``, which is banker's rounding — so SQL and Python could differ by a cent
+on a converted amount even when they agreed on the rate, and the parity test was
+restricted to comparing rates. Worth knowing if you touch this: ``round()`` stays
+banker's rounding on a ``Decimal`` too, so passing the rate through as ``Decimal``
+was necessary but not sufficient; replacing the ``round()`` call was the fix.
 """
 from textwrap import indent
 
