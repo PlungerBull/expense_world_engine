@@ -53,14 +53,13 @@ _NEGATIVE_RATE_CACHE_TTL_SECONDS = 60
 # away from the SQL ones on half-cent values (bug 1.7-round). Keeping the
 # Decimal is the absence of a conversion, not the addition of one.
 #
-# What this does NOT claim: that the stored value is the provider's clean
-# decimal. `jobs/fetch_exchange_rates` parses provider JSON into Python floats
-# and binds those into the numeric column, so a stored rate reads back as
+# The write side is Decimal end-to-end too, as of 2026-08-13 (bug
+# fx-store-float): `jobs/fetch_exchange_rates` used to parse provider JSON into
+# floats and bind those into the numeric column, so a stored rate read back as
 # 3.3751531400000001070793587132357060909271240234375 rather than 3.37515314.
-# That noise is ~1e-16 relative — far below a cent on any balance — and it is
-# identical for both implementations, since both read the same stored row, so
-# parity is unaffected. It is a separate (open) defect on the write side, not
-# something this module can fix by reading more carefully.
+# Reading carefully could never have fixed that — a row holds what was written —
+# which is why the two halves are noted together: the guarantee this module
+# offers is only worth what the writer put there.
 #
 # The second element stays the *resolved* rate_date, which may be earlier than
 # the requested date — carry-forward. See _fetch_rate_from_db.

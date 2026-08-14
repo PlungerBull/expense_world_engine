@@ -39,13 +39,20 @@ from app.jobs.fetch_exchange_rates import (
 
 # One decade-slot per concern so no case can read another's baseline: the
 # guard only ever looks 7 days back, and these are months apart.
-BASELINE = 3.40
+#
+# Decimal, not float — `_upsert_rate` takes the Decimal the provider parse
+# produces, and a float argument would not even reach the guard: the ratio
+# against a Decimal baseline raises TypeError before any comparison happens.
+# Constructing the rates the way the job does is also what keeps this file
+# honest about the arithmetic it claims to pin.
+BASELINE = Decimal("3.40")
 
 CASES = {
     "spike": date(2015, 3, 10),
     "crash": date(2015, 4, 10),
     "within_band": date(2015, 5, 10),
     "boundary": date(2015, 6, 10),
+    "exact_edge": date(2015, 10, 10),
     "no_baseline": date(2015, 7, 10),
     "stale_baseline": date(2015, 8, 10),
     "tally": date(2015, 9, 10),
@@ -59,13 +66,13 @@ TOUCHED_DATES = (
 )
 
 
-async def _seed(conn, rate_date: date, rate: float) -> None:
+async def _seed(conn, rate_date: date, rate: Decimal) -> None:
     """Insert a baseline row directly, bypassing the guard under test."""
     await conn.execute(
         """INSERT INTO exchange_rates (base_currency, target_currency, rate, rate_date, created_at)
            VALUES ('USD', 'PEN', $1, $2, now())
            ON CONFLICT (base_currency, target_currency, rate_date) DO NOTHING""",
-        Decimal(str(rate)), rate_date,
+        rate, rate_date,
     )
 
 
@@ -162,7 +169,7 @@ async def test_ordinary_movement_is_accepted(fx):
     day = CASES["within_band"]
     async with db.pool.acquire() as conn:
         await _seed(conn, day.replace(day=9), BASELINE)
-        assert await _upsert_rate(conn, "PEN", day, BASELINE * 1.02) is True
+        assert await _upsert_rate(conn, "PEN", day, BASELINE * Decimal("1.02")) is True
         assert await _row_exists(conn, day)
 
 
@@ -170,13 +177,17 @@ async def test_ordinary_movement_is_accepted(fx):
 async def test_the_band_sits_where_the_constant_says(fx):
     """Just inside the band passes, just outside is refused.
 
-    Deliberately NOT asserted at exactly ``MAX_RATE_MOVE_FRACTION``. The guard
-    compares floats, and a move constructed as ``BASELINE * 1.10`` computes as
-    10.000000000000019% — so ``>`` and ``>=`` are indistinguishable at the
-    nominal edge and the exact boundary is not a property anything can rely on.
-    What is worth pinning is that the band is at 10% and not, say, 50%: a
-    fat-fingered constant is the realistic regression, not an off-by-one-ulp
-    reading of it.
+    The half-point margin is what pins the band's *location* — that it is at 10%
+    and not, say, 50% — which is the realistic regression: a fat-fingered
+    constant.
+
+    The exact edge is asserted separately, and only became assertable when the
+    guard went all-Decimal (bug fx-store-float, 2026-08-13). In float the move
+    constructed as ``BASELINE * 1.10`` computed as 10.000000000000019%, so ``>``
+    and ``>=`` were indistinguishable at the nominal edge and this file said so.
+    Decimal makes ``0.34 / 3.40`` exactly ``0.10``, so "a move of exactly the
+    limit is accepted" is now a real property rather than an artefact of how the
+    fixture happened to round.
     """
     day = CASES["boundary"]
     margin = MAX_RATE_MOVE_FRACTION / 20  # half a percentage point at 10%
@@ -191,6 +202,17 @@ async def test_the_band_sits_where_the_constant_says(fx):
         outside = BASELINE * (1 + MAX_RATE_MOVE_FRACTION + margin)
         with pytest.raises(ValueError, match="implausible"):
             await _upsert_rate(conn, "PEN", day, outside)
+
+
+@pytest.mark.asyncio
+async def test_a_move_of_exactly_the_limit_is_accepted(fx):
+    """``move > MAX_RATE_MOVE_FRACTION`` — the limit itself is inside the band."""
+    day = CASES["exact_edge"]
+    async with db.pool.acquire() as conn:
+        await _seed(conn, day.replace(day=9), BASELINE)
+        at_the_edge = BASELINE * (1 + MAX_RATE_MOVE_FRACTION)
+        assert await _upsert_rate(conn, "PEN", day, at_the_edge) is True
+        assert await _row_exists(conn, day)
 
 
 @pytest.mark.asyncio

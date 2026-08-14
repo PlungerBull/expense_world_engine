@@ -32,7 +32,6 @@ Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high
 
 ## ⚪ Low
 
-- **fx-store-float** `jobs/fetch_exchange_rates` parses provider JSON with `json.loads` (floats) and binds `float(rates[target])` into `exchange_rates.rate`, which is `numeric` — so every stored rate carries binary-float expansion: today's USD→PEN reads back as `3.3751531400000001070793587132357060909271240234375`, not the provider's `3.37515314`. Harmless today at ~1e-16 relative (far below a cent on any balance) and **parity-neutral**, since SQL and Python both read the same stored row — found while closing 1.7-round, which is why it is worth writing down rather than assuming the column holds what the provider sent. Fix is `json.loads(..., parse_float=Decimal)` in `_fetch_currency_api` plus `Decimal` through `_upsert_rate`'s signature; the plausibility guard's ratio arithmetic works on `Decimal` unchanged.
 - **1.7-archived** `_fetch_target_currencies` excludes archived accounts, so archiving an account drops its currency from the daily fetch list. **Inert under `sql/015`** — USD is the base (never a target) and PEN is always on the list via `user_settings.main_currency`, so the only rate that exists is fetched regardless of what is archived. Becomes live the day a third currency is admitted; fix it in the same change that lifts the CHECK, not before.
 ---
 

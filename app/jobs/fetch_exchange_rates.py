@@ -18,6 +18,17 @@ currencies against USD) covers all of them. Upserts are idempotent on the
 `(base_currency, target_currency, rate_date)` unique constraint — safe to re-run the
 job at any time.
 
+Rates are Decimal from the moment they are parsed, never float. `exchange_rates.rate`
+is `numeric`, so a float bound into it stores its binary expansion rather than the
+digits the provider published — 3.37515314 landed as
+3.3751531400000001070793587132357060909271240234375 until this was fixed (bug
+fx-store-float, 2026-08-13). The noise was ~1e-16 and harmed no figure, but a column
+that does not hold what was inserted is not something later rounding work can reason
+against. `json.loads(..., parse_float=Decimal)` is the whole fix; everything
+downstream of it just declines to cast back. Note the provider may also send a bare
+integer (`"jpy": 150`), which `parse_float` does not touch — `_apply_rates` normalizes
+with `Decimal(...)`, exact for both.
+
 Provider rates are not trusted on sight: `_upsert_rate` refuses a non-positive
 rate and one that moves more than `MAX_RATE_MOVE_FRACTION` from the previous
 known rate, counting the target as a failure instead of storing it. A refused
@@ -34,6 +45,7 @@ import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Optional
 
 import asyncpg
@@ -66,7 +78,11 @@ DB_CONNECT_WAIT_SECONDS = 2
 # to currency feeds — a misplaced decimal point (33.373 for 3.3373), a zero, a
 # garbage value. Since sql/021 this table is the only source of every
 # home-currency figure, so one bad row misprices reports rather than one write.
-MAX_RATE_MOVE_FRACTION = 0.10
+#
+# Decimal, like every other number in this module: the guard's `move` is a
+# Decimal quotient, and a float limit would be the one place a binary
+# approximation re-entered the comparison.
+MAX_RATE_MOVE_FRACTION = Decimal("0.10")
 
 # How far back a baseline may be drawn from. The band above asks "did this move
 # more than 10% in about a day"; across a long gap that question has no answer —
@@ -156,12 +172,15 @@ def _fetch_currency_api(version: str = "latest") -> dict:
 
     Raw shape: {"date": "2026-07-30", "usd": {"pen": 3.39, "eur": 0.87, ...}} (codes
     lowercase). Normalized here to the shape the caller consumes — {"date": ...,
-    "rates": {"PEN": 3.39, ...}} — so the provider swap stays inside this function.
+    "rates": {"PEN": Decimal("3.39"), ...}} — so the provider swap stays inside this
+    function. Rate values are Decimal (or int, where the provider sent a whole
+    number); they are never float.
     """
     url = CURRENCY_API_URL.format(version=version)
     req = urllib.request.Request(url, headers={"User-Agent": "expense-world-engine/1.0"})
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-        raw = json.loads(resp.read())
+        # parse_float=Decimal, not the default float — see the module docstring.
+        raw = json.loads(resp.read(), parse_float=Decimal)
     return {
         "date": raw["date"],
         "rates": {code.upper(): rate for code, rate in raw.get("usd", {}).items()},
@@ -172,8 +191,14 @@ async def _baseline_rate(
     conn: asyncpg.Connection,
     target: str,
     rate_date: date,
-) -> Optional[tuple[float, date]]:
+) -> Optional[tuple[Decimal, date]]:
     """Most recent stored rate strictly before ``rate_date``, or None.
+
+    The rate stays the Decimal asyncpg hands back for a `numeric` column. It
+    used to be cast to float here, which was harmless while the incoming rate
+    was also a float — but the two now have to meet in ``_upsert_rate``'s ratio,
+    and Python refuses to subtract a float from a Decimal at all. Casting is
+    what would break the guard, not what keeps it working.
 
     Deliberately not ``helpers.exchange_rate.get_rate``, which answers a
     different question in all three respects that matter here: it resolves
@@ -197,16 +222,20 @@ async def _baseline_rate(
     )
     if row is None:
         return None
-    return (float(row["rate"]), row["rate_date"])
+    return (row["rate"], row["rate_date"])
 
 
 async def _upsert_rate(
     conn: asyncpg.Connection,
     target: str,
     rate_date: date,
-    rate: float,
+    rate: Decimal,
 ) -> bool:
     """Insert one provider rate; True if a row was written.
+
+    ``rate`` is a Decimal, and is bound into the `numeric` column unchanged —
+    that is the whole of what makes the stored row equal the digits the provider
+    published (see the module docstring).
 
     Raises ValueError rather than inserting when the rate is non-positive or
     implausible — since sql/021 this table is the only source of every
@@ -281,7 +310,10 @@ async def _apply_rates(
             tally["missing"].append(target)
             continue
         try:
-            did_insert = await _upsert_rate(conn, target, rate_date, float(rates[target]))
+            # Decimal(...), not float(...): the provider's parse already yields
+            # Decimal, and this converts the int case (a whole-number rate,
+            # which parse_float does not see) exactly.
+            did_insert = await _upsert_rate(conn, target, rate_date, Decimal(rates[target]))
         except ValueError as exc:
             tally["failed"].append((target, str(exc)))
             continue

@@ -9,6 +9,7 @@
     fetch/backfill jobs also refuse it in _upsert_rate before the INSERT.
 """
 from datetime import date
+from decimal import Decimal
 
 import asyncpg
 import pytest
@@ -42,7 +43,7 @@ async def test_exchange_rate_must_be_positive(bad_rate):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_rate", [0.0, -1.0])
+@pytest.mark.parametrize("bad_rate", [Decimal("0"), Decimal("-1")])
 async def test_upsert_rate_refuses_non_positive_before_insert(bad_rate):
     """The job-side guard fires before SQL, so one bad provider value is a
     counted failure, not a CheckViolationError aborting the whole run."""
