@@ -8,6 +8,9 @@ These tests verify:
     next call (positive caching).
   * A missing rate (``None`` result) is also cached — otherwise a
     non-existent rate would be re-queried on every access.
+  * A missing rate expires **sooner** than a real one (bug 1.7-cache) —
+    asserted as a relationship between the two stored expiries, not
+    against either constant.
   * ``clear_rate_cache()`` drops all entries.
 
 Testing TTL expiry directly would require either ``freezegun`` or
@@ -98,6 +101,46 @@ async def test_negative_result_is_cached(client, test_data):
         "Cache must store the None result — otherwise negative lookups "
         "bypass the cache and hit the DB on every call"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_missing_rate_expires_sooner_than_a_real_one(client, test_data):
+    """The two TTLs are separate, and the negative one is shorter (bug 1.7-cache).
+
+    Both answers used to be held for an hour, which meant a rate that landed
+    after a miss — from the 6-hourly fetch job, or a manual backfill — stayed
+    invisible to this module for up to an hour while the SQL read paths, which
+    are uncached, could already price it.
+
+    Asserted as a *relationship* between the two stored expiries rather than
+    against either constant, so retuning the values doesn't drop the guard. The
+    two lookups are issued back-to-back, so the shared ``time.monotonic()`` base
+    is close enough that the ordering can only come from the TTLs. This is the
+    only thing pinning the split: nothing else in the suite would notice if the
+    ternary in ``get_rate`` collapsed back to one TTL.
+    """
+    rate_module.clear_rate_cache()
+    as_of = date.today()
+
+    async with db.pool.acquire() as conn:
+        # USD → PEN is seeded by conftest._ensure_test_data; ZZ → XX resolves
+        # to nothing, the same pair the negative test above uses.
+        hit = await rate_module.get_rate(conn, "USD", "PEN", as_of)
+        miss = await rate_module.get_rate(conn, "ZZ", "XX", as_of)
+
+    assert hit is not None and miss is None, "fixture assumption"
+
+    _, hit_expires = rate_module._RATE_CACHE[("USD", "PEN", as_of)]
+    _, miss_expires = rate_module._RATE_CACHE[("ZZ", "XX", as_of)]
+
+    assert miss_expires < hit_expires, (
+        "a missing rate must be forgotten sooner than a real one — both "
+        f"expiries came out equal ({hit_expires}), so the TTLs are shared again"
+    )
+    assert (
+        rate_module._NEGATIVE_RATE_CACHE_TTL_SECONDS
+        < rate_module._RATE_CACHE_TTL_SECONDS
+    ), "the negative TTL constant must stay the shorter of the two"
 
 
 @pytest.mark.asyncio

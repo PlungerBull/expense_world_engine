@@ -8,8 +8,14 @@ dynos, each dyno maintains its own cache; worst case is N DB hits
 per hour per rate instead of one.
 
 Negative results (no rate available) are also cached — otherwise a
-missing rate would be re-queried on every call. Eviction is lazy:
-expired entries are deleted on next access.
+missing rate would be re-queried on every call — but on a much shorter
+TTL, because the two answers age differently. A real rate is stable for
+the day; a *missing* one is a gap someone is likely fixing right now
+(the daily job, or a historical backfill), and holding "there is no
+rate" for an hour after the row lands means the surfaces that use this
+module keep reporting unconvertible while the SQL read paths, which are
+uncached, can already price it. Eviction is lazy: expired entries are
+deleted on next access.
 
 Cache sizing: for realistic workloads (users typically have 1-3
 currencies and care about recent dates), the cache stays well under
@@ -29,6 +35,16 @@ from app.helpers.validation import resolve_timezone
 
 
 _RATE_CACHE_TTL_SECONDS = 3600  # 1 hour
+
+# A "no rate for this date" answer is held far more briefly than a real one.
+# Rates change at most once a day, so an hour costs nothing on a hit; but a miss
+# is a gap that is actively being filled — by the 6-hourly fetch job or by a
+# manual backfill — and the hour it used to be cached for was pure lag between
+# the row landing and this module admitting it exists (bug 1.7-cache). One
+# minute keeps the "don't re-query a missing rate on every call" property the
+# negative cache exists for, while bounding that lag to something nobody
+# notices.
+_NEGATIVE_RATE_CACHE_TTL_SECONDS = 60
 
 _RateResult = Optional[tuple[float, date_type]]
 _RATE_CACHE: dict[tuple[str, str, date_type], tuple[_RateResult, float]] = {}
@@ -131,8 +147,10 @@ async def get_rate(
     """Return (rate, actual_rate_date) to convert `from_currency` → `to_currency` as of `as_of`.
 
     Cached: see module docstring. Callers do not need to think about
-    the cache — it's transparent, per-worker, and self-evicting. Both
-    hits and negative results (None) are cached for the same TTL.
+    the cache — it's transparent, per-worker, and self-evicting. Hits and
+    negative results (None) are both cached, on separate TTLs: a missing
+    rate is forgotten far sooner, because it is the answer most likely to
+    have stopped being true since it was stored.
 
     Returns None if any required rate row is missing. Callers decide
     the fallback.
@@ -152,7 +170,8 @@ async def get_rate(
         del _RATE_CACHE[cache_key]
 
     result = await _fetch_rate_from_db(conn, from_currency, to_currency, as_of)
-    _RATE_CACHE[cache_key] = (result, now + _RATE_CACHE_TTL_SECONDS)
+    ttl = _RATE_CACHE_TTL_SECONDS if result is not None else _NEGATIVE_RATE_CACHE_TTL_SECONDS
+    _RATE_CACHE[cache_key] = (result, now + ttl)
     return result
 
 
