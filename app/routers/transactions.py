@@ -12,6 +12,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from app import db
+from app.constants import TransactionSource
 from app.deps import CurrentUser, DebitAsNegative, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES
 from app.helpers import transactions as transactions_service
@@ -95,9 +96,17 @@ async def list_transactions(
 
         if hashtag_id:
             params.append(hashtag_id)
+            # transaction_source pins this to *ledger* junction rows. Every other
+            # reader of this table already carries it (helpers/monthly_report.py,
+            # helpers/transactions.py); this was the one that didn't. Inert today —
+            # sql/027 CHECKs the column to 1, so no row exists that this excludes —
+            # and a live divergence the day the inbox hashtag writer widens that
+            # CHECK to IN (1, 2), which is the plan. A filter that means "ledger"
+            # should say so rather than rely on nothing else being storable.
             conditions.append(
                 f"EXISTS (SELECT 1 FROM expense_transaction_hashtags th "
                 f"WHERE th.transaction_id = t.id AND th.hashtag_id = ${len(params)} "
+                f"AND th.transaction_source = {int(TransactionSource.LEDGER)} "
                 f"AND th.deleted_at IS NULL)"
             )
 
