@@ -270,18 +270,41 @@ async def restore_category(
 ) -> dict:
     """Undo a soft-delete on a category and log the restoration.
 
-    Checks for name collisions with active categories before clearing
-    deleted_at — a user can delete a category and create a new one with
-    the same name, which would block restoration.
+    Checks the stored name against both name rules before clearing deleted_at:
+    it must not be reserved, and it must not collide with an active category
+    (a user can delete a category and create a new one with the same name,
+    which blocks restoration).
+
+    Restore is the third write path into a category name, and it was the one
+    bug 7.4 missed — create and update both reject reserved names, so a user
+    category that held '@Opening' before that guard shipped could be
+    soft-deleted and restored straight back into the squat. The difference
+    here is that the name is not caller-supplied: it comes off the stored row,
+    which is why the same rule needs stating a third time rather than being
+    caught by a shared request validator.
 
     Raises:
         not_found: no soft-deleted category with that id for this user.
+        validation_error: the stored name is reserved for system categories.
         conflict: an active category already uses the same name.
     """
     before_row = await fetch_owned_row_or_404(
         conn, "expense_categories", category_id, user_id, "category", deleted=True
     )
 
+    # Same predicate update_category applies (see its check_name callback):
+    # system rows own their reserved names and are exempt. That arm is
+    # unreachable today — delete_category refuses to soft-delete a system row,
+    # so no such row can be restored — but the exemption is written out rather
+    # than assumed, because "the other path forbids it" is not a guarantee this
+    # function makes for itself.
+    if before_row["system_key"] is None:
+        _reject_reserved_name(before_row["name"])
+
+    # Ordering matters: reserved is a 422 about the name itself, collision is a
+    # 409 about the world it is being restored into. A reserved name that also
+    # collides must report the reserved failure, since that one cannot be
+    # resolved by deleting the other row.
     if await name_taken(
         conn, "expense_categories", user_id, before_row["name"],
         exclude_id=category_id,

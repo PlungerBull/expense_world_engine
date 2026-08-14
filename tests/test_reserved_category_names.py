@@ -7,11 +7,16 @@ and 500'd opening balances forever. @Opening is the only reserved name left:
 @Debt and @Transfer went with the transfer removal (2026-08-10), which is why
 the tests below read as one name rather than three. Two layers close it:
 
-  * boundary: POST /categories and PUT rename reject reserved names on
-    non-system rows with 422 (system rows rename freely — lookup is by
-    ``system_key``, and the spec guarantees renameability);
+  * boundary: POST /categories, PUT rename, and POST /{id}/restore reject
+    reserved names on non-system rows with 422 (system rows rename freely —
+    lookup is by ``system_key``, and the spec guarantees renameability);
   * defense in depth: the seeding INSERT catches UniqueViolationError from a
     pre-fix squatter row and raises a clean 409 with the remedy.
+
+Restore was added to that first layer on 2026-08-13 (bug 7.4-r). 7.4 shipped
+with only the two caller-supplied-name paths, because restore takes the name off
+the stored row and so did not look like a name-write at all — which is exactly
+how it stayed open. All three paths are now pinned here.
 """
 import uuid
 
@@ -122,3 +127,77 @@ async def test_seeding_over_prefix_squatter_row_raises_409_not_500():
         finally:
             await conn.execute("DELETE FROM expense_categories WHERE user_id = $1", squat_user_id)
             await conn.execute("DELETE FROM users WHERE id = $1", squat_user_id)
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_a_soft_deleted_reserved_name(client, test_data):
+    """The third write path (bug 7.4-r).
+
+    7.4 sealed create and update, which are the two paths where the name is
+    caller-supplied. Restore takes the name off the stored row, so it went
+    unsealed: a user category that claimed '@Opening' before the guard shipped
+    and was then soft-deleted could be restored straight back into the squat,
+    re-breaking opening balances for that user.
+
+    The squatter has to be hand-INSERTed — POST has rejected the name since 7.4,
+    so the API can no longer produce the row this test needs. Soft-deleted at
+    insert time for the same reason: DELETE would work, but building the state
+    directly keeps the test about restore rather than about two other endpoints.
+    """
+    category_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        try:
+            await conn.execute(
+                """INSERT INTO expense_categories
+                    (id, user_id, name, color, is_system, sort_order,
+                     created_at, updated_at, deleted_at)
+                   VALUES ($1, $2, '@Opening', '#111111', false, 97,
+                           now(), now(), now())""",
+                category_id, test_data.user_id,
+            )
+
+            response = await client.post(
+                f"/v1/categories/{category_id}/restore", headers=_idem()
+            )
+
+            assert response.status_code == 422, response.text
+            body = response.json()["error"]
+            assert body["code"] == "VALIDATION_ERROR"
+            assert "name" in body["fields"]
+
+            still_deleted = await conn.fetchval(
+                "SELECT deleted_at IS NOT NULL FROM expense_categories WHERE id = $1",
+                category_id,
+            )
+            assert still_deleted, "a refused restore must not clear deleted_at"
+        finally:
+            await conn.execute("DELETE FROM expense_categories WHERE id = $1", category_id)
+
+
+@pytest.mark.asyncio
+async def test_restore_of_an_ordinary_name_is_unaffected(client, test_data):
+    """The guard must not turn every restore into a 422.
+
+    Paired with the reserved case above so the new check is pinned as
+    *selective*, not merely present — the failure mode of a badly-placed guard
+    is that it fires on everything, and a lone negative test would not see it.
+    """
+    category_id = str(uuid.uuid4())
+    async with db.pool.acquire() as conn:
+        try:
+            await conn.execute(
+                """INSERT INTO expense_categories
+                    (id, user_id, name, color, is_system, sort_order,
+                     created_at, updated_at, deleted_at)
+                   VALUES ($1, $2, 'Groceries 7.4r', '#111111', false, 97,
+                           now(), now(), now())""",
+                category_id, test_data.user_id,
+            )
+
+            response = await client.post(
+                f"/v1/categories/{category_id}/restore", headers=_idem()
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["deleted_at"] is None
+        finally:
+            await conn.execute("DELETE FROM expense_categories WHERE id = $1", category_id)
