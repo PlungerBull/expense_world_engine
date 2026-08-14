@@ -17,7 +17,7 @@ from app.constants import ActivityAction
 from app.errors import conflict, not_found
 from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import dynamic_update, fetch_owned_row_or_404
-from app.helpers.validation import normalize_name
+from app.helpers.validation import normalize_name, validate_color
 
 
 async def name_taken(
@@ -105,6 +105,15 @@ async def update_named_resource(
         conn, table, resource_id, user_id, resource_type
     )
     before = serialize(before_row)
+
+    # Every named resource that has a colour uses this path for its updates, so
+    # the rule lives here once rather than in each caller's wrapper. Hashtags
+    # route through here too but have no `color` field on their update schema
+    # (and no column), so the guard can never fire for them — cost of the extra
+    # `in` check is nil, and a colour column added to hashtags later inherits the
+    # rule instead of quietly skipping it.
+    if "color" in fields:
+        validate_color(fields["color"])
 
     if "name" in fields:
         fields["name"] = normalize_name(fields["name"])

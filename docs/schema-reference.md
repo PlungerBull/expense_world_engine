@@ -5,7 +5,8 @@
 >
 > Regenerated 2026-08-06 from the live catalog (`information_schema` + `pg_indexes` +
 > `pg_constraint` + `pg_policies`) after the deletion program landed (`sql/020`–`sql/025`);
-> amended 2026-08-10 for the transfer removal (`sql/030` — three columns and two CHECKs dropped).
+> amended 2026-08-10 for the transfer removal (`sql/030` — three columns and two CHECKs dropped),
+> then 2026-08-13 for the colour-format CHECKs (`sql/031` — two CHECKs added, no column changes).
 > **14 tables, 123 columns.**
 
 ---
@@ -262,6 +263,7 @@ expense_bank_accounts
                              INSERT omits the column and the schemas reject the field).
                              Open product question — see TODO.md.
   - color                  text, NOT NULL, default '#3b82f6'
+                           CHECK accounts_color_is_hex: IS NOT NULL AND ~ '^#[0-9a-fA-F]{6}$' (sql/031)
   - is_archived            boolean, NOT NULL, default false
                            — hides from pickers and entry flows but preserves all history.
                              Accounts with transactions can be archived, not hard-deleted.
@@ -293,6 +295,7 @@ expense_categories
   - name        text, NOT NULL
                 — display label. Free to rename, including for system categories.
   - color       text, NOT NULL, default '#6b7280'
+                CHECK categories_color_is_hex: IS NOT NULL AND ~ '^#[0-9a-fA-F]{6}$' (sql/031)
   - is_system   boolean, NOT NULL, default false
                 — true for system-managed categories (@Opening).
                   Cannot be deleted.

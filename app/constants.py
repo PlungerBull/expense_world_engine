@@ -28,6 +28,18 @@ HOME_CURRENCY = "PEN"
 # the fail-closed comment beside it).
 BASE_CURRENCY = "USD"
 
+# The colour an account gets when the caller omits one. Mirrors sql/003's column
+# DEFAULT, which is the real owner — Python restates it only because the accounts
+# INSERT has a fixed column list and so cannot express "omit this one and let the
+# DEFAULT apply". tests/test_sql031_color_checks.py asserts the two still agree,
+# since a silent drift here would hand new accounts a colour the schema says they
+# do not have.
+#
+# Categories deliberately get no constant: their default (#6b7280) lives only in
+# sql/003, `CategoryCreateRequest.color` is required, and `ensure_system_category`
+# omits the column so the DEFAULT applies. A constant nothing reads is bloat.
+DEFAULT_ACCOUNT_COLOR = "#3b82f6"
+
 
 class SystemCategoryKey(str, Enum):
     """Stable discriminator for engine-managed categories.

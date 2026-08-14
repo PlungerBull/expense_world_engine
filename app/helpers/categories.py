@@ -31,7 +31,7 @@ from app.helpers.reference_data import (
     next_sort_order,
     update_named_resource,
 )
-from app.helpers.validation import normalize_name
+from app.helpers.validation import normalize_name, validate_color
 from app.schemas.categories import category_from_row
 
 # Reserved display names, folded to match the case-insensitive
@@ -142,13 +142,18 @@ async def create_category(
     """Validate uniqueness, insert, and log the creation.
 
     Raises:
-        validation_error: name is empty after stripping, or is a reserved
-            system-category name (created rows are never system rows).
+        validation_error: name is empty after stripping, is a reserved
+            system-category name (created rows are never system rows), or
+            ``color`` is not a 6-digit hex value. Unlike accounts, ``color`` is
+            required here (`CategoryCreateRequest`), so there is no
+            omitted-falls-to-default case — which is why an empty string used to
+            be stored verbatim rather than collapsing to a default.
         conflict: a non-deleted category with the same name (case-insensitive)
             or id already exists.
     """
     name = normalize_name(name)
     _reject_reserved_name(name)
+    validate_color(color)
     if await name_taken(conn, "expense_categories", user_id, name):
         raise conflict(f"A category named '{name}' already exists.")
 

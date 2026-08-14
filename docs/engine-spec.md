@@ -57,6 +57,19 @@ This holds on **every** amount-bearing column in **every** table — no column's
 
 **Unknown request fields:** Every request body rejects unknown fields with `422 VALIDATION_ERROR` — no endpoint silently drops input (fail-closed). Since 2026-08-06 this is enforced structurally: all request models inherit `schemas.StrictModel` (`extra="forbid"`). Any future nested request object must inherit the base itself — Pydantic config does not propagate into nested models (no nested fragment exists today; the last one, `transfer`, left with the 2026-08-10 removal). The error names the offending key in `fields`, nested keys as dotted paths (`transactions.0.bogus`). Per-endpoint "unknown fields 422" notes below call out cases where the rejection carries extra meaning (a deliberately-deleted field, a locked field); the rule itself is global.
 
+**Colour format:** Every `color` field — accounts and categories, create and update alike — must be a **6-digit hex string with a leading `#`**: `^#[0-9a-fA-F]{6}$`. Anything else is `422 VALIDATION_ERROR` with `fields: {"color": "Must be a 6-digit hex color, e.g. '#3b82f6'."}`.
+
+| Input | Result |
+|---|---|
+| omitted (accounts only) | `#3b82f6` — the default. Categories require the field. |
+| `#ff0000`, `#00AA00` | stored **verbatim, case preserved** — the engine never rewrites a value it accepted |
+| `""`, `"   "` | `422` |
+| `banana`, `3b82f6`, `#3b82fg` | `422` |
+| `#fff` (3-digit shorthand) | `422` — one colour with two spellings, and clients compare these as strings |
+| `#ff00ff00` (8-digit alpha) | `422` — nothing renders the channel |
+
+Backed by `CHECK` constraints on both columns (`sql/031`), so the rule holds against writers that bypass the API. *(Added 2026-08-13, bug account-color. Nothing validated colour before: `create_account` collapsed an explicit `""` to the default through `color or …` truthiness, while `create_category` — whose `color` is required — stored `""` and `banana` verbatim, and both update paths were unchecked. **Breaking:** see `docs/client-breaking-changes.md`.)*
+
 **Datetime inputs:** All datetime fields in request bodies must be RFC 3339 with a timezone offset. Accepted: `2026-04-25T16:30:00Z`, `2026-04-25T16:30:00+00:00`, `2026-04-25T11:30:00-05:00`. Rejected with `422 VALIDATION_ERROR`: naive datetimes (`2026-04-25T16:30:00`, `2026-04-25 16:30`, `2026-04-25`). Clients are responsible for resolving the user's local timezone and emitting canonical RFC 3339 — the engine never guesses a timezone for unqualified input. Response datetimes are always emitted in UTC with a `Z` suffix.
 
 ---
@@ -217,7 +230,7 @@ Each account response includes `current_balance_cents` and `current_balance_home
 Creates a new bank account (real account only — `is_person = false`).
 
 **Required:** `id` (client-supplied UUID), `name`, `currency_code`
-**Optional:** `color`, `sort_order` (omitted → appends: `MAX(sort_order) + 1` within the user's collection, `0` when empty; an explicit value — including `0` — is stored verbatim)
+**Optional:** `color` (see **Colour format** below — omitted → `#3b82f6`), `sort_order` (omitted → appends: `MAX(sort_order) + 1` within the user's collection, `0` when empty; an explicit value — including `0` — is stored verbatim)
 **Forbidden:** `is_person`, and any unknown field. Person accounts are **not** created through this endpoint; they are created explicitly via the People API (see **People / Person Accounts** below). Requests that include `is_person` (with any value) or any other unknown field return `422 VALIDATION_ERROR`.
 
 **Validation:**
@@ -247,7 +260,7 @@ Since `sql/022` it is also the **first term of the account's balance**, which is
 ### `GET /accounts/{id}`
 ### `PUT /accounts/{id}`
 
-Fields that can be updated: `name`, `color`, `sort_order`.
+Fields that can be updated: `name`, `color` (see **Colour format**), `sort_order`.
 `currency_code` is immutable. Returns `422` if included in the request body.
 The same name normalization rules as `POST` apply to renames: trimmed, empty
 names return `422`, and case-insensitive conflicts within the account's own
@@ -279,7 +292,7 @@ Person accounts (`is_person = true`) represent people the user lends to or borro
 Creates a person account.
 
 **Required:** `id` (client-supplied UUID), `name`, `currency_code`
-**Optional:** `color`, `sort_order`
+**Optional:** `color` (see **Colour format**), `sort_order`
 
 Response shape is identical to a bank account with `is_person = true`.
 
@@ -293,7 +306,7 @@ Until this endpoint ships, person accounts cannot be created through the API. Th
 Returns all active categories, sorted by `sort_order`. System categories (`is_system = true`) are always included and always appear first. Supports standard pagination. Use `?include_deleted=true` to include soft-deleted categories. (Category archiving was deleted in `sql/024` — soft delete already hides a row from pickers while leaving its historical transactions intact, which is what archiving was for. Accounts keep their archive; see Bank Accounts.)
 
 ### `POST /categories`
-**Required:** `id` (client-supplied UUID), `name`, `color`
+**Required:** `id` (client-supplied UUID), `name`, `color` (see **Colour format** — required here, so there is no default to fall back to)
 **Optional:** `sort_order` (omitted → appends: `MAX(sort_order) + 1` within the user's collection; explicit values, including `0`, stored verbatim)
 
 **Name normalization:** `name` is trimmed before storage. An empty-after-trim name returns `422 VALIDATION_ERROR` with `fields: {"name": "Must not be empty."}`. Uniqueness is **case-insensitive** per user: "Food", "food", and "FOOD" collide. A conflicting name returns `409 CONFLICT`. The database enforces this with a partial unique index on `(user_id, LOWER(name)) WHERE deleted_at IS NULL`, so deleting a category and creating a new one with the same name works as expected.

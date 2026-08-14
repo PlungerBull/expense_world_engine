@@ -13,6 +13,7 @@ that short-circuit on the first bad reference (single create/update).
 """
 
 from datetime import datetime
+import re
 from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
@@ -36,6 +37,12 @@ MSG_USER_CATEGORY = "Must not reference a system category."
 MSG_NOT_EMPTY = "Must not be empty."
 MSG_NOT_ZERO = "Must not be zero."
 MSG_NOT_FUTURE = "Must not be in the future."
+MSG_HEX_COLOR = "Must be a 6-digit hex color, e.g. '#3b82f6'."
+
+# Kept beside the message it produces. Mirrored by sql/031's CHECK — the two are
+# one rule in two places, so a change here needs a migration, and
+# tests/test_sql031_color_checks.py asserts they still agree.
+_HEX_COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 
 
 def validate_timezone(value: str, field: str) -> None:
@@ -196,6 +203,42 @@ def normalize_name(name: Optional[str], field: str = "name") -> str:
             {field: MSG_NOT_EMPTY},
         )
     return cleaned
+
+
+def validate_color(value: Optional[str], field: str = "color") -> None:
+    """Raise a 422 unless ``value`` is a 6-digit hex color. ``None`` passes.
+
+    ``None`` means "not supplied", which is a separate question from "is this a
+    color" — accounts fall back to a default, categories require the field at
+    the schema. Same split as ``reject_zero_amount``.
+
+    Nothing before this validated color at all: an empty string, ``banana`` and
+    ``#12`` were all stored verbatim on the category paths, while on
+    ``create_account`` an empty string collapsed to the default via ``color or
+    …`` truthiness — the same class of collapse ``or 0`` caused for
+    ``sort_order`` (bug account-color; owner decision 2026-08-13 is to reject).
+
+    Deliberately narrow, per the fail-closed rule — enumerate what is permitted:
+
+      * **no 3-digit shorthand.** ``#fff`` and ``#ffffff`` are one color under
+        two spellings, and clients compare these as strings.
+      * **no 8-digit alpha.** Nothing renders the channel, so it would be a
+        stored value with no meaning.
+      * **no case normalization.** ``#00AA00`` stays ``#00AA00``. Rewriting a
+        caller's value is the silent mutation this fix exists to stop, and the
+        engine never edits input it has accepted.
+
+    ``sql/031`` carries the same rule as a CHECK on both columns. This runs
+    first, so the constraint only ever fires on a path that has already skipped
+    this — which is a defect, and a 500 is the right answer to one.
+    """
+    if value is None:
+        return
+    if not _HEX_COLOR_RE.fullmatch(value):
+        raise validation_error(
+            f"{field.capitalize()} must be a 6-digit hex color.",
+            {field: MSG_HEX_COLOR},
+        )
 
 
 def reject_zero_amount(value: Optional[int], field: str = "amount_cents") -> None:

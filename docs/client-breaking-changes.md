@@ -11,6 +11,48 @@ Each entry states what changed, what breaks, and what the client must do.
 
 ---
 
+## 2026-08-13 — `color` must be a 6-digit hex value
+
+**Engine change** (`helpers/validation.validate_color`, `helpers/accounts.py`,
+`helpers/categories.py`, `helpers/reference_data.py`, `sql/031`; open-bugs
+account-color, owner decision 2026-08-13).
+
+`color` was previously **unvalidated everywhere**. Two different bugs sat under
+that:
+
+- `POST /accounts` bound `color or '#3b82f6'`, so an explicitly-sent `""` came
+  back as the default blue with a `201` — the caller's value silently replaced.
+- `POST /categories` — where `color` is *required* — bound it verbatim, so `""`
+  and `banana` were simply stored. Both `PUT` paths were unchecked too, which
+  meant create and update already disagreed about `""` on accounts.
+
+**Now:** every `color` on `POST`/`PUT` for accounts and categories must match
+`^#[0-9a-fA-F]{6}$`, else `422 VALIDATION_ERROR` with
+`fields: {"color": "Must be a 6-digit hex color, e.g. '#3b82f6'."}`. Rejected:
+`""`, whitespace, `banana`, `3b82f6` (no `#`), `#12`, `#fff` (3-digit shorthand),
+`#ff00ff00` (8-digit alpha), and any value with surrounding whitespace. `CHECK`
+constraints on both columns (`sql/031`) back the rule.
+
+**Unchanged:** omitting `color` on an account still yields `#3b82f6`; a valid
+value is stored **verbatim including case** (`#00AA00` stays `#00AA00` — the
+engine does not normalize what it accepted); categories still require the field.
+
+**What clients must do:**
+
+- **CLI** — `expense accounts create --color` and `expense accounts update
+  --color` document the flag as *"Color hint (free-form string)"*
+  (`expense/commands/accounts_cmd.py`). That is now false; update the help text
+  and expect a `422` for anything non-hex. The TUI's colour picker
+  (`tui/screens/create_forms.py`) only emits 6-digit hex and needs no change.
+- **Any client** with a free-text colour input should validate client-side for a
+  better message, but the engine's `422` is well-formed and renderable as-is
+  through the standard error path.
+
+No stored data changed: the live ledger's rows were already valid hex, so the
+migration is constraint-only with no backfill.
+
+---
+
 ## 2026-08-11 — completed reconciliations fully freeze their transactions; DELETE loses its `warnings` key; one PUT is one `version` bump
 
 **Engine change** (`helpers/transactions.py`, `helpers/query_builder.py`,

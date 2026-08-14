@@ -21,7 +21,7 @@ from uuid import UUID
 
 import asyncpg
 
-from app.constants import ActivityAction, SystemCategoryKey
+from app.constants import ActivityAction, DEFAULT_ACCOUNT_COLOR, SystemCategoryKey
 from app.errors import conflict, not_found, validation_error
 from app.helpers.account_balance import fetch_balance, fetch_home_balance
 from app.helpers.activity_log import write_activity_log
@@ -33,7 +33,7 @@ from app.helpers.query_builder import (
     soft_delete_with_audit,
 )
 from app.helpers.reference_data import name_taken, next_sort_order
-from app.helpers.validation import currency_code_error, normalize_name
+from app.helpers.validation import currency_code_error, normalize_name, validate_color
 from app.schemas.accounts import account_from_row
 
 
@@ -50,12 +50,15 @@ async def create_account(
 
     Raises:
         validation_error: ``currency_code`` is not in ``global_currencies``,
-            or the name is empty/whitespace.
+            the name is empty/whitespace, or ``color`` is not a 6-digit hex
+            value. An omitted ``color`` is not an invalid one — it falls to
+            ``DEFAULT_ACCOUNT_COLOR``.
         conflict: a non-deleted account with the same ``(name, currency_code)``
             already exists for this user (case-insensitive since sql/028), OR
             a resource with the same id already exists.
     """
     name = normalize_name(name)
+    validate_color(color)
 
     # Validate currency_code
     message = await currency_code_error(conn, currency_code)
@@ -82,7 +85,13 @@ async def create_account(
             user_id,
             name,
             currency_code,
-            color or "#3b82f6",
+            # `is not None`, not `or` — the same collapse that `or 0` caused for
+            # sort_order below, which was fixed while this one survived: an
+            # explicitly-sent color quietly became the default instead of being
+            # honoured or refused (bug account-color). Junk never reaches here now;
+            # validate_color above rejects it, so the only thing this expresses is
+            # omitted-vs-supplied.
+            color if color is not None else DEFAULT_ACCOUNT_COLOR,
             # Omitted sort_order appends; an explicit value (including 0) is
             # respected verbatim (the old `or 0` collapsed explicit zeros too).
             sort_order
@@ -197,11 +206,19 @@ async def update_account(
     — matches the prior router behaviour of treating empty-update as a fetch.
 
     Raises:
-        validation_error: attempting to change ``currency_code`` (immutable).
+        validation_error: attempting to change ``currency_code`` (immutable),
+            or ``color`` is not a 6-digit hex value.
         not_found: no active account with that id for this user.
         conflict: another non-deleted account already uses the new name with
             the same currency.
     """
+    # Same colour rule as create. Sits with the other field-shape checks, ahead
+    # of the ownership fetch, because it is a fact about the request rather than
+    # about the stored row — a 404 for someone else's account must not be
+    # preceded by a 422 that reveals nothing was wrong with the id.
+    if "color" in fields:
+        validate_color(fields["color"])
+
     # Reject currency_code changes
     if "currency_code" in fields:
         raise validation_error(
