@@ -10,11 +10,26 @@ The open items, in execution order: the bug burn-down, the People API, and the i
 
 The 2026-08-07 verification audit confirmed every previously closed bug is genuinely fixed (each pinned by a test) and these are what remain. **Detail lives only in [docs/open-bugs.md](docs/open-bugs.md)** — this entry is the schedule, not a second copy; delete a line here when its row leaves that file.
 
-1. **Seven ⚪ lows** — `restore_category` skips the reserved-name check (7.4-r); `?hashtag_id=` filter lacks `transaction_source = 1` (hashtag-filter — or fold into the inbox-hashtags feature below, whichever ships first); inbox titles stored verbatim, whitespace-only can promote (inbox-title, found 2026-08-08 — fix wants an owner call on 422-vs-NULL); `color or` collapses an explicit empty string to the default (account-color, found 2026-08-08 — needs a reject-vs-store decision); and the three remnants of 1.7 (`1.7-round`, `1.7-cache`, `1.7-archived`), of which `1.7-archived` should be left alone until a third currency is admitted.
+Three ⚪ lows remain, planned as two phases sequenced by cost of being wrong — the four
+independent single-file fixes landed together on 2026-08-13 as phase 1.
 
-*(1.7 was split 2026-08-13. Its one part that could put a visibly wrong number in front of the owner — no plausibility check on provider rates — was fixed the same day rather than scheduled: `_upsert_rate` now refuses a rate moving more than ±10% from the previous known one, `MAX_RATE_MOVE_FRACTION` in `app/jobs/fetch_exchange_rates.py`, pinned by `tests/test_fx_plausibility.py`. The three remainders are lows and are listed above.)*
+1. **`1.7-round`** — FX rounding split. `Decimal` through `exchange_rate.py` **plus**
+   `ROUND_HALF_UP` quantize at `account_balance.py`'s two rate×cents sites — note
+   `round(Decimal)` is still banker's rounding, so the type change alone fixes nothing.
+   Its own phase: the only remaining item that can produce a wrong number. Finishing it
+   means seeding a tie-producing rate in `tests/test_home_currency_parity.py` (today's
+   fixture multiplies 2500 cents by 2-decimal rates, so it can never produce a tie) and
+   converting that file's rate comparison to exact `Decimal` equality.
+2. **`account-color`** — reject anything that isn't a 6-digit hex color (owner decision
+   2026-08-13). Its own phase: ~10 files, a `sql/031` CHECK, and the only client-breaking
+   change left — `expense_world_CLI` documents `--color` as a free-form string.
+   Bigger than the bug row implies: `CategoryCreateRequest.color` is a **required**
+   unvalidated `str`, so `POST /categories {"color": ""}` stores `""` today.
+3. **`1.7-archived`** — leave alone. Inert under `sql/015`; fix it in the change that
+   lifts the currency CHECK, where it can actually be tested.
 
-**When it becomes blocking:** nothing here corrupts data today — that severity tier is empty — but the burn-down should still precede any new feature work.
+**When it becomes blocking:** nothing here corrupts data today — that severity tier is
+empty — but the burn-down should still precede any new feature work.
 
 ---
 

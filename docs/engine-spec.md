@@ -315,7 +315,9 @@ System categories (`is_system = true`) CAN be renamed — the engine identifies 
 Soft-delete. Returns `409` if the category is referenced by any non-deleted transaction (inbox or ledger). System categories (`is_system = true`) always return `403` — the opening-balance flow must always be able to find its category.
 
 ### `POST /categories/{id}/restore`
-Undoes a soft-delete. Returns `404` if no soft-deleted category with that id exists. Returns `409` if an active category already uses the same name (the name collision check prevents silent duplicates). Writes a `RESTORED` activity log entry.
+Undoes a soft-delete. Returns `404` if no soft-deleted category with that id exists. Returns `422` if the stored name is **reserved** for system categories (`@Opening`) and the row is not itself a system row — restore is the third write path into a category name, and it checks the same reserved-name rule `POST` and `PUT` do. Returns `409` if an active category already uses the same name (the name collision check prevents silent duplicates). Writes a `RESTORED` activity log entry.
+
+Order is `422` before `409`: a reserved name is a fact about the name itself, while a collision is a fact about the world it is being restored into — and only the second can be resolved by deleting the other row. *(Added 2026-08-13, bug 7.4-r. Bug 7.4 sealed `POST` and `PUT`, the two paths where the name is caller-supplied; restore takes the name off the stored row and so did not look like a name-write, which is how a user category that claimed `@Opening` before 7.4 could be soft-deleted and restored back into the squat.)*
 
 *(The `POST /categories/{id}/archive` / `/unarchive` routes and the archived-category attach guards were deleted with the `is_archived` column in `sql/024`. The soft-delete guards — `category_id` must reference an **active** category on every attach path — are untouched. Archived **accounts** still block attachment; see the account rules under Transactions and Inbox.)*
 
@@ -364,6 +366,12 @@ A supplied `account_id` or `category_id` must reference an active resource owned
 
 No inbox field accepts an explicit `null` — send a value or omit the key. *(The former `transfer` object, the one explicit-null exception, left with the 2026-08-10 transfer removal.)*
 
+**`title` is trimmed on write; whitespace-only becomes `null`** (create and `PUT` alike). A padded title keeps its content (`"  Coffee  "` → `"Coffee"`); a title that is only spaces, tabs or newlines is an unfilled field, not a value, and is stored as `null` — so the draft saves, stays out of `?ready=true`, and cannot promote until a real title is typed. `description` is **not** normalized: the ledger stores it verbatim, and normalizing it here would make a draft stricter than the row it becomes.
+
+> This produces a deliberate asymmetry worth stating plainly: `{"title": "   "}` succeeds and stores `null`, while `{"title": null}` is `422`. They are different kinds of statement. Whitespace is a field you left blank — the inbox is *"looser about which fields are null, never about how a field encodes its meaning"*, and this changes nullness only. An explicit `null` is a **clear** operation, which no inbox field offers; `extract_update_fields` refuses null everywhere so that an immutable field cannot be nulled to dodge its guard.
+>
+> *Considered and declined (2026-08-13): adding `title` to the nullable set, making `{"title": null}` a legal clear (precedent: `reconciliation_id`, "null means unassign"). It would remove the asymmetry, but it is a client-breaking change nobody asked for and it widens the null-is-not-a-verb rule for one field's convenience.*
+
 **Response shape:** native currency only, exactly as on a ledger row — `amount_cents` positive, with `transaction_type` carrying the direction. (The old response computed home-currency values from a stored `exchange_rate` whose `DEFAULT 1.0` was bug 1.4 — a $100 draft promoted as 100 PEN cents. Both columns died in `sql/021`.)
 
 Pass `?debit_as_negative=true` on `GET /inbox` or `GET /inbox/{id}` to have amounts returned negated for the outflow side (`transaction_type = 1`).
@@ -397,7 +405,7 @@ Promotes a ready inbox item to the ledger.
 - `id` — the client-supplied UUID for the newly-created ledger `expense_transactions` row.
 
 **Validation (engine enforces, not the client):**
-- `title` is present and not `'UNTITLED'`
+- `title` is present and not `'UNTITLED'` — and since inbox writes normalize it (below), a whitespace-only title is stored as `null` and so fails this arm rather than promoting a blank-looking ledger row
 - `amount_cents` is present and not zero
 - `date` is present and `≤ now()`
 - `account_id` is present and references an active, non-archived account
