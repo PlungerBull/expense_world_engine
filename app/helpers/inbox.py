@@ -42,6 +42,7 @@ from app.helpers.validation import (
     MSG_USER_CATEGORY,
     active_account_row,
     active_category_row,
+    clean_name,
     db_now,
     extract_update_fields,
     reject_zero_amount,
@@ -106,7 +107,24 @@ async def create_inbox_item(
             """,
             body.id,
             user_id,
-            body.title,
+            # A whitespace-only title is an unfilled field, not a value. Stored
+            # verbatim it was truthy, so it passed both readiness definitions
+            # and promoted into the ledger as a blank-looking row — bypassing the
+            # trim-and-reject rule every direct ledger write applies (bug
+            # inbox-title, owner decision 2026-08-13). `clean_name` maps it to
+            # NULL, which both readiness guards already handle correctly; the
+            # draft simply stays not-ready until a real title is typed.
+            #
+            # `clean_name`, not `normalize_name`: the ledger rejects an empty
+            # title because the column is NOT NULL and the row is final. A draft
+            # is allowed to be incomplete — CLAUDE.md's inbox carve-out is
+            # looseness about *which fields are null*, never about how a field
+            # encodes its meaning, and this changes nullness only.
+            #
+            # `description` is deliberately untouched: the ledger stores it
+            # verbatim, so normalizing it here would make the draft stricter
+            # than the row it becomes.
+            clean_name(body.title),
             body.description,
             amount_cents,
             transaction_type,
@@ -152,6 +170,16 @@ async def update_inbox_item(
             conn, "expense_transaction_inbox", inbox_id, user_id, "inbox item"
         )
         return inbox_from_row(row)
+
+    # Same title rule as create — see the comment on the INSERT bind. Applied
+    # before the row is fetched because it is a property of the input, not of
+    # the stored state. An explicit `{"title": null}` never reaches here:
+    # extract_update_fields already rejects it 422, since null is not a verb on
+    # this endpoint. Whitespace and explicit-null therefore differ, deliberately:
+    # one is a field you left blank, the other is a clear operation the inbox
+    # does not offer.
+    if "title" in fields:
+        fields["title"] = clean_name(fields["title"])
 
     # Collect the signed input. As on create, signs live only in this block.
     primary_signed: Optional[int] = None
