@@ -28,6 +28,55 @@ must do.
 
 ---
 
+## 2026-08-14 ⚠️ BREAKING — `POST /inbox/{id}/restore` is gone
+
+**Engine change** (`app/routers/inbox.py`, `app/helpers/inbox.py`; no SQL
+migration; owner decision 2026-08-14).
+
+**Dismissing a draft is now final.** The route that un-dismissed a soft-deleted
+inbox item no longer exists. Every other soft-deletable resource still has its
+restore endpoint — the inbox is the single, stated exception to the spec's
+Restore semantics convention, because a draft is not a financial record. It is
+something the user wrote; deciding it was wrong and dismissing it is the end of
+it.
+
+### What breaks
+
+- **Any call to `POST /v1/inbox/{id}/restore` now returns `404`** — the route is
+  unregistered, so the response is FastAPI's unmatched-route 404, not the
+  engine's `NOT_FOUND` envelope for a missing row. A client that distinguishes
+  the two will see the difference.
+- **The `409` "Inbox item was promoted to the ledger…" error is gone with it.**
+  It only ever came from this route.
+
+### What the client must do
+
+- Remove the undo affordance from the inbox delete flow (undo prompt, toast
+  action, `inbox restore` command — whatever exists).
+- **Confirm before deleting instead.** There is no in-app way back now, so the
+  confirmation is the safety net. A mis-tapped delete means retyping the draft.
+- Nothing else about `DELETE /inbox/{id}` changed: same `200`, same response
+  body, same `status = 1` + `deleted_at` end state.
+
+### What does *not* change
+
+- The delete is still **soft**. The row keeps its data, `GET /inbox?include_deleted=true`
+  still lists it, and the activity log still holds the `CREATED`/`DELETED`
+  snapshots — so a genuinely painful mistake is recoverable by hand at the
+  database, just not through the API.
+- Every other restore endpoint is untouched: accounts, categories, hashtags,
+  transactions, reconciliations.
+- To undo a *promotion*, the answer is unchanged and was never this route:
+  delete the ledger transaction.
+
+### Engine references
+
+- `docs/engine-spec.md` §Restore semantics (the inbox exception), §`DELETE /inbox/{id}`
+- `app/helpers/inbox.py` module docstring — "No restore (owner decision 2026-08-14)"
+- `tests/test_restore_endpoints.py` — pins the route's absence
+
+---
+
 ## 2026-08-14 ➕ ADDITIVE — the People API ships (`POST /people`)
 
 **Engine change** (`app/routers/people.py` new; `helpers/accounts.py`,

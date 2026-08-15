@@ -19,6 +19,22 @@ ledger (sql/022), so writing the row IS the balance change.
 The inbox row is locked with ``FOR UPDATE`` at the start of the promote
 flow so two concurrent promotes can't create duplicate transactions
 from the same inbox item.
+
+## No restore (owner decision 2026-08-14)
+
+There is no ``restore_inbox_item`` and no ``POST /inbox/{id}/restore``.
+Every other soft-deletable resource has one — the spec's "Restore
+semantics" convention names the inbox as its single exception, because
+a draft is the one thing here that is not a financial record. A draft
+is something you wrote; deciding it was wrong and dismissing it is the
+end of it, not a state to come back from.
+
+Delete stays a *soft* delete regardless: the row keeps its data,
+``?include_deleted=true`` still lists it, and the activity log still
+holds the before-snapshot. Nothing is erased — there is simply no route
+that un-dismisses. (The route that used to exist also carried a 409 arm
+for promoted rows, guarding against a second promote of the same draft;
+removing the route removes that hazard rather than managing it.)
 """
 
 from typing import Optional
@@ -32,7 +48,6 @@ from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import (
     dynamic_update,
     fetch_owned_row_or_404,
-    restore_with_audit,
     soft_delete_with_audit,
 )
 from app.helpers.transactions import attach_hashtag_ids, insert_transaction_row
@@ -248,51 +263,6 @@ async def delete_inbox_item(
     )
 
     return await soft_delete_with_audit(
-        conn, user_id, "expense_transaction_inbox", "inbox", row, inbox_from_row
-    )
-
-
-# ---------------------------------------------------------------------------
-# Restore
-# ---------------------------------------------------------------------------
-
-async def restore_inbox_item(
-    conn: asyncpg.Connection,
-    user_id: str,
-    inbox_id: str,
-) -> dict:
-    """Undo a soft-delete on a PENDING inbox item.
-
-    Only restores rows whose status is still PENDING — i.e., rows that
-    were dismissed before being promoted. Promoted rows (status = 2) are
-    deliberately NOT restorable here: the ledger transaction they created
-    still exists, so "restoring" the inbox side would leave the user one
-    promote-click away from a duplicate ledger row. To undo a promotion
-    the correct path is to delete the ledger transaction; once transaction
-    restore ships, clients can chain the two operations themselves.
-
-    The status guard uses ``!= PENDING`` (not ``== PROMOTED``) so any
-    future status value the spec adds is rejected by default rather than
-    silently accepted.
-
-    Raises:
-        not_found: no soft-deleted inbox row with that id for this user.
-        conflict: the row is soft-deleted but was promoted — restore is
-            not the right gesture; client should delete the ledger row
-            instead.
-    """
-    row = await fetch_owned_row_or_404(
-        conn, "expense_transaction_inbox", inbox_id, user_id, "inbox item",
-        deleted=True,
-    )
-
-    if row["status"] != InboxStatus.PENDING:
-        raise conflict(
-            "Inbox item was promoted to the ledger. Delete the ledger "
-            "transaction to undo the promotion."
-        )
-
-    return await restore_with_audit(
         conn, user_id, "expense_transaction_inbox", "inbox", row, inbox_from_row
     )
 

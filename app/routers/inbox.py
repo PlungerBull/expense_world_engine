@@ -183,23 +183,8 @@ async def delete_inbox_item(
     )
 
 
-# ---------------------------------------------------------------------------
-# POST /inbox/{inbox_id}/restore
-# ---------------------------------------------------------------------------
-@router.post("/{inbox_id}/restore", response_model=InboxResponse)
-async def restore_inbox_item(
-    inbox_id: UUID,
-    auth_user: CurrentUser,
-    x_idempotency_key: IdempotencyKey = None,
-):
-    return await run_idempotent(
-        auth_user.id,
-        x_idempotency_key,
-        status_code=200,
-        work=lambda conn: inbox_service.restore_inbox_item(
-            conn, auth_user.id, inbox_id,
-        ),
-    )
+# There is deliberately no POST /inbox/{id}/restore — see helpers/inbox.py's
+# module docstring. Dismissing a draft is final.
 
 
 # ---------------------------------------------------------------------------

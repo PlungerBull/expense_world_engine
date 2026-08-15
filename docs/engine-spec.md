@@ -51,7 +51,9 @@ This holds on **every** amount-bearing column in **every** table — no column's
 
 **Soft-deleted records:** Excluded from all list responses by default. Pass `?include_deleted=true` to include them.
 
-**Restore semantics:** Every resource with a delete endpoint also exposes `POST /{resource}/{id}/restore`. Restores clear `deleted_at` and write a `RESTORED` activity log entry. See per-resource sections for collision rules (e.g., restoring a category whose name now collides with an active one returns `409`).
+**Restore semantics:** Every resource with a delete endpoint also exposes `POST /{resource}/{id}/restore`, **with one exception: the inbox** (see below). Restores clear `deleted_at` and write a `RESTORED` activity log entry. See per-resource sections for collision rules (e.g., restoring a category whose name now collides with an active one returns `409`).
+
+> **The inbox exception** (owner decision 2026-08-14). `DELETE /inbox/{id}` has no inverse. Every other soft-deletable resource here is a financial record or a label attached to one; a draft is neither — it is something the user wrote and can decide was wrong. Dismissing it is that decision, and it is final. The delete is still *soft* (the row keeps its data, `?include_deleted=true` still lists it, the activity log holds the before-snapshot); there is simply no route that un-dismisses. The cost is stated plainly: a mis-tapped delete means retyping the draft. *(This also retired the route's `409` arm for promoted rows, which existed to stop a restored-then-re-promoted draft from duplicating a ledger row — a hazard removed rather than managed.)*
 
 **Optimistic locking:** All mutable resources include a `version` field in responses, incremented on every update. Clients can use this for conflict detection.
 
@@ -411,14 +413,9 @@ Partial update. Re-evaluates promotion readiness after every update. Date and ac
 An `account_id` or `category_id` present in the update follows the same reference rule as `POST /inbox`; references the update does not touch are not re-validated — a draft whose account has since died stays editable, and promote remains the gate.
 
 ### `DELETE /inbox/{id}`
-Soft-delete. Sets `deleted_at = now()` without touching `status`, so the row remains `status = 1` (PENDING) + `deleted_at IS NOT NULL` — distinct from the PROMOTED end-state (`status = 2` + `deleted_at IS NOT NULL`).
+Dismiss a draft. Soft-delete: sets `deleted_at = now()` without touching `status`, so the row remains `status = 1` (PENDING) + `deleted_at IS NOT NULL` — distinct from the PROMOTED end-state (`status = 2` + `deleted_at IS NOT NULL`).
 
-### `POST /inbox/{id}/restore`
-Undoes a soft-delete on a **pending** inbox item (`status = 1`). Clears `deleted_at` and writes a `RESTORED` activity log entry.
-
-Returns `409 CONFLICT` if the row is soft-deleted but `status != 1` — promoted inbox items are not restorable here because the ledger transaction they created still exists, and restoring the inbox side would leave the user one promote-click away from a duplicate ledger row. The error message points the client at the ledger: to undo a promotion, delete the ledger transaction instead.
-
-Returns `404 NOT_FOUND` if no soft-deleted inbox row with that id exists (including "row exists but is still active" — use that route's natural affordances instead).
+**This is final — there is no `POST /inbox/{id}/restore`** (owner decision 2026-08-14; the route existed until then). The inbox is the one exception to the Restore semantics convention above, and the reasoning is there: a draft is not a financial record. The row and its history survive; the way back does not.
 
 ### `POST /inbox/{id}/promote`
 Promotes a ready inbox item to the ledger.
@@ -452,7 +449,7 @@ If any condition fails, returns `422` with **all** the failing fields, not just 
 
 There is no balance step in this list, or in any other write flow below — an account's balance is the signed sum of its non-deleted transactions, computed at read time (`sql/022`), so inserting the row **is** the balance change. There is no rate step either — conversion happens at read time (`sql/021`).
 
-`status = 2` distinguishes a promoted inbox item from a dismissed one (which stays at `status = 1` with `deleted_at` set) — both end up soft-deleted, but the reason is preserved via the status column. Only the PENDING + deleted combination is restorable via `POST /inbox/{id}/restore`.
+`status = 2` distinguishes a promoted inbox item from a dismissed one (which stays at `status = 1` with `deleted_at` set) — both end up soft-deleted, but the reason is preserved via the status column. Neither is restorable (there is no inbox restore route); the distinction is what the activity log and `?include_deleted=true` read back, and what stops a promoted draft from ever being counted as still pending.
 
 Returns the newly created `expense_transactions` object.
 

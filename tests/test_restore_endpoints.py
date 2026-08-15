@@ -3,10 +3,10 @@
 The transaction restore path has its own dedicated test file
 (`test_transaction_restore.py`) because its inverse logic is intricate
 (balance re-apply, junction precision, reconciliation handling).
-The five endpoints covered here are the
-"simpler" restores — accounts, categories, hashtags, reconciliations,
-and pending inbox items — but each carries its own resource-specific
-guard rail that this file pins down:
+The four endpoints covered here are the
+"simpler" restores — accounts, categories, hashtags and reconciliations —
+but each carries its own resource-specific guard rail that this file
+pins down:
 
   * Accounts: round-trip (clear deleted_at, RESTORED activity entry).
   * Categories: same, plus a name-collision check that returns 409 when
@@ -16,11 +16,10 @@ guard rail that this file pins down:
     re-tag transactions the user may no longer want labeled).
   * Reconciliations: round-trip (transactions unassigned during the
     delete are NOT re-linked on restore — same reasoning as hashtags).
-  * Inbox: PENDING items restore cleanly; PROMOTED items return 409
-    pointing the client at the ledger transaction (the underlying
-    promote created a ledger row that's still alive, so restoring the
-    inbox row would put the user one promote-click away from a
-    duplicate ledger entry).
+  * Inbox: the exception — there is NO restore route (owner decision
+    2026-08-14). A draft is not a financial record; dismissing it is
+    final. The tests at the end of this file pin the route's absence
+    and the fact that the delete is still soft.
 
 Run: .venv/bin/pytest tests/test_restore_endpoints.py -v
 """
@@ -428,114 +427,66 @@ async def test_restore_reconciliation_round_trip(client, test_data):
 
 
 # ---------------------------------------------------------------------------
-# Inbox restore — pending OK, promoted blocked
+# Inbox — the exception: dismissing a draft is final
 # ---------------------------------------------------------------------------
 
 
+def test_inbox_restore_route_does_not_exist():
+    """No `POST /inbox/{id}/restore` is registered — owner decision 2026-08-14.
+
+    Asserted against the route table rather than a response code so it
+    fails for the right reason: a 404 could equally mean "route exists,
+    row missing", which is what the two tests this replaced would have
+    started returning if the route had been silently unregistered.
+    """
+    from app.main import app
+
+    paths = {route.path for route in app.routes}
+    assert "/v1/inbox/{inbox_id}" in paths, "fixture assumption — inbox routes moved"
+    assert "/v1/inbox/{inbox_id}/restore" not in paths, (
+        "The inbox restore route is back. A draft is not a financial record: "
+        "dismissing it is final (engine-spec §Restore semantics, the inbox "
+        "exception)."
+    )
+
+
 @pytest.mark.asyncio
-async def test_restore_pending_inbox_item_round_trip(client, test_data):
-    """A dismissed (PENDING + deleted_at) inbox item restores cleanly."""
+async def test_dismissed_inbox_item_stays_dismissed(client, test_data):
+    """The delete is soft and the data survives — there is just no way back.
+
+    Pins both halves of the decision: `?include_deleted=true` still reads
+    the dismissed draft (nothing is erased), and the restore attempt 404s
+    because no such route exists.
+    """
     inbox_id = str(uuid.uuid4())
     await client.post(
         "/v1/inbox",
-        json={"id": inbox_id, "title": f"restore-inbox-{uuid.uuid4()}"},
+        json={"id": inbox_id, "title": f"dismissed-{uuid.uuid4()}"},
         headers={"X-Idempotency-Key": str(uuid.uuid4())},
     )
 
     try:
-        await client.delete(
+        delete_r = await client.delete(
             f"/v1/inbox/{inbox_id}",
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
+        assert delete_r.status_code == 200, delete_r.text
+        assert delete_r.json()["deleted_at"] is not None
+        assert delete_r.json()["status"] == 1  # PENDING + deleted, not PROMOTED
+
         restore_r = await client.post(
             f"/v1/inbox/{inbox_id}/restore",
             headers={"X-Idempotency-Key": str(uuid.uuid4())},
         )
-        assert restore_r.status_code == 200, restore_r.text
-        body = restore_r.json()
-        assert body["deleted_at"] is None
-        assert body["status"] == 1  # PENDING
+        assert restore_r.status_code == 404, restore_r.text
 
-        assert await _activity_actions(inbox_id, test_data.user_id) == [1, 3, 4]
+        # Soft, not hard: the row is still readable on request.
+        listed = await client.get("/v1/inbox?include_deleted=true&limit=200")
+        assert listed.status_code == 200, listed.text
+        assert inbox_id in {item["id"] for item in listed.json()["items"]}
+
+        # CREATED then DELETED — and no RESTORED, ever.
+        assert await _activity_actions(inbox_id, test_data.user_id) == [1, 3]
 
     finally:
         await _cleanup_inbox(inbox_id, test_data.user_id)
-
-
-@pytest.mark.asyncio
-async def test_restore_promoted_inbox_item_returns_409(client, test_data):
-    """A promoted inbox item (status=2) is soft-deleted as part of the
-    promote flow but is NOT restorable here — the ledger transaction it
-    created still exists, so restoring would put the user one
-    promote-click from a duplicate ledger row. The 409 message points
-    the client at the ledger.
-    """
-    inbox_id = str(uuid.uuid4())
-    txn_id = str(uuid.uuid4())
-
-    # Create a fully-formed inbox item ready to promote.
-    create_r = await client.post(
-        "/v1/inbox",
-        json={
-            "id": inbox_id,
-            "title": f"promotable-{uuid.uuid4()}",
-            "amount_cents": -250,
-            "date": "2026-04-12T12:00:00Z",
-            "account_id": test_data.account_id,
-            "category_id": test_data.category_id,
-        },
-        headers={"X-Idempotency-Key": str(uuid.uuid4())},
-    )
-    assert create_r.status_code == 201, create_r.text
-
-    promote_r = await client.post(
-        f"/v1/inbox/{inbox_id}/promote",
-        json={"id": txn_id},
-        headers={"X-Idempotency-Key": str(uuid.uuid4())},
-    )
-    assert promote_r.status_code == 200, promote_r.text
-
-    try:
-        # Inbox row is now status=2 + deleted_at IS NOT NULL.
-        async with db.pool.acquire() as conn:
-            inbox_row = await conn.fetchrow(
-                "SELECT status, deleted_at FROM expense_transaction_inbox WHERE id = $1",
-                inbox_id,
-            )
-        assert inbox_row["status"] == 2
-        assert inbox_row["deleted_at"] is not None
-
-        restore_r = await client.post(
-            f"/v1/inbox/{inbox_id}/restore",
-            headers={"X-Idempotency-Key": str(uuid.uuid4())},
-        )
-        assert restore_r.status_code == 409, restore_r.text
-        error = restore_r.json()["error"]
-        assert error["code"] == "CONFLICT"
-        assert "ledger" in error["message"].lower(), (
-            f"409 message should redirect to the ledger; got {error['message']!r}"
-        )
-
-        # State unchanged — inbox row still soft-deleted with status=2.
-        async with db.pool.acquire() as conn:
-            inbox_row_after = await conn.fetchrow(
-                "SELECT status, deleted_at FROM expense_transaction_inbox WHERE id = $1",
-                inbox_id,
-            )
-        assert inbox_row_after["status"] == 2
-        assert inbox_row_after["deleted_at"] is not None
-
-    finally:
-        async with db.pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM activity_log WHERE resource_id = ANY($1::uuid[]) AND user_id = $2",
-                [inbox_id, txn_id], test_data.user_id,
-            )
-            await conn.execute(
-                "DELETE FROM expense_transactions WHERE id = $1 AND user_id = $2",
-                txn_id, test_data.user_id,
-            )
-            await conn.execute(
-                "DELETE FROM expense_transaction_inbox WHERE id = $1 AND user_id = $2",
-                inbox_id, test_data.user_id,
-            )
