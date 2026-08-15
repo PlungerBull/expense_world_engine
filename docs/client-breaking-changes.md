@@ -260,6 +260,54 @@ them to `archived_people` and makes the engine refuse to record against them.
 
 ---
 
+## 2026-08-13 — FX correctness batch: home-cent rounding unified, implausible provider rates refused
+
+**Engine change** (`helpers/exchange_rate.py`, `helpers/account_balance.py`,
+`jobs/fetch_exchange_rates.py`; `sql/032`; open-bugs 1.7 split + fx-store-float,
+owner decisions 2026-08-13). Four related FX fixes. No request or response
+*shape* changes anywhere — this entry exists because two of the fixes can move
+a *value* a client renders.
+
+**1. Python-side conversion now rounds half-up, the way Postgres does.** The
+accounts list and dashboard converted rate × cents with banker's rounding while
+every report figure used SQL `round(numeric)` (half-up), so a half-cent product
+differed by one cent between surfaces: at rate 3.3373 a $50.00 balance was
+S/166.87 in a report and S/166.86 on `GET /accounts`.
+`current_balance_home_cents` on `/accounts` and `/dashboard` can therefore
+shift by one cent on exact half-cent values — and now always agrees with the
+monthly report and dashboard flow figures.
+
+**2. The fetch job refuses implausible provider rates.** A rate moving more
+than ±10% from the most recent stored rate within 7 days is not stored
+(misplaced-decimal protection: `33.373` for `3.3373` would previously have
+stood all day, since the first rate written for a date wins). A refused date
+simply has no row; every read carries forward the last good rate and
+self-heals the moment a sane one lands. Client-visible only as: `rate_date`
+can trail `date` in `GET /exchange-rates` on such a day — which is the
+standing staleness signal (`rate_date < date`), not a new field.
+
+**3–4. Fidelity fixes, not wire changes:** stored rates now hold the
+provider's exact decimal digits instead of a bound float's binary expansion
+(`parse_float=Decimal`; `sql/032` rewrites all 893 pre-existing rows,
+losslessly — every rewrite was verified to round-trip), and a *missing*-rate
+cache entry now expires after 60s instead of an hour, so a backfilled rate is
+picked up promptly. `rate` stays `float` on the wire and serializes to the
+same JSON number as before.
+
+**What the client must do:** nothing. If the TUI caches home-cent figures,
+expect one-cent shifts on half-cent conversions; the cross-surface
+disagreement those could produce is gone.
+
+### Engine references
+
+- `tests/test_home_currency_parity.py` (SQL/Python conversions now pinned
+  exactly equal), `tests/test_fx_plausibility.py`,
+  `tests/test_fx_decimal_fidelity.py`, `tests/test_rate_cache.py`
+- `docs/engine-spec.md` — §Rate ingestion (plausibility band), the
+  `rate_date < date` staleness contract under `GET /exchange-rates`
+
+---
+
 ## 2026-08-13 — `color` must be a 6-digit hex value
 
 **Engine change** (`helpers/validation.validate_color`, `helpers/accounts.py`,
@@ -299,6 +347,74 @@ engine does not normalize what it accepted); categories still require the field.
 
 No stored data changed: the live ledger's rows were already valid hex, so the
 migration is constraint-only with no backfill.
+
+---
+
+## 2026-08-13 — inbox titles are trimmed; a whitespace-only title is an unfilled field
+
+**Engine change** (`helpers/inbox.py`; open-bugs inbox-title, owner decision
+2026-08-13). `POST /inbox` and `PUT /inbox/{id}` now pass `title` through the
+same trim the ledger has always applied: surrounding whitespace is stripped,
+and an empty or whitespace-only title is stored as `null` — the draft still
+saves (that is what the inbox is for), but the field counts as unfilled.
+
+### What breaks
+
+- **A title no longer round-trips byte-for-byte.** `"  Coffee  "` comes back
+  `"Coffee"` on the write response and every later read.
+- **A whitespace-only title no longer makes a draft ready.** `{"title": "   "}`
+  was previously stored verbatim, passed both readiness checks, and promoted
+  into the ledger as a blank-looking row. Now it stores `title: null`, the
+  draft is excluded from `GET /inbox?ready=true`, and
+  `POST /inbox/{id}/promote` returns the standing `422`
+  `"Inbox item is not ready to promote."` until a real title is typed.
+
+### What does *not* change
+
+- **`{"title": null}` is still `422`** — deliberately asymmetric: whitespace
+  is a field left blank, explicit null is a clear operation the inbox does not
+  offer (no inbox field accepts explicit null).
+- `description` is untouched — stored verbatim, exactly as the ledger stores it.
+- The ledger side is unchanged: direct transaction writes have always trimmed
+  titles and rejected empty ones with `422`.
+
+**What the client must do:** nothing structurally. Drop any assumption that a
+saved draft's title equals the sent string, and treat `title: null` coming
+back after sending whitespace as "unfilled", not an error.
+
+### Engine references
+
+- `tests/test_inbox_title_normalization.py` (the new pins)
+- `docs/engine-spec.md` — §`POST /inbox` (the trim rule and the
+  whitespace-vs-null asymmetry), §readiness definition
+
+---
+
+## 2026-08-13 — restoring a category re-checks the reserved-name rule
+
+**Engine change** (`helpers/categories.py`; open-bugs 7.4-r, closing the gap
+the bug 7.4 create/update guard left). `POST /categories/{id}/restore` now
+rejects a soft-deleted *user* category whose stored name is reserved for
+system categories (today: `@Opening`, compared case-insensitively) with
+`422 VALIDATION_ERROR`
+(`fields: {"name": "'…' is reserved for system categories."}`). Restore was
+the third write path into a category name and the one the original guard
+missed — the name comes off the stored row, not the request, so a pre-guard
+squatter could be soft-deleted and restored straight back into the squat that
+breaks opening-balance seeding.
+
+**What breaks:** only the restore of a squatter row created before the
+create/update guard shipped — no API call since then can have produced one.
+The `422` is checked before the existing name-collision `409`, which is
+unchanged for ordinary names.
+
+**What the client must do:** nothing — render the `422` through the standard
+error path like every other restore rejection.
+
+### Engine references
+
+- `tests/test_reserved_category_names.py` (the restore pins)
+- `docs/engine-spec.md` — §Reserved names
 
 ---
 
