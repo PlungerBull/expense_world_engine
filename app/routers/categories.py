@@ -42,7 +42,7 @@ async def list_categories(
             from_sql="expense_categories",
             conditions=conditions,
             params=params,
-            order_by="is_system DESC, sort_order ASC, created_at ASC",
+            order_by="(system_key IS NOT NULL) DESC, sort_order ASC, created_at ASC",
             limit=limit,
             offset=offset,
         )

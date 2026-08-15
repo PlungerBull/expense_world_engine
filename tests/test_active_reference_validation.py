@@ -255,9 +255,9 @@ async def test_inbox_create_rejects_inactive_references(client, test_data):
         )
         await conn.execute(
             """INSERT INTO expense_categories
-                (id, user_id, name, color, is_system, sort_order,
+                (id, user_id, name, color, sort_order,
                  created_at, updated_at, deleted_at)
-               VALUES ($1, $2, 'inbox-ref deleted cat', '#FF0000', false, 0,
+               VALUES ($1, $2, 'inbox-ref deleted cat', '#FF0000', 0,
                  now(), now(), now())""",
             deleted_category, test_data.user_id,
         )
@@ -276,9 +276,9 @@ async def test_inbox_create_rejects_inactive_references(client, test_data):
         )
         await conn.execute(
             """INSERT INTO expense_categories
-                (id, user_id, name, color, is_system, sort_order,
+                (id, user_id, name, color, sort_order,
                  created_at, updated_at)
-               VALUES ($1, $2, 'B category', '#FF0000', false, 0,
+               VALUES ($1, $2, 'B category', '#FF0000', 0,
                  now(), now())""",
             category_b, user_b,
         )

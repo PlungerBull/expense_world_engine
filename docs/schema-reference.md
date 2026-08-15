@@ -10,8 +10,10 @@
 > `sql/032` is data-only (rewrote 893 `exchange_rates.rate` values to the provider's published
 > digits, bug fx-store-float) and changes nothing described here.
 > Amended 2026-08-14 for the inbox-hashtag migration (`sql/033` — no column changes; one CHECK
-> widened, one UNIQUE key gained a column).
-> **14 tables, 123 columns.**
+> widened, one UNIQUE key gained a column), then 2026-08-15 for `sql/034`
+> (`expense_categories.is_system` dropped — a stored derivable; the wire field is now computed
+> from `system_key`).
+> **14 tables, 122 columns.**
 
 ---
 
@@ -300,16 +302,18 @@ expense_categories
                 — display label. Free to rename, including for system categories.
   - color       text, NOT NULL, default '#6b7280'
                 CHECK categories_color_is_hex: IS NOT NULL AND ~ '^#[0-9a-fA-F]{6}$' (sql/031)
-  - is_system   boolean, NOT NULL, default false
-                — true for system-managed categories (@Opening).
-                  Cannot be deleted.
   - system_key  text, nullable
                 — immutable discriminator for system categories
                   ('opening_balance' — the only value since the transfer removal
                   deleted 'debt'/'transfer', 2026-08-10). NULL for regular
                   user-created categories. The engine looks up system rows by
                   (user_id, system_key) so display renames are safe — added in
-                  sql/010.
+                  sql/010. Since sql/034 this column is also the *policy* bit:
+                  the wire's `is_system` flag, the delete guard, and the
+                  user-category-only assignment rule all derive from its
+                  null-ness (the stored `is_system` boolean was a derivable
+                  copy with no CHECK tying the two together — same doctrine
+                  as sql/022: derived values are computed, never stored).
   - sort_order  integer, NOT NULL, default 0
   - created_at  timestamptz, NOT NULL, default now()
   - updated_at  timestamptz, NOT NULL, default now()

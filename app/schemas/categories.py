@@ -25,6 +25,8 @@ class CategoryResponse(BaseModel):
     user_id: str
     name: str
     color: str
+    # Derived, not stored (sql/034): true iff system_key is non-null. Kept on
+    # the wire so clients don't each re-derive the delete/assign guard.
     is_system: bool
     # Immutable discriminator ('opening_balance'), null for user categories.
     # Not an IDs-only violation: it is identity, not a hydrated copy of the
@@ -42,7 +44,7 @@ def category_from_row(row) -> dict:
         **owned_fields(row),
         name=row["name"],
         color=row["color"],
-        is_system=row["is_system"],
+        is_system=row["system_key"] is not None,
         system_key=row["system_key"],
         sort_order=row["sort_order"],
         **audit_fields(row),

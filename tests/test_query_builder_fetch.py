@@ -23,9 +23,9 @@ async def category_row(test_data):
     async with db.pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO expense_categories
-                (id, user_id, name, color, is_system, sort_order,
+                (id, user_id, name, color, sort_order,
                  created_at, updated_at)
-               VALUES ($1, $2, 'fetch-owned-row probe', '#123456', false, 0,
+               VALUES ($1, $2, 'fetch-owned-row probe', '#123456', 0,
                  now(), now())""",
             category_id, test_data.user_id,
         )

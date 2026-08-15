@@ -237,7 +237,7 @@ async def create_transaction(
     # The field-level error remains the authoritative signal for clients.
     await validate_active_account(conn, body.account_id, user_id)
     category = await validate_active_category(conn, body.category_id, user_id)
-    if not allow_system_category and category["is_system"]:
+    if not allow_system_category and category["system_key"] is not None:
         raise validation_error(
             "Category validation failed.",
             {"category_id": MSG_USER_CATEGORY},
@@ -423,7 +423,7 @@ async def update_transaction(
         category = await validate_active_category(
             conn, fields["category_id"], user_id
         )
-        if category["is_system"]:
+        if category["system_key"] is not None:
             raise validation_error(
                 "Category validation failed.",
                 {"category_id": MSG_USER_CATEGORY},

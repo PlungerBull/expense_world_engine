@@ -109,8 +109,8 @@ async def _ensure_test_data(conn, data: TestData):
         )
         await conn.execute(
             """INSERT INTO expense_categories
-                (id, user_id, name, color, is_system, sort_order, created_at, updated_at)
-               VALUES ($1, $2, 'Test Category', '#FF0000', false, 1, now(), now())""",
+                (id, user_id, name, color, sort_order, created_at, updated_at)
+               VALUES ($1, $2, 'Test Category', '#FF0000', 1, now(), now())""",
             data.category_id, data.user_id,
         )
         await conn.execute(

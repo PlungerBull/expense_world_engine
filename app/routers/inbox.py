@@ -83,7 +83,7 @@ async def list_inbox(
                 "(i.category_id IS NOT NULL AND EXISTS ("
                 "SELECT 1 FROM expense_categories c "
                 "WHERE c.id = i.category_id AND c.user_id = i.user_id "
-                "AND c.deleted_at IS NULL AND c.is_system = false))"
+                "AND c.deleted_at IS NULL AND c.system_key IS NULL))"
             )
 
         if overdue:

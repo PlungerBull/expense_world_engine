@@ -154,9 +154,9 @@ async def test_batch_distinguishes_deleted_from_system(client, test_data):
     async with db.pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO expense_categories
-                (id, user_id, name, color, is_system, sort_order,
+                (id, user_id, name, color, sort_order,
                  created_at, updated_at, deleted_at)
-               VALUES ($1, $2, $3, '#123456', false, 0,
+               VALUES ($1, $2, $3, '#123456', 0,
                  now(), now(), now())""",
             deleted_id, test_data.user_id, f"syscat-deleted {uuid.uuid4().hex[:8]}",
         )

@@ -114,8 +114,8 @@ async def test_seeding_over_prefix_squatter_row_raises_409_not_500():
             )
             await conn.execute(
                 """INSERT INTO expense_categories
-                    (id, user_id, name, color, is_system, sort_order, created_at, updated_at)
-                   VALUES ($1, $2, '@opening', '#111111', false, 1, now(), now())""",
+                    (id, user_id, name, color, sort_order, created_at, updated_at)
+                   VALUES ($1, $2, '@opening', '#111111', 1, now(), now())""",
                 str(uuid.uuid4()), squat_user_id,
             )
             with pytest.raises(AppError) as exc_info:
@@ -149,9 +149,9 @@ async def test_restore_rejects_a_soft_deleted_reserved_name(client, test_data):
         try:
             await conn.execute(
                 """INSERT INTO expense_categories
-                    (id, user_id, name, color, is_system, sort_order,
+                    (id, user_id, name, color, sort_order,
                      created_at, updated_at, deleted_at)
-                   VALUES ($1, $2, '@Opening', '#111111', false, 97,
+                   VALUES ($1, $2, '@Opening', '#111111', 97,
                            now(), now(), now())""",
                 category_id, test_data.user_id,
             )
@@ -187,9 +187,9 @@ async def test_restore_of_an_ordinary_name_is_unaffected(client, test_data):
         try:
             await conn.execute(
                 """INSERT INTO expense_categories
-                    (id, user_id, name, color, is_system, sort_order,
+                    (id, user_id, name, color, sort_order,
                      created_at, updated_at, deleted_at)
-                   VALUES ($1, $2, 'Groceries 7.4r', '#111111', false, 97,
+                   VALUES ($1, $2, 'Groceries 7.4r', '#111111', 97,
                            now(), now(), now())""",
                 category_id, test_data.user_id,
             )

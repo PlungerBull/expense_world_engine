@@ -67,9 +67,9 @@ async def fx(test_data, db_pool):
             )
         await conn.execute(
             """INSERT INTO expense_categories
-                (id, user_id, name, color, is_system, sort_order,
+                (id, user_id, name, color, sort_order,
                  created_at, updated_at)
-               VALUES ($1, $2, $3, '#116644', false, 97, now(), now())""",
+               VALUES ($1, $2, $3, '#116644', 97, now(), now())""",
             data.category_id, test_data.user_id, f"WP6-Cat-{data.category_id[:8]}",
         )
 

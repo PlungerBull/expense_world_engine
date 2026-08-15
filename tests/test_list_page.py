@@ -24,9 +24,9 @@ async def category_rows(test_data):
         for i, cid in enumerate(ids):
             await conn.execute(
                 """INSERT INTO expense_categories
-                    (id, user_id, name, color, is_system, sort_order,
+                    (id, user_id, name, color, sort_order,
                      created_at, updated_at, deleted_at)
-                   VALUES ($1, $2, $3, '#123456', false, $4,
+                   VALUES ($1, $2, $3, '#123456', $4,
                      now(), now(), CASE WHEN $5 THEN now() END)""",
                 cid, test_data.user_id, f"list-page probe {i}", i, i == 2,
             )

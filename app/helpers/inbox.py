@@ -426,7 +426,7 @@ async def promote_inbox_item(
         )
         if category is None:
             errors["category_id"] = MSG_ACTIVE_CATEGORY
-        elif category["is_system"]:
+        elif category["system_key"] is not None:
             # Promotion inserts the ledger row directly (not via
             # create_transaction), so it carries its own copy of the
             # system-category boundary (bug 6.7): only the engine files

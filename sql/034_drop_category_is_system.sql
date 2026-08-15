@@ -1,0 +1,33 @@
+-- 034_drop_category_is_system.sql
+--
+-- Drop expense_categories.is_system: a stored derived value (2026-08-15).
+--
+-- Why: is_system was, on every row ever written, exactly
+-- (system_key IS NOT NULL). Two columns set once at creation and never
+-- updated cannot drift the way the stored balance could (sql/022), but a
+-- stored derivable is still a second source of truth — and nothing tied
+-- the two together: no CHECK stopped a hand-written row from claiming
+-- is_system = true with no system_key, and every guard that read the
+-- boolean would then disagree with every lookup that read the key.
+-- Deleting the copy is cheaper and stronger than constraining it.
+--
+-- The doctrine is sql/022's, verbatim: a derived value is computed at
+-- read time, never stored.
+--
+-- What replaces it:
+--   * wire shape UNCHANGED — CategoryResponse.is_system is now computed
+--     as (system_key is not None) in app/schemas/categories.py; clients
+--     see the identical field. Activity-log snapshots serialize through
+--     the same builder, so they keep the field too.
+--   * SQL readers use (system_key IS NOT NULL) / (system_key IS NULL):
+--     the category list ordering (system rows first) and the inbox
+--     ?ready filter's user-category predicate.
+--   * Python guards read row["system_key"] is not None; the rows all
+--     arrive via SELECT * / RETURNING *, so no query shapes changed.
+--   * The seed INSERT in ensure_system_category writes system_key only.
+--
+-- system_key remains the single authority it always was for *identity*
+-- (lookup by (user_id, system_key), report exclusion); it now also
+-- answers *policy* ("may you delete/assign this?") by null-ness.
+
+ALTER TABLE expense_categories DROP COLUMN is_system;

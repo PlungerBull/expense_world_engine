@@ -88,8 +88,8 @@ async def ensure_system_category(
         row = await conn.fetchrow(
             """
             INSERT INTO expense_categories
-                (id, user_id, name, is_system, system_key, created_at, updated_at)
-            VALUES ($1, $2, $3, true, $4, now(), now())
+                (id, user_id, name, system_key, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, now(), now())
             ON CONFLICT (user_id, system_key)
                 WHERE system_key IS NOT NULL AND deleted_at IS NULL
                 DO NOTHING
@@ -235,7 +235,7 @@ async def delete_category(
     )
 
     # System categories cannot be deleted
-    if row["is_system"]:
+    if row["system_key"] is not None:
         raise forbidden(f"Cannot delete system category {row['name']}.")
 
     # Reference checks: active transactions and inbox items

@@ -334,7 +334,7 @@ Categories carry no type restriction. The same category can be used on expenses 
 
 **Auto-creation (engine-side, not via this endpoint):**
 - `@Opening` — auto-created the first time an account's opening balance is seeded via `POST /accounts/{id}/opening-balance`.
-It is created with `is_system = true` and a stable `system_key` column (`"opening_balance"`) — the engine looks it up by `system_key`, not by display name. This means users can freely rename the display text without breaking the flow that depends on it (which was a bug before the `system_key` column was added). *(`@Transfer` and `@Debt` — the other two system categories — were deleted with the transfer feature, 2026-08-10.)*
+It is created with a stable `system_key` column (`"opening_balance"`) — the engine looks it up by `system_key`, not by display name, and the response's `is_system` flag is derived from `system_key` at read time (`sql/034` dropped the stored boolean; the wire shape is unchanged). This means users can freely rename the display text without breaking the flow that depends on it (which was a bug before the `system_key` column was added). *(`@Transfer` and `@Debt` — the other two system categories — were deleted with the transfer feature, 2026-08-10.)*
 
 Category responses include `system_key` (`null` for user categories) — since 2026-08-07. It is the identity the rename-safety guarantee keys off, so clients get it too; without it a client wanting to label a specific system row had to string-match a renameable display name. Not an IDs-only violation: `system_key` is an immutable discriminator, not a hydrated copy of a mutable value.
 

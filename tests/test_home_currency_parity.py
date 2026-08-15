@@ -156,9 +156,9 @@ async def fx(test_data, db_pool):
         )
         await conn.execute(
             """INSERT INTO expense_categories
-                (id, user_id, name, color, is_system, sort_order,
+                (id, user_id, name, color, sort_order,
                  created_at, updated_at)
-               VALUES ($1, $2, 'Parity Empty', '#00FF00', false, 98,
+               VALUES ($1, $2, 'Parity Empty', '#00FF00', 98,
                        now(), now())""",
             data.empty_category_id, test_data.user_id,
         )

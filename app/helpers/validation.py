@@ -319,7 +319,7 @@ async def active_category_ids(
         return {}
     rows = await conn.fetch(
         """
-        SELECT id, is_system FROM expense_categories
+        SELECT id, (system_key IS NOT NULL) AS is_system FROM expense_categories
         WHERE id = ANY($1::uuid[]) AND user_id = $2 AND deleted_at IS NULL
         """,
         ids,
