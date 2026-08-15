@@ -167,13 +167,14 @@ async def test_report_hashtags_ignore_non_ledger_junction_rows(client, test_data
     assert r.status_code == 201, r.text
 
     async with db.pool.acquire() as conn:
-        # sql/027 CHECKs transaction_source = 1, so the rogue row must be
-        # planted with the constraint out of the way. Test DB only; restored
-        # in the finally below after the row is gone again.
-        await conn.execute(
-            "ALTER TABLE expense_transaction_hashtags "
-            "DROP CONSTRAINT hashtags_transaction_source_valid"
-        )
+        # An inbox-source junction row on a LEDGER id — nonsense as data, which
+        # is the point: the report must ignore it on the source predicate
+        # alone. Plantable directly since sql/033 admits source = 2.
+        #
+        # This test used to DROP the CHECK, insert, and re-ADD it in its
+        # `finally` — which quietly re-installed sql/027's `= 1` definition
+        # over sql/033's, for the rest of the session. Order-dependent schema
+        # damage; the widened CHECK removes the need for the whole dance.
         await conn.execute(
             """INSERT INTO expense_transaction_hashtags
                 (transaction_id, transaction_source, hashtag_id, user_id, created_at, updated_at)
@@ -193,16 +194,6 @@ async def test_report_hashtags_ignore_non_ledger_junction_rows(client, test_data
         assert all(test_data.hashtag2_id not in g for g in groups)
     finally:
         async with db.pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM expense_transaction_hashtags "
-                "WHERE transaction_id = $1 AND transaction_source = 2",
-                txn_id,
-            )
-            await conn.execute(
-                "ALTER TABLE expense_transaction_hashtags "
-                "ADD CONSTRAINT hashtags_transaction_source_valid "
-                "CHECK (transaction_source = 1)"
-            )
             await conn.execute(
                 "DELETE FROM activity_log WHERE resource_id = $1", txn_id
             )

@@ -42,15 +42,21 @@ from uuid import UUID
 
 import asyncpg
 
-from app.constants import ActivityAction, InboxStatus
+from app.constants import ActivityAction, InboxStatus, TransactionSource
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
+from app.helpers.hashtag_links import (
+    attach_hashtag_ids,
+    cascade_delete,
+    fetch_hashtag_ids_map,
+    sync_hashtags,
+)
 from app.helpers.query_builder import (
     dynamic_update,
     fetch_owned_row_or_404,
-    soft_delete_with_audit,
+    soft_delete,
 )
-from app.helpers.transactions import attach_hashtag_ids, insert_transaction_row
+from app.helpers.transactions import insert_transaction_row
 from app.helpers.validation import (
     MSG_ACTIVE_ACCOUNT,
     MSG_ACTIVE_CATEGORY,
@@ -82,6 +88,12 @@ async def create_inbox_item(
     Inbox items can have sparse data — amount, date, account, category
     are all optional. The service normalises what's provided (sign →
     transaction_type, abs the amount).
+
+    ``hashtag_ids`` is stored as junction rows under
+    ``TransactionSource.INBOX``, and every id must reference an active
+    hashtag (the one reference rule the inbox does not relax — see
+    ``hashtag_links.sync_hashtags``). A rejection there aborts the create:
+    the caller's transaction rolls the INSERT back with it.
     """
     # Signs are consumed in this block and nowhere else. Everything below sees
     # only an absolute amount plus the encoded direction — the same contract
@@ -150,7 +162,15 @@ async def create_inbox_item(
     except asyncpg.UniqueViolationError:
         raise conflict(f"An inbox item with id '{body.id}' already exists.")
 
+    if body.hashtag_ids:
+        await sync_hashtags(
+            conn, str(row["id"]), user_id, body.hashtag_ids, TransactionSource.INBOX,
+        )
+
     response = inbox_from_row(row)
+    # Resolve after the sync — the CREATED snapshot carries the draft's tags
+    # per §6 aggregate exception #1, the same contract the ledger create has.
+    await attach_hashtag_ids(conn, response, TransactionSource.INBOX)
 
     await write_activity_log(
         conn, user_id, "inbox", str(row["id"]), ActivityAction.CREATED,
@@ -174,17 +194,26 @@ async def update_inbox_item(
     Handles the same amount normalisation as ``create_inbox_item``. No
     field accepts an explicit null — send a value or omit the key.
 
+    ``hashtag_ids`` is pulled out of ``fields`` before the dynamic UPDATE
+    (it is junction state, not a column) and applied with replacement
+    semantics: omitted leaves the set alone, ``[]`` clears it. A tags-only
+    edit still bumps ``version`` — ``dynamic_update`` with zero fields is
+    exactly that bump — because the draft's wire shape changed.
+
     Empty updates short-circuit to a fetch-and-return — matches the prior
     router behaviour and the pattern established by other domain helpers.
     """
     fields = extract_update_fields(body)
+    hashtag_ids = fields.pop("hashtag_ids", None)
 
     # Empty update — return current
-    if not fields:
+    if not fields and hashtag_ids is None:
         row = await fetch_owned_row_or_404(
             conn, "expense_transaction_inbox", inbox_id, user_id, "inbox item"
         )
-        return inbox_from_row(row)
+        response = inbox_from_row(row)
+        await attach_hashtag_ids(conn, response, TransactionSource.INBOX)
+        return response
 
     # Same title rule as create — see the comment on the INSERT bind. Applied
     # before the row is fetched because it is a property of the input, not of
@@ -212,6 +241,9 @@ async def update_inbox_item(
     )
 
     before = inbox_from_row(before_row)
+    # Pre-mutation tags — the UPDATED before_snapshot must show what was
+    # attached prior to the edit (§6 aggregate exception #1).
+    await attach_hashtag_ids(conn, before, TransactionSource.INBOX)
 
     # Same reference rule as create (and same deliberate lack of an
     # is_system arm). Sits after the ownership fetch so a nonexistent
@@ -233,7 +265,15 @@ async def update_inbox_item(
     if after_row is None:
         raise not_found("inbox item")
 
+    if hashtag_ids is not None:
+        await sync_hashtags(
+            conn, inbox_id, user_id, hashtag_ids, TransactionSource.INBOX,
+        )
+
     after = inbox_from_row(after_row)
+    # Post-mutation tags — applies whether this PUT rewrote them or not; an
+    # edit to any other field still surfaces the current set.
+    await attach_hashtag_ids(conn, after, TransactionSource.INBOX)
 
     await write_activity_log(
         conn, user_id, "inbox", inbox_id, ActivityAction.UPDATED,
@@ -252,19 +292,48 @@ async def delete_inbox_item(
     user_id: str,
     inbox_id: str,
 ) -> dict:
-    """Soft-delete a pending inbox item.
+    """Dismiss a draft — soft-delete, with its tags.
 
     This is distinct from the PROMOTED end-state which also sets
     ``deleted_at`` but keeps ``status = 2``. A plain delete just marks
     the row ``deleted_at`` without touching ``status``.
+
+    **Final** — there is no restore route (see the module docstring). The
+    junction cascade is therefore one-way, which is the one place the inbox
+    and the ledger genuinely differ here: ``delete_transaction`` leaves a
+    ``deleted_at`` marker its restore inverts precisely, while a dismissed
+    draft's tags simply close with it.
+
+    Not routed through ``query_builder.soft_delete_with_audit``: the
+    after-snapshot needs the *async* ``attach_hashtag_ids``, and it must run
+    after the cascade so the snapshot shows the post-delete wire state
+    (``[]``) — ``_mutate_with_audit``'s sync ``serialize`` can express
+    neither. Same reason ``delete_transaction`` is hand-rolled.
     """
     row = await fetch_owned_row_or_404(
         conn, "expense_transaction_inbox", inbox_id, user_id, "inbox item"
     )
 
-    return await soft_delete_with_audit(
-        conn, user_id, "expense_transaction_inbox", "inbox", row, inbox_from_row
+    before = inbox_from_row(row)
+    # Captured BEFORE the cascade — otherwise the audit trail cannot say what
+    # the dismissed draft was tagged with, and with no restore route this is
+    # the only surviving record of it.
+    await attach_hashtag_ids(conn, before, TransactionSource.INBOX)
+
+    after_row = await soft_delete(
+        conn, "expense_transaction_inbox", inbox_id, user_id
     )
+    await cascade_delete(conn, user_id, inbox_id, TransactionSource.INBOX)
+
+    after = inbox_from_row(after_row)
+    await attach_hashtag_ids(conn, after, TransactionSource.INBOX)
+
+    await write_activity_log(
+        conn, user_id, "inbox", inbox_id, ActivityAction.DELETED,
+        before_snapshot=before,
+        after_snapshot=after,
+    )
+    return after
 
 
 # ---------------------------------------------------------------------------
@@ -285,10 +354,18 @@ async def promote_inbox_item(
          can't create duplicate ledger transactions.
       2. Validate that all fields required for promotion are present
          and reference active resources (account, category).
-      3. Insert the ledger row and write an activity log for the new
-         transaction.
+      3. Insert the ledger row, carry the draft's hashtags across to it,
+         and write an activity log for the new transaction.
       4. Cleanup: soft-delete the inbox row with ``status = 2``
-         (PROMOTED) and write an activity log.
+         (PROMOTED), close its junction rows, and write an activity log.
+
+    **The tags move; they are not copied.** The draft's junction rows
+    (source = 2) are cascaded closed in step 4 and equivalent ledger rows
+    (source = 1) are written in step 3, so exactly one live set exists at
+    any moment. Tags are not part of the readiness check — an untagged
+    draft promotes fine, and a hashtag deleted between drafting and
+    promoting has already had its junction dropped by ``delete_hashtag``,
+    so the carry-over can only ever move live tags.
 
     Returns the newly-created ledger transaction.
     """
@@ -312,6 +389,12 @@ async def promote_inbox_item(
         raise not_found("inbox item")
 
     inbox_before = inbox_from_row(inbox_row)
+    # The draft's live tags, read once under the lock and used twice: as the
+    # set the ledger row inherits, and as the before-snapshot's content.
+    draft_hashtag_ids = (
+        await fetch_hashtag_ids_map(conn, [inbox_id], TransactionSource.INBOX)
+    )[str(inbox_id)]
+    inbox_before["hashtag_ids"] = draft_hashtag_ids
 
     # 2. Validate required fields — collect all failures
     #
@@ -381,9 +464,25 @@ async def promote_inbox_item(
         inbox_id=inbox_row["id"],
     )
 
+    # The tags follow the row into the ledger. Written under
+    # TransactionSource.LEDGER against the NEW id — nothing is re-validated
+    # here because these ids came off live junction rows a statement ago,
+    # under the same lock; sync_hashtags re-checks them anyway, which is the
+    # fail-closed half of reusing the one writer instead of an INSERT ... SELECT
+    # that would copy whatever the junction table happened to hold.
+    if draft_hashtag_ids:
+        await sync_hashtags(
+            conn, str(txn_row["id"]), user_id, draft_hashtag_ids,
+            TransactionSource.LEDGER,
+        )
+
     txn_response = transaction_from_row(txn_row)
 
     # No balance step: the INSERT above IS the balance change (sql/022).
+
+    # Attached before the snapshot, not after the return: the CREATED entry
+    # for the new ledger row must show the tags it was born with.
+    await attach_hashtag_ids(conn, txn_response)
 
     await write_activity_log(
         conn, user_id, "transaction", str(txn_row["id"]), ActivityAction.CREATED,
@@ -403,17 +502,20 @@ async def promote_inbox_item(
         user_id,
         InboxStatus.PROMOTED,
     )
+
+    # Close the draft's own junction rows. The set now lives on the ledger
+    # row; leaving the inbox copy active would mean one logical tag held by
+    # two rows, and a later DELETE /hashtags/{id} would have to bump a parent
+    # that no longer exists as far as the user is concerned.
+    await cascade_delete(conn, user_id, inbox_id, TransactionSource.INBOX)
+
     inbox_after = inbox_from_row(inbox_after_row)
+    await attach_hashtag_ids(conn, inbox_after, TransactionSource.INBOX)
 
     await write_activity_log(
         conn, user_id, "inbox", inbox_id, ActivityAction.DELETED,
         before_snapshot=inbox_before,
         after_snapshot=inbox_after,
     )
-
-    # Promoted transactions are freshly created — no junctions exist yet,
-    # so this resolves to []. Attaching uniformly is still the right call
-    # so the wire shape matches every other transaction-returning endpoint.
-    await attach_hashtag_ids(conn, txn_response)
 
     return txn_response

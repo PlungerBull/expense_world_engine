@@ -9,11 +9,12 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from app import db
-from app.constants import InboxStatus
+from app.constants import InboxStatus, TransactionSource
 from app.deps import CurrentUser, DebitAsNegative, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES
 from app.helpers import inbox as inbox_service
 from app.helpers.formatting import apply_debit_as_negative
+from app.helpers.hashtag_links import attach_hashtag_ids
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.helpers.query_builder import fetch_owned_row_or_404
@@ -101,6 +102,8 @@ async def list_inbox(
         )
 
         data = [inbox_from_row(row) for row in rows]
+        # One query for the whole page, same as the transactions list.
+        await attach_hashtag_ids(conn, data, TransactionSource.INBOX)
         if debit_as_negative:
             data = [apply_debit_as_negative(d) for d in data]
         return paginated_response(data, total, limit, offset)
@@ -139,6 +142,7 @@ async def get_inbox_item(
             conn, "expense_transaction_inbox", inbox_id, auth_user.id, "inbox item"
         )
         data = inbox_from_row(row)
+        await attach_hashtag_ids(conn, data, TransactionSource.INBOX)
         if debit_as_negative:
             data = apply_debit_as_negative(data)
         return data

@@ -13,7 +13,7 @@ from uuid import UUID
 
 import asyncpg
 
-from app.constants import ActivityAction
+from app.constants import ActivityAction, TransactionSource
 from app.errors import conflict
 from app.helpers.activity_log import write_activity_log
 from app.helpers.query_builder import (
@@ -112,9 +112,9 @@ async def delete_hashtag(
     Cascade steps (atomically coupled — all inside the caller's transaction):
       1. Lookup the hashtag row (raises not_found if missing).
       2. Soft-delete every ``expense_transaction_hashtags`` junction row for
-         this hashtag, capturing the affected transaction IDs.
-      3. Bump ``updated_at`` + ``version`` on each parent transaction so
-         readers see the hashtag_ids change.
+         this hashtag, capturing the affected parent IDs *and their source*.
+      3. Bump ``updated_at`` + ``version`` on each affected parent — ledger
+         rows and inbox drafts alike — so readers see the hashtag_ids change.
       4. Soft-delete the hashtag row itself.
       5. Write the activity log with before/after snapshots.
 
@@ -125,34 +125,50 @@ async def delete_hashtag(
         conn, "expense_hashtags", hashtag_id, user_id, "hashtag"
     )
 
-    # Soft-delete all junction rows for this hashtag, capturing the
-    # affected transaction IDs so we can bump their version + updated_at.
-    # Without the parent bump, the row's version would miss the hashtag_ids change.
+    # Soft-delete all junction rows for this hashtag, capturing the affected
+    # parents so we can bump their version + updated_at. Without the parent
+    # bump, the parent's version would miss the hashtag_ids change.
     #
-    # Activity log — per-row entries for the junction table are
-    # deliberately NOT written here (see helpers/transactions._sync_hashtags
-    # for the rationale). Each affected parent transaction carries the new
-    # hashtag_ids list via its version bump, and a single DELETED entry is
-    # written for the hashtag itself below.
+    # This is the one junction statement that deliberately spans BOTH sources
+    # (which is why it doesn't use hashtag_links.cascade_delete): deleting a
+    # hashtag removes it from everything it is on. `transaction_source` comes
+    # back with each id because the parents live in two different tables and
+    # the bump below has to send each id to the right one — an id array mixed
+    # across tables would silently no-op on the half that doesn't match.
+    #
+    # Activity log — per-row entries for the junction table are deliberately
+    # NOT written here (see helpers/hashtag_links for the rationale). Each
+    # affected parent carries the new hashtag_ids list via its version bump,
+    # and a single DELETED entry is written for the hashtag itself below.
     affected = await conn.fetch(
         """
         UPDATE expense_transaction_hashtags
         SET deleted_at = now(), updated_at = now()
         WHERE hashtag_id = $1 AND user_id = $2 AND deleted_at IS NULL
-        RETURNING transaction_id
+        RETURNING transaction_id, transaction_source
         """,
         hashtag_id,
         user_id,
     )
 
-    if affected:
+    parents_by_table = {
+        "expense_transactions": TransactionSource.LEDGER,
+        "expense_transaction_inbox": TransactionSource.INBOX,
+    }
+    for table, source in parents_by_table.items():
+        ids = list({
+            r["transaction_id"] for r in affected
+            if r["transaction_source"] == source
+        })
+        if not ids:
+            continue
         await conn.execute(
-            """
-            UPDATE expense_transactions
+            f"""
+            UPDATE {table}
             SET updated_at = now(), version = version + 1
             WHERE id = ANY($1::uuid[]) AND user_id = $2
             """,
-            list({r["transaction_id"] for r in affected}),
+            ids,
             user_id,
         )
 

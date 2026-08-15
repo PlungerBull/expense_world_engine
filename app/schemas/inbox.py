@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel
+from pydantic import AwareDatetime, BaseModel, Field
 
 from app.constants import InboxStatus, TransactionType
 from app.schemas import StrictModel, audit_fields, opt_id, owned_fields
@@ -21,6 +21,11 @@ class InboxCreateRequest(StrictModel):
     # UUID-typed like `id` — malformed FKs 422 at the boundary (open-bugs 6.6).
     account_id: Optional[UUID] = None
     category_id: Optional[UUID] = None
+    # Same field, same type and same rules as the ledger twin (2026-08-14):
+    # every id must reference an active hashtag, and the set is stored as
+    # junction rows with `transaction_source = 2`. Tags are the one reference
+    # the inbox does NOT relax — see hashtag_links.sync_hashtags for why.
+    hashtag_ids: Optional[list[UUID]] = None
 
 
 class InboxUpdateRequest(StrictModel):
@@ -30,6 +35,10 @@ class InboxUpdateRequest(StrictModel):
     date: Optional[AwareDatetime] = None
     account_id: Optional[UUID] = None
     category_id: Optional[UUID] = None
+    # Replacement semantics, as on the ledger: omitted leaves the set alone,
+    # `[]` clears it, a list becomes the whole set. Explicit `null` is 422 like
+    # every other inbox field — null is not a verb here, `[]` is.
+    hashtag_ids: Optional[list[UUID]] = None
 
 
 class InboxPromoteRequest(StrictModel):
@@ -60,9 +69,22 @@ class InboxResponse(BaseModel):
     updated_at: datetime
     version: int
     deleted_at: Optional[datetime] = None
+    # Flattened junction, exactly as on a ledger row (api-design-principles.md
+    # §3a). Always present, `[]` when the draft carries no tags — never null,
+    # never omitted. Unlike the amount fields, this one is NOT nullable on the
+    # inbox: "no tags yet" and "no tags" are the same statement.
+    hashtag_ids: list[str] = Field(default_factory=list)
 
 
-def inbox_from_row(row) -> dict:
+def inbox_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
+    """Serialize an inbox row.
+
+    ``hashtag_ids`` mirrors ``transaction_from_row``'s parameter: callers
+    that surface this dict on the wire — or persist it as an activity-log
+    snapshot — pass the resolved list, and it defaults to ``[]``. Most
+    callers instead let ``hashtag_links.attach_hashtag_ids`` fill the key in
+    afterwards, which is the one-query-per-page path the list endpoint needs.
+    """
     return InboxResponse(
         **owned_fields(row),
         title=row["title"],
@@ -74,4 +96,5 @@ def inbox_from_row(row) -> dict:
         category_id=opt_id(row["category_id"]),
         status=row["status"],
         **audit_fields(row),
+        hashtag_ids=[str(h) for h in hashtag_ids] if hashtag_ids else [],
     ).model_dump(mode="json")

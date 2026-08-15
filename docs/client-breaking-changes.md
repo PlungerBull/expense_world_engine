@@ -28,6 +28,81 @@ must do.
 
 ---
 
+## 2026-08-14 ➕ ADDITIVE — inbox drafts carry hashtags
+
+**Engine change** (`sql/033`; `app/helpers/hashtag_links.py` new,
+`helpers/inbox.py`, `helpers/transactions.py`, `helpers/hashtags.py`,
+`schemas/inbox.py`, `routers/inbox.py`, `routers/transactions.py`,
+`routers/reconciliations.py`, `constants.py`; owner decision 2026-08-07,
+scheduled and built 2026-08-14).
+
+**Tagging a draft is possible for the first time.** The junction table has had
+its `transaction_source` column since `sql/003`, reserved for exactly this, but
+the inbox writer was never built: the inbox schemas had no `hashtag_ids` field,
+promotion attached none, and a user who captured through the inbox simply could
+not tag. `sql/033` widened the column's CHECK to `IN (1, 2)` and the writer
+shipped with it.
+
+### Nothing breaks
+
+No field was removed, renamed, or retyped, and no previously-accepted request is
+newly rejected. `hashtag_ids` is optional on both inbox write routes, and the new
+response key is an array that is always present — a client that ignores it is
+unaffected. *(A client that was sending `hashtag_ids` to `/inbox` and receiving a
+`422` for an unknown field will now find it accepted, which is the fix, not a
+break.)*
+
+### What's new
+
+- **`POST /inbox` and `PUT /inbox/{id}` accept `hashtag_ids: [uuid, ...]`.**
+  Same shape and same rules as on `/transactions`: every id must reference an
+  active hashtag you own, else `422` `"Some hashtag IDs are invalid."` with the
+  offending ids in `fields.hashtag_ids`. On `PUT` the semantics are
+  **replacement** — omit to leave alone, `[]` to clear, a list to become the
+  whole set. Explicit `null` is `422`, as on every other inbox field.
+- **Every inbox representation returns `hashtag_ids`** — `GET /inbox`,
+  `GET /inbox/{id}`, and the `POST`/`PUT`/`DELETE` response bodies. Sorted
+  ascending, `[]` when empty, never `null`, never omitted.
+- **Promotion carries the tags into the ledger.** `POST /inbox/{id}/promote`
+  returns a transaction whose `hashtag_ids` is the draft's set. Nothing to do
+  client-side — but a client that re-attached tags manually after promoting
+  should stop, or it will issue a redundant `PUT`.
+- **A tags-only `PUT /inbox/{id}` bumps `version`.** Expected if you compare
+  versions for conflict detection: the draft's wire shape changed.
+- **`DELETE /hashtags/{id}` now also untags drafts**, bumping their `version`
+  the same way it does for transactions. A cached inbox list goes stale on a
+  hashtag delete exactly as a cached transaction list already did.
+- **Dismissing a draft clears its tags** (`hashtag_ids: []` in the `DELETE`
+  response, and on the row under `?include_deleted=true`). One-way — see the
+  restore-removal entry below.
+
+### What the client must do
+
+Nothing, to keep working. To use the feature: send `hashtag_ids` when creating
+or editing a draft, render the array on inbox rows, and drop any post-promote
+re-tagging step.
+
+### What does *not* change
+
+- **The ledger side is untouched** — same field, same rules, same responses.
+- **Reports and filters are ledger-only.** An inbox tag never surfaces a row in
+  `GET /transactions?hashtag_id=` and never appears in a `hashtag_breakdown`;
+  the two sources are separated in every query.
+- **`GET /inbox` has no `?hashtag_id=` filter** (owner decision 2026-08-14 —
+  deliberately out of scope; the inbox is a short working list).
+- Hashtag CRUD, names, ordering: unchanged.
+
+### Engine references
+
+- `sql/033_inbox_hashtags.sql` — the widened CHECK and the three-column UNIQUE key
+- `app/helpers/hashtag_links.py` — the single implementation, source-parameterized
+- `docs/engine-spec.md` §`POST /inbox`, §`PUT /inbox/{id}`, §`DELETE /inbox/{id}`,
+  §`POST /inbox/{id}/promote`, §`DELETE /hashtags/{id}`
+- `tests/test_inbox_hashtags.py`, `tests/test_hashtag_source_filter.py`,
+  `tests/test_sql033_checks.py`
+
+---
+
 ## 2026-08-14 ⚠️ BREAKING — `POST /inbox/{id}/restore` is gone
 
 **Engine change** (`app/routers/inbox.py`, `app/helpers/inbox.py`; no SQL

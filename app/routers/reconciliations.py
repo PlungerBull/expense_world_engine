@@ -10,7 +10,7 @@ from app.deps import CurrentUser, DebitAsNegative, IdempotencyKey, Limit, Offset
 from app.errors import ERROR_RESPONSES, not_found
 from app.helpers import reconciliations as reconciliations_service
 from app.helpers.formatting import apply_debit_as_negative
-from app.helpers.transactions import attach_hashtag_ids
+from app.helpers.hashtag_links import attach_hashtag_ids
 from app.helpers.idempotency import run_idempotent
 from app.helpers.pagination import DEFAULT_LIMIT, list_page, paginated_response
 from app.helpers.validation import extract_update_fields

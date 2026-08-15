@@ -171,7 +171,7 @@ async def test_restore_re_attaches_cascaded_hashtags(client, test_data):
 
     The match is precise: only junction rows whose ``deleted_at`` equals
     the parent's are restored, so pre-existing soft-deleted junctions
-    from earlier ``_sync_hashtags`` runs stay deleted.
+    from earlier ``hashtag_links.sync_hashtags`` runs stay deleted.
     """
     txn_id = str(uuid.uuid4())
     create_r = await client.post(

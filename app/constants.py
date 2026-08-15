@@ -80,16 +80,21 @@ class TransactionType(IntEnum):
 
 
 class TransactionSource(IntEnum):
-    """Which writer attached this hashtag junction row.
+    """Which table ``expense_transaction_hashtags.transaction_id`` names.
 
-    ``expense_transaction_hashtags.transaction_source`` — CHECK-locked by
-    sql/027 to exactly this one value. There is deliberately no ``INBOX = 2``
-    member: the value exists nowhere in code, and sql/027's header instructs
-    that the member and the widened CHECK ship *with* the inbox-hashtag
-    writer, never ahead of it — an admissible-but-unwritten value is how
-    half-copied conventions become load-bearing by accident.
+    The column carries no foreign key precisely so it can point at either
+    table; this enum is the discriminator. CHECK-locked to these two values
+    by sql/033, which shipped the inbox writer — sql/027 had pinned the
+    column to ``LEDGER`` alone until then, on the rule that an
+    admissible-but-unwritten value is how half-copied conventions become
+    load-bearing by accident.
+
+    ⚠️ 1 is the LEDGER. A pre-WP7 revision of the schema doc defined
+    ``1 = inbox, 2 = ledger``; no writer ever agreed with it and sql/033
+    settled the mapping the way the code has always written it.
     """
     LEDGER = 1
+    INBOX = 2
 
 
 class ActivityAction(IntEnum):

@@ -1,12 +1,14 @@
-"""Pins for sql/027 — the last two CHECK constraints from bug 6.3.
+"""Pins for sql/027 — one of the two CHECK constraints from bug 6.3.
 
-  * hashtags_transaction_source_valid: transaction_source is pinned to 1, the
-    only value any writer produces. Owner decision 2026-08-07: the inbox WILL
-    eventually carry hashtags, so the column stays; the migration shipping
-    that writer widens the CHECK to IN (1, 2) — until then 2 must be rejected.
   * exchange_rates_rate_positive: a non-positive rate would misprice every
     home-currency figure (the table is the sole source since sql/021). The
     fetch/backfill jobs also refuse it in _upsert_rate before the INSERT.
+
+The other one, hashtags_transaction_source_valid, has moved to
+`test_sql033_checks.py`: sql/027 pinned it to `= 1` because only the ledger
+wrote junction rows, and sql/033 widened it to `IN (1, 2)` when the inbox
+writer shipped — exactly the sequencing sql/027's header prescribed. The pin
+belongs with the definition that is live.
 """
 from datetime import date
 from decimal import Decimal
@@ -16,18 +18,6 @@ import pytest
 
 from app import db
 from app.jobs.fetch_exchange_rates import _upsert_rate
-
-
-@pytest.mark.asyncio
-async def test_transaction_source_pinned_to_1(test_data):
-    async with db.pool.acquire() as conn:
-        with pytest.raises(asyncpg.CheckViolationError):
-            await conn.execute(
-                """INSERT INTO expense_transaction_hashtags
-                    (transaction_id, transaction_source, hashtag_id, user_id, created_at, updated_at)
-                   VALUES ($1, 2, $2, $3, now(), now())""",
-                test_data.transaction_id, test_data.hashtag2_id, test_data.user_id,
-            )
 
 
 @pytest.mark.asyncio

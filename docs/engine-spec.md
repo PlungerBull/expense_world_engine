@@ -367,7 +367,7 @@ Returns all active hashtags, sorted by `sort_order`. Supports standard paginatio
 ### `PUT /hashtags/{id}`
 The same name normalization rules as `POST` apply to renames.
 ### `DELETE /hashtags/{id}`
-Soft-delete. Cascades: soft-deletes all `expense_transaction_hashtags` junction rows for this hashtag and bumps each affected parent transaction's `version + updated_at` — a hashtag change is an edit to the transaction as clients see it (the embedded `hashtag_ids` array), so the parent's optimistic version must move. Writes a single `DELETED` activity log entry for the hashtag itself; per-junction-row entries are deliberately NOT written (see "Activity log aggregate exceptions" below).
+Soft-delete. Cascades: soft-deletes all `expense_transaction_hashtags` junction rows for this hashtag and bumps each affected parent's `version + updated_at` — a hashtag change is an edit to the parent as clients see it (the embedded `hashtag_ids` array), so its optimistic version must move. **Parents of both kinds** (since 2026-08-14): a deleted hashtag leaves every ledger transaction *and* every inbox draft it was on, and each id is bumped in its own table. This is the one junction statement that deliberately spans both `transaction_source` values. Writes a single `DELETED` activity log entry for the hashtag itself; per-junction-row entries are deliberately NOT written (see "Activity log aggregate exceptions" below).
 
 ### `POST /hashtags/{id}/restore`
 Undoes a soft-delete of the hashtag row itself. Does NOT automatically restore the cascaded junction rows — the restored hashtag comes back as an empty label that the user can re-apply manually to transactions. Silently re-tagging could surprise users. Returns `404` if no soft-deleted hashtag with that id exists. Returns `409` if an active hashtag already uses the same name.
@@ -392,6 +392,10 @@ Creates a new inbox item.
 
 A supplied `account_id` or `category_id` must reference an active resource owned by the caller (`account_id` additionally non-archived), else `422` with the standard reference messages. The fields stay optional; only what is sent is checked. System categories are the deliberate exception to matching the ledger's write rules: a draft may point at `@Opening` and is refused only at promote (and excluded from `?ready=true`).
 
+**`hashtag_ids`** (optional, since 2026-08-14 — `sql/033`). A draft carries hashtags exactly as a ledger row does: same field, same array-of-uuid shape, same rule that every id must reference an active hashtag the caller owns, else `422` `"Some hashtag IDs are invalid."` with the offending ids in `fields.hashtag_ids`. The tags survive promotion (see `POST /inbox/{id}/promote`). Storage is the shared junction table `expense_transaction_hashtags` with `transaction_source = 2`; clients never see junction rows.
+
+> **Tags are the one reference the inbox does *not* relax.** A draft may hold a dead or system `category_id` and be refused only at promote, but a dead hashtag is refused on the spot. The asymmetry is not an oversight: `category_id` is a column on the draft that promote re-reads, whereas a tag is a junction row, and `DELETE /hashtags/{id}` has already dropped every junction pointing at that hashtag — accepting one here would write a row that no read surface can ever return.
+
 `amount_cents` follows the standard sign convention: negative = expense, positive = income. The engine infers `transaction_type` from the sign and stores `amount_cents` as positive (same as the ledger). `transaction_type` is stored on the inbox row so direction is preserved through to promotion.
 
 No inbox field accepts an explicit `null` — send a value or omit the key. *(The former `transfer` object, the one explicit-null exception, left with the 2026-08-10 transfer removal.)*
@@ -402,7 +406,7 @@ No inbox field accepts an explicit `null` — send a value or omit the key. *(Th
 >
 > *Considered and declined (2026-08-13): adding `title` to the nullable set, making `{"title": null}` a legal clear (precedent: `reconciliation_id`, "null means unassign"). It would remove the asymmetry, but it is a client-breaking change nobody asked for and it widens the null-is-not-a-verb rule for one field's convenience.*
 
-**Response shape:** native currency only, exactly as on a ledger row — `amount_cents` positive, with `transaction_type` carrying the direction. (The old response computed home-currency values from a stored `exchange_rate` whose `DEFAULT 1.0` was bug 1.4 — a $100 draft promoted as 100 PEN cents. Both columns died in `sql/021`.)
+**Response shape:** native currency only, exactly as on a ledger row — `amount_cents` positive, with `transaction_type` carrying the direction. Every inbox representation also carries `hashtag_ids: [uuid, ...]`, sorted ascending, `[]` when the draft has no tags — never `null`, never omitted, on `GET /inbox`, `GET /inbox/{id}` and every mutation response alike. Unlike the amount fields it is not nullable: on tags, "none yet" and "none" are the same statement. (The old response computed home-currency values from a stored `exchange_rate` whose `DEFAULT 1.0` was bug 1.4 — a $100 draft promoted as 100 PEN cents. Both columns died in `sql/021`.)
 
 Pass `?debit_as_negative=true` on `GET /inbox` or `GET /inbox/{id}` to have amounts returned negated for the outflow side (`transaction_type = 1`).
 
@@ -412,10 +416,14 @@ Partial update. Re-evaluates promotion readiness after every update. Date and ac
 
 An `account_id` or `category_id` present in the update follows the same reference rule as `POST /inbox`; references the update does not touch are not re-validated — a draft whose account has since died stays editable, and promote remains the gate.
 
+`hashtag_ids` has **replacement** semantics, the same as on `PUT /transactions/{id}`: omit the key to leave the set untouched, send a list to make it the whole set, send `[]` to clear it. Explicit `null` is `422` like every other inbox field — `[]` is the clear operation, null is not a verb here. A tags-only edit still bumps `version` and writes an `UPDATED` activity entry: the draft's wire shape changed, so its optimistic version has to move.
+
 ### `DELETE /inbox/{id}`
 Dismiss a draft. Soft-delete: sets `deleted_at = now()` without touching `status`, so the row remains `status = 1` (PENDING) + `deleted_at IS NOT NULL` — distinct from the PROMOTED end-state (`status = 2` + `deleted_at IS NOT NULL`).
 
 **This is final — there is no `POST /inbox/{id}/restore`** (owner decision 2026-08-14; the route existed until then). The inbox is the one exception to the Restore semantics convention above, and the reasoning is there: a draft is not a financial record. The row and its history survive; the way back does not.
+
+The draft's hashtag junction rows are soft-deleted with it, so the response — and the dismissed draft under `?include_deleted=true` — reports `hashtag_ids: []`. The cascade is **one-way**, the one place this differs from `DELETE /transactions/{id}`: the ledger's cascade leaves a `deleted_at` marker its restore inverts precisely, while a dismissed draft's tags simply close. The `DELETED` activity entry's `before_snapshot` keeps what they were, which with no restore route is the only surviving record of them.
 
 ### `POST /inbox/{id}/promote`
 Promotes a ready inbox item to the ledger.
@@ -442,10 +450,11 @@ If any condition fails, returns `422` with **all** the failing fields, not just 
 
 **On success (atomic):**
 1. Creates the `expense_transactions` row using the client-supplied `id`. `inbox_id` points back to this inbox item. Copies `transaction_type` from the inbox row. The row takes the draft's title, description, and date; `cleared` starts `false`.
-2. Sets `status = 2` (promoted) on the inbox row.
-3. Sets `deleted_at` on the inbox row (soft delete).
-4. Writes `activity_log` entry (action=1 CREATED) for the new transaction(s).
-5. Writes `activity_log` entry (action=3 DELETED) for the inbox item.
+2. **Moves the draft's hashtags onto it** — the same set, re-written as ledger junction rows (`transaction_source = 1`) against the new id, and the draft's own rows (`= 2`) soft-deleted in step 4's cascade. One live set exists at every moment, never two. Tags are not part of the readiness check: an untagged draft promotes fine, and a hashtag deleted between drafting and promoting has already had its junction dropped, so only live tags can travel.
+3. Sets `status = 2` (promoted) on the inbox row.
+4. Sets `deleted_at` on the inbox row (soft delete) and closes its hashtag junction rows.
+5. Writes `activity_log` entry (action=1 CREATED) for the new transaction, carrying the tags it was born with.
+6. Writes `activity_log` entry (action=3 DELETED) for the inbox item.
 
 There is no balance step in this list, or in any other write flow below — an account's balance is the signed sum of its non-deleted transactions, computed at read time (`sql/022`), so inserting the row **is** the balance change. There is no rate step either — conversion happens at read time (`sql/021`).
 
@@ -457,7 +466,7 @@ Returns the newly created `expense_transactions` object.
 
 ## Transactions (Ledger)
 
-**Hashtag wire format:** every transaction returned by any read endpoint includes a `hashtag_ids: [uuid, ...]` array (sorted ascending) listing every hashtag attached to it. This applies uniformly to `GET /transactions`, `GET /transactions/{id}`, the response body of `POST /transactions`, `PUT /transactions/{id}`, `DELETE /transactions/{id}`, `POST /transactions/{id}/restore`, `POST /transactions/batch`, `POST /inbox/{id}/promote`, and each embedded transaction inside `GET /reconciliations/{id}`. Transactions with no attached hashtags return `"hashtag_ids": []` (never `null`, never omitted). The junction table `expense_transaction_hashtags` is internal storage only — clients never see junction rows. Mutations to a transaction's hashtag set bump the parent transaction's `version` and `updated_at` in the same DB transaction — a hashtag change is an edit to the transaction as clients see it.
+**Hashtag wire format:** every transaction returned by any read endpoint includes a `hashtag_ids: [uuid, ...]` array (sorted ascending) listing every hashtag attached to it. This applies uniformly to `GET /transactions`, `GET /transactions/{id}`, the response body of `POST /transactions`, `PUT /transactions/{id}`, `DELETE /transactions/{id}`, `POST /transactions/{id}/restore`, `POST /transactions/batch`, `POST /inbox/{id}/promote`, and each embedded transaction inside `GET /reconciliations/{id}`. Transactions with no attached hashtags return `"hashtag_ids": []` (never `null`, never omitted). Every **inbox** representation carries the same array on the same terms (see §Inbox) — the junction table is shared, discriminated by `transaction_source` (1 = ledger, 2 = inbox), and no read crosses that line: an inbox tag never surfaces a row in `GET /transactions?hashtag_id=` and never reaches a report. The junction table `expense_transaction_hashtags` is internal storage only — clients never see junction rows. Mutations to a hashtag set bump the parent's `version` and `updated_at` in the same DB transaction — a hashtag change is an edit to the parent as clients see it.
 
 **Home-currency fields — absent, not `null`.** A transaction response carries **no** home-currency value: the row belongs to one account, the account governs the currency, and a per-row conversion would be a second copy of a number nothing on the row combines (`sql/021`). This is the documented exception to null-over-omission — a permanently-null key on every transaction forever is dead weight, so the key is absent rather than null. Conversion happens where currencies are combined: the dashboard and monthly report. (`parent_transaction_id` also left the payload when `sql/024` dropped the column; splits are Phase 5 and will re-add schema support when they ship.)
 

@@ -9,6 +9,8 @@
 > then 2026-08-13 for the colour-format CHECKs (`sql/031` — two CHECKs added, no column changes).
 > `sql/032` is data-only (rewrote 893 `exchange_rates.rate` values to the provider's published
 > digits, bug fx-store-float) and changes nothing described here.
+> Amended 2026-08-14 for the inbox-hashtag migration (`sql/033` — no column changes; one CHECK
+> widened, one UNIQUE key gained a column).
 > **14 tables, 123 columns.**
 
 ---
@@ -34,7 +36,7 @@ These rules apply to all mutable tables unless explicitly noted as an exception.
 | `transaction_type` | `expense_transaction_inbox` | same enum, nullable (a draft may have no amount yet). CHECK-enforced with an explicit `IS NULL OR` arm. |
 | `status` | `expense_transaction_inbox` | 1 = pending, 2 = promoted. **There is no value 3** — a dismissed row is `status = 1` + `deleted_at` set (the status records how far the row got, `deleted_at` records that it left the inbox). CHECK-enforced (`sql/029`). |
 | `status` | `expense_reconciliations` | 1 = draft, 2 = completed. CHECK-enforced (`sql/025`). |
-| `transaction_source` | `expense_transaction_hashtags` | 1 = ledger attach path — the only value ever written; see the table's section. CHECK-enforced (`sql/027`). |
+| `transaction_source` | `expense_transaction_hashtags` | 1 = the row's parent is an `expense_transactions` row, 2 = an `expense_transaction_inbox` draft. CHECK-enforced (`sql/033`, which widened `sql/027`'s `= 1` when the inbox writer shipped). ⚠️ A pre-WP7 revision of this document defined `1 = inbox, 2 = ledger`; no writer ever agreed, and `sql/033` settled the mapping as the code has always written it. |
 | `action` | `activity_log` | 1 = created, 2 = updated, 3 = deleted, 4 = restored. CHECK-enforced (`sql/029`). |
 
 ### Exceptions (no version / no deleted_at)
@@ -45,7 +47,7 @@ These rules apply to all mutable tables unless explicitly noted as an exception.
 - `user_settings` — has `version`, has **no** `deleted_at` (`sql/024`)
 - `activity_log` — immutable append-only audit trail. No soft delete, no version, no updated_at.
 - `idempotency_keys` — permanent (`sql/026`); rows are never deleted. Growth at the owner's write rate is a few MB/year.
-- `expense_transaction_hashtags` — has `deleted_at`, has **no** `version` (`sql/024`); versioning lives on the parent transaction (see the table's section).
+- `expense_transaction_hashtags` — has `deleted_at`, has **no** `version` (`sql/024`); versioning lives on the parent — a ledger transaction or an inbox draft, per `transaction_source` (see the table's section).
 
 ### Row-level security
 
@@ -371,12 +373,13 @@ expense_transaction_inbox
 **Promotion flow:** User-initiated. When `title`, `amount_cents`, `date`, `account_id`, and `category_id` are all present and `date ≤ now()`, the item is eligible. Promoting atomically:
 1. Creates a new row in `expense_transactions` with all validated data. `transaction_type` is copied directly from the inbox row.
 2. Sets `inbox_id` on the new transaction row to link back to this item.
-3. Sets `status = 2` (promoted) on this inbox row.
-4. Sets `deleted_at` on this inbox row (soft delete).
+3. Moves the draft's hashtag junction rows onto the new transaction — same set, re-written with `transaction_source = 1` against the new id.
+4. Sets `status = 2` (promoted) on this inbox row.
+5. Sets `deleted_at` on this inbox row (soft delete) and soft-deletes its own (`= 2`) junction rows.
 
 There is no balance step (writing the ledger row *is* the balance change — `sql/022`) and no rate lookup (conversion happens at read time — `sql/021`).
 
-**Hashtags:** The inbox has no hashtag support — no `hashtag_ids` field on its schemas, and promotion attaches none, so tags are silently lost by drafting through the inbox. Open product question — see TODO.md.
+**Hashtags:** Drafts carry them, since 2026-08-14 (`sql/033`). Storage is the shared `expense_transaction_hashtags` table with `transaction_source = 2`; the draft's `hashtag_ids` array is assembled at read time like the ledger's. Dismissing a draft soft-deletes its junction rows one-way (there is no inbox restore); promoting moves them. Before that date the inbox had no hashtag support at all and tags were lost by drafting — the column existed for this feature from `sql/003` and waited for it.
 
 **Deferred features:** Recurring expenses (`is_recurring`), CSV import (`source_text`), and receipt capture (`receipt_photo_url`) are not in Phase 1.
 
@@ -462,39 +465,48 @@ expense_hashtags
 
 ### expense_transaction_hashtags
 
-Junction table linking hashtags to ledger transactions. A transaction with 3 hashtags produces 3 rows here — same `transaction_id`, three different `hashtag_id` values.
+Junction table linking hashtags to their parents. A parent with 3 hashtags produces 3 rows here — same `transaction_id`, three different `hashtag_id` values.
+
+**Two kinds of parent, since 2026-08-14** (`sql/033`): `transaction_source` says which table `transaction_id` names. Both writers are live — the ledger attach path and the inbox one.
 
 ```
 expense_transaction_hashtags
   - id                  UUID, primary key, default uuid_generate_v4()
   - transaction_id      UUID, NOT NULL
-                        — references expense_transactions (no formal FK; see
-                          transaction_source)
-  - transaction_source  smallint, NOT NULL, CHECK (transaction_source = 1)  [sql/027]
-                        — 1 = written by the ledger attach path. This is the only value
-                          that has ever been written, and every reader filters on it.
-                          The column was designed to let transaction_id reference either
-                          the ledger or the inbox; the inbox writer was never built
-                          (see the inbox section — tags are lost by drafting there).
-                          Owner decision 2026-08-07: inbox hashtags are a wanted future
-                          feature, so the column stays and the CHECK pins today's single
-                          value — the migration shipping the inbox writer widens it to
-                          IN (1, 2). ⚠️ An earlier revision of this document defined
-                          1=inbox, 2=ledger; the implementation has always written 1 for
-                          ledger rows.
+                        — references expense_transactions OR
+                          expense_transaction_inbox (no formal FK — that is what
+                          makes the column polymorphic; see transaction_source)
+  - transaction_source  smallint, NOT NULL, CHECK (transaction_source IN (1, 2))  [sql/033]
+                        — 1 = the parent is a ledger transaction, 2 = an inbox draft.
+                          Every single-source reader carries the predicate; the one
+                          statement that spans both is DELETE /hashtags/{id}'s cascade,
+                          deliberately (a deleted hashtag leaves every parent).
+                          ⚠️ An earlier revision of this document defined 1=inbox,
+                          2=ledger; the implementation has always written 1 for ledger
+                          rows, and sql/033 settled the mapping that way.
+                          History: sql/027 CHECKed this to `= 1` while only the ledger
+                          wrote here, on the rule that an admissible-but-unwritten value
+                          is how half-copied conventions become load-bearing by accident.
   - hashtag_id          UUID, NOT NULL, FK → expense_hashtags
   - user_id             UUID, NOT NULL, FK → users
   - created_at          timestamptz, NOT NULL, default now()
   - updated_at          timestamptz, NOT NULL, default now()
   - deleted_at          timestamptz, nullable
-  - UNIQUE (transaction_id, hashtag_id)
+  - UNIQUE (transaction_id, transaction_source, hashtag_id)  [sql/033]
+                        — the source is part of the key. Without it the constraint
+                          claims a (parent, hashtag) pair is unique ACROSS parent kinds,
+                          which the two independent id spaces make false — and promote,
+                          where the client picks the new ledger row's uuid, is where that
+                          bit silently. sql/033's header has the worked example.
 
 Indexes:
   - idx_expense_transaction_hashtags_tx (transaction_id, transaction_source)
-    WHERE deleted_at IS NULL — backs the per-transaction hashtag read-back.
+    WHERE deleted_at IS NULL — backs the per-parent hashtag read-back.
 ```
 
-`version` was dropped in `sql/024` — versioning lives on the parent. **Parent version-bump rule:** any mutation to a junction row (attach, detach, cascade soft-delete from `DELETE /hashtags/{id}`) bumps `version` and `updated_at` on the parent `expense_transactions` row in the same DB transaction. This keeps the parent's optimistic version honest for the embedded `hashtag_ids` array on the wire — a hashtag-only edit is an edit to the transaction as clients see it.
+`version` was dropped in `sql/024` — versioning lives on the parent. **Parent version-bump rule:** any mutation to a junction row (attach, detach, cascade soft-delete from `DELETE /hashtags/{id}`) bumps `version` and `updated_at` on the parent row — in `expense_transactions` or `expense_transaction_inbox`, whichever the source names — in the same DB transaction. This keeps the parent's optimistic version honest for the embedded `hashtag_ids` array on the wire — a hashtag-only edit is an edit to the parent as clients see it.
+
+All access goes through `app/helpers/hashtag_links.py`, which is the single implementation of every read and write here and takes the source as a parameter.
 
 ---
 

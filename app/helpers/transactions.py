@@ -6,7 +6,10 @@ Routers stay thin (HTTP glue + idempotency) and delegate business logic here.
 This module is the most complex service in the codebase because transactions
 intersect with every other domain:
 
-  * hashtag junction rows (via the private ``_sync_hashtags``)
+  * hashtag junction rows (via ``helpers/hashtag_links``, called here with
+    ``TransactionSource.LEDGER`` — the machinery moved out on 2026-08-14 when
+    the inbox became the second writer; that module's docstring owns the
+    junction contract now)
   * reconciliation field-locking and cascade unassignment
 
 ## Account balances are not written here
@@ -53,6 +56,12 @@ import asyncpg
 from app.constants import ActivityAction, ReconciliationStatus, TransactionSource
 from app.errors import conflict, not_found, validation_error
 from app.helpers.activity_log import write_activity_log
+from app.helpers.hashtag_links import (
+    attach_hashtag_ids,
+    cascade_delete,
+    cascade_restore,
+    sync_hashtags,
+)
 from app.helpers.query_builder import (
     dynamic_update,
     fetch_owned_row_or_404,
@@ -82,61 +91,6 @@ from app.schemas.transactions import (
     infer_transaction_type,
     transaction_from_row,
 )
-
-# ---------------------------------------------------------------------------
-# hashtag_ids attach helpers (shared by every transaction-returning endpoint)
-# ---------------------------------------------------------------------------
-
-async def _fetch_hashtag_ids_map(
-    conn: asyncpg.Connection,
-    transaction_ids: list[str],
-) -> dict[str, list[str]]:
-    """Resolve active hashtag IDs for a set of ledger transactions.
-
-    Returns ``{transaction_id: [hashtag_id, ...]}`` with each list sorted
-    ascending by UUID (one stable convention everywhere). Soft-deleted
-    junction rows are excluded — when a transaction is soft-deleted its
-    junctions cascade-soft-delete, so deleted transactions resolve to ``[]``.
-
-    Returns an empty mapping for an empty input — never queries.
-    """
-    if not transaction_ids:
-        return {}
-    rows = await conn.fetch(
-        """
-        SELECT transaction_id, hashtag_id
-        FROM expense_transaction_hashtags
-        WHERE transaction_id = ANY($1::uuid[])
-          AND transaction_source = $2
-          AND deleted_at IS NULL
-        ORDER BY transaction_id, hashtag_id
-        """,
-        transaction_ids,
-        int(TransactionSource.LEDGER),
-    )
-    result: dict[str, list[str]] = {str(tid): [] for tid in transaction_ids}
-    for r in rows:
-        result[str(r["transaction_id"])].append(str(r["hashtag_id"]))
-    return result
-
-
-async def attach_hashtag_ids(conn: asyncpg.Connection, payload) -> None:
-    """Mutate one transaction dict (or a list of them) to include ``hashtag_ids``.
-
-    Per api-design-principles.md §3a, every transaction-returning endpoint
-    flattens the junction relationship to an embedded array. Call this at
-    each response site after building the transaction dict via
-    ``transaction_from_row``. One query covers a whole list — list endpoints
-    pay a single round trip regardless of page size.
-    """
-    items = [payload] if isinstance(payload, dict) else list(payload)
-    if not items:
-        return
-    ids = [item["id"] for item in items]
-    hashtag_map = await _fetch_hashtag_ids_map(conn, ids)
-    for item in items:
-        item["hashtag_ids"] = hashtag_map.get(item["id"], [])
-
 
 async def fetch_recon_status(
     conn: asyncpg.Connection,
@@ -169,169 +123,6 @@ async def fetch_recon_status(
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-async def _cascade_junctions_delete(
-    conn: asyncpg.Connection,
-    user_id: str,
-    transaction_id: str,
-    *,
-    keep_hashtag_ids: Optional[list[str]] = None,
-) -> None:
-    """Soft-delete the transaction's active ledger junction rows.
-
-    The single producer of junction ``deleted_at`` markers — used by the
-    delete cascade and by ``_sync_hashtags`` step 1.
-
-    **The marker is load-bearing.** Postgres ``now()`` returns
-    ``transaction_timestamp()`` — one value per DB transaction — so every
-    junction row soft-deleted here carries the exact timestamp the parent
-    row got in the same transaction. ``_cascade_junctions_restore``
-    re-activates by exact ``deleted_at`` match against the parent's
-    marker, which catches precisely the rows this cascade dropped and not
-    soft-deleted junctions left by earlier ``_sync_hashtags`` runs.
-
-    ``keep_hashtag_ids`` narrows the cascade to rows *leaving* the active
-    set (rows staying attached get no updated_at bump for nothing). An
-    empty or omitted list makes ``<> ALL`` vacuously TRUE — everything
-    active is dropped.
-
-    Deliberate non-adopter: ``hashtags.delete_hashtag`` pivots on
-    ``hashtag_id`` across all transactions, skips the
-    ``transaction_source`` filter, and needs ``RETURNING transaction_id``
-    — a different operation, not another copy of this one.
-    """
-    await conn.execute(
-        """
-        UPDATE expense_transaction_hashtags
-        SET deleted_at = now(), updated_at = now()
-        WHERE transaction_id = $1
-          AND transaction_source = $4
-          AND user_id = $2
-          AND deleted_at IS NULL
-          AND hashtag_id <> ALL($3::uuid[])
-        """,
-        transaction_id,
-        user_id,
-        keep_hashtag_ids or [],
-        int(TransactionSource.LEDGER),
-    )
-
-
-async def _cascade_junctions_restore(
-    conn: asyncpg.Connection,
-    user_id: str,
-    transaction_id: str,
-    deleted_at_marker,
-) -> None:
-    """Re-activate the junction rows cascaded by THIS transaction's delete.
-
-    Matches ``deleted_at = $marker`` exactly, with ``$marker`` bound to
-    the parent's pre-restore ``deleted_at`` — see
-    ``_cascade_junctions_delete`` for why the equality is precise.
-    """
-    await conn.execute(
-        """
-        UPDATE expense_transaction_hashtags
-        SET deleted_at = NULL, updated_at = now()
-        WHERE transaction_id = $1 AND transaction_source = $4
-          AND user_id = $2 AND deleted_at = $3
-        """,
-        transaction_id,
-        user_id,
-        deleted_at_marker,
-        int(TransactionSource.LEDGER),
-    )
-
-
-async def _sync_hashtags(
-    conn: asyncpg.Connection,
-    transaction_id: str,
-    user_id: str,
-    hashtag_ids: Optional[list[str]],
-) -> None:
-    """Make the transaction's active hashtag set exactly ``hashtag_ids``.
-
-    Replacement semantics, not delta semantics. The active set after this
-    call equals ``hashtag_ids`` regardless of what was attached before.
-    Uses ``TransactionSource.LEDGER`` to identify ledger junction rows.
-
-    Implementation: a narrowed soft-delete drops only the rows *leaving*
-    the active set, and an ``ON CONFLICT DO UPDATE`` upsert handles the
-    rows joining or staying. Two key properties fall out:
-
-      1. **Re-attach safety.** The junction table's
-         ``UNIQUE (transaction_id, hashtag_id)`` is unconditional —
-         soft-deleted rows still occupy the slot. The previous "soft-
-         delete-everything + plain INSERT" pattern hit a UNIQUE
-         violation any time the new set overlapped with the old set
-         (e.g. PUT ``[A]`` → ``[A, B]``) or re-attached a
-         previously-deleted hashtag. ``ON CONFLICT DO UPDATE`` flips
-         ``deleted_at`` back to NULL on the existing row instead.
-
-      2. **Stable junction IDs.** Attach → detach → re-attach cycles
-         keep the same junction row (one row per logical pair forever),
-         instead of accumulating N+1 rows per cycle — a single junction
-         lifecycle, not phantom rows.
-
-    The ``DO UPDATE`` clause only fires on rows that were soft-deleted
-    (``WHERE expense_transaction_hashtags.deleted_at IS NOT NULL``), so
-    rows that are already active are left fully untouched — no
-    ``version`` or ``updated_at`` churn on no-op transitions.
-
-    Activity log — deliberate aggregation exception: junction rows are
-    mutated here without per-row ``activity_log`` entries. The parent
-    transaction's UPDATED snapshot carries the new ``hashtag_ids`` list,
-    so the change is captured at parent granularity. See
-    api-design-principles.md §6 exception #1.
-    """
-    if hashtag_ids:
-        valid = await conn.fetch(
-            """
-            SELECT id FROM expense_hashtags
-            WHERE id = ANY($1::uuid[])
-              AND user_id = $2
-              AND deleted_at IS NULL
-            """,
-            hashtag_ids,
-            user_id,
-        )
-        valid_ids = {str(r["id"]) for r in valid}
-        # str() both sides: request models supply uuid.UUID since open-bugs
-        # 6.6 closed; a UUID is never `in` a set[str].
-        invalid = [str(h) for h in hashtag_ids if str(h) not in valid_ids]
-        if invalid:
-            raise validation_error(
-                "Some hashtag IDs are invalid.",
-                {"hashtag_ids": f"Invalid IDs: {', '.join(invalid)}"},
-            )
-
-    # Step 1: soft-delete the junctions *leaving* the active set.
-    await _cascade_junctions_delete(
-        conn, user_id, transaction_id, keep_hashtag_ids=hashtag_ids,
-    )
-
-    # Step 2: upsert the new set in one statement. ON CONFLICT re-activates
-    # rows that exist but were soft-deleted; rows that don't exist get
-    # plain INSERT semantics; rows that are already active are skipped via
-    # the WHERE on DO UPDATE (no churn).
-    if hashtag_ids:
-        await conn.execute(
-            """
-            INSERT INTO expense_transaction_hashtags
-                (transaction_id, transaction_source, hashtag_id, user_id, created_at, updated_at)
-            SELECT $1, $4, hashtag_id, $2, now(), now()
-            FROM unnest($3::uuid[]) AS hashtag_id
-            ON CONFLICT (transaction_id, hashtag_id) DO UPDATE
-            SET deleted_at = NULL,
-                updated_at = now()
-            WHERE expense_transaction_hashtags.deleted_at IS NOT NULL
-            """,
-            transaction_id,
-            user_id,
-            hashtag_ids,
-            int(TransactionSource.LEDGER),
-        )
-
 
 async def insert_transaction_row(
     conn: asyncpg.Connection,
@@ -473,7 +264,10 @@ async def create_transaction(
 
     # Hashtags
     if body.hashtag_ids:
-        await _sync_hashtags(conn, str(row["id"]), user_id, body.hashtag_ids)
+        await sync_hashtags(
+            conn, str(row["id"]), user_id, body.hashtag_ids,
+            TransactionSource.LEDGER,
+        )
 
     # Resolve hashtag_ids before snapshotting — the activity-log after_snapshot
     # carries the new hashtag set per §6 aggregate exception #1.
@@ -670,7 +464,9 @@ async def update_transaction(
 
     # Sync hashtags if provided
     if hashtag_ids is not None:
-        await _sync_hashtags(conn, transaction_id, user_id, hashtag_ids)
+        await sync_hashtags(
+            conn, transaction_id, user_id, hashtag_ids, TransactionSource.LEDGER,
+        )
 
     after = transaction_from_row(after_row)
     # Post-mutation hashtag_ids — applies whether hashtag_ids was rewritten
@@ -742,7 +538,7 @@ async def delete_transaction(
 
     # No balance reversal: the sum that defines the balance already excludes
     # soft-deleted rows, so setting deleted_at IS the reversal.
-    await _cascade_junctions_delete(conn, user_id, transaction_id)
+    await cascade_delete(conn, user_id, transaction_id, TransactionSource.LEDGER)
 
     # After-snapshot — junctions soft-deleted above, resolves to []
     # (matches the post-delete wire state).
@@ -791,7 +587,7 @@ async def restore_transaction(
     in the same batch without a re-assignment ceremony.
 
     **Junction rows.** Restored precisely by exact ``deleted_at`` match —
-    see ``_cascade_junctions_delete`` for the marker contract.
+    see ``hashtag_links.cascade_delete`` for the marker contract.
 
     This intentionally differs from ``restore_hashtag`` /
     ``restore_reconciliation`` which both opt NOT to cascade-restore.
@@ -875,7 +671,9 @@ async def restore_transaction(
 
     # (There is no balance step to mirror the delete's reversal: clearing
     # deleted_at above puts the row back into the sum that defines the balance.)
-    await _cascade_junctions_restore(conn, user_id, transaction_id, deleted_at_marker)
+    await cascade_restore(
+        conn, user_id, transaction_id, TransactionSource.LEDGER, deleted_at_marker,
+    )
 
     # Post-restore: junctions are active again → resolves to the restored set.
     await attach_hashtag_ids(conn, after)
@@ -1002,7 +800,10 @@ async def create_batch(
 
         # Hashtags
         if item.hashtag_ids:
-            await _sync_hashtags(conn, str(row["id"]), user_id, item.hashtag_ids)
+            await sync_hashtags(
+                conn, str(row["id"]), user_id, item.hashtag_ids,
+                TransactionSource.LEDGER,
+            )
 
     # The accumulate-then-apply balance loop that used to close this function is
     # gone. It existed to collapse N per-item balance writes into K UPDATEs, and

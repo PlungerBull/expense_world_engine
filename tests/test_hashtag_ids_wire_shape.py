@@ -196,7 +196,7 @@ async def test_put_response_reflects_new_hashtag_set(client, test_data):
 
     The overlap case ([A] → [A, B]) is the natural shape of "add a
     hashtag to a transaction that already has one." Covered explicitly
-    because ``_sync_hashtags`` previously crashed on it (UNIQUE conflict
+    because ``hashtag_links.sync_hashtags`` previously crashed on it (UNIQUE conflict
     on the re-INSERT of an already-attached hashtag); now handled by an
     ``ON CONFLICT DO UPDATE`` upsert.
     """
