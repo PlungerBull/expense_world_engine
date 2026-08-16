@@ -1,38 +1,21 @@
-# Open bugs
+# Open bugs & tasks
 
-Work queue, not documentation. Findings from the 2026-08-01 audits (business logic,
-coding patterns, bloat/DRY, doc+schema drift — all ~60 non-test files, the spec, the
-schema doc, every migration). **Compressed 2026-08-03** from 361 lines to this: every
-closed, void and superseded entry was deleted, since git history holds them and a
-resolved bug sitting in a bug list is noise.
+The single work queue: open defects by severity, operational/deployment tasks,
+and engine changes awaiting client uptake (⚠️ breaking / ➕ additive — such an
+entry lives here until the client catches up). Absorbed `TODO.md` and
+`docs/client-breaking-changes.md` on 2026-08-15; their closed entries, like
+everything deleted here, live in git history.
+
+**Delete an entry when it closes. Do not annotate it as done.**
 
 Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high · 🟡 medium · ⚪ low.
 
-**Delete a row when it is fixed. Do not annotate it as done.**
-
 ---
 
-## 🔴 Critical
+## Open
 
-*(none open)*
+- ⚪ **1.7-archived** `_fetch_target_currencies` excludes archived accounts, so archiving an account drops its currency from the daily fetch list. **Inert under `sql/015`** — USD is the base (never a target) and PEN is always on the list via `user_settings.main_currency`, so the only rate that exists is fetched regardless of what is archived. Becomes live the day a third currency is admitted; fix it in the same change that lifts the CHECK, not before.
 
----
-
-## 🟠 High
-
-*(none open)*
-
----
-
-## 🟡 Medium
-
-*(none open)*
-
----
-
-## ⚪ Low
-
-- **1.7-archived** `_fetch_target_currencies` excludes archived accounts, so archiving an account drops its currency from the daily fetch list. **Inert under `sql/015`** — USD is the base (never a target) and PEN is always on the list via `user_settings.main_currency`, so the only rate that exists is fetched regardless of what is archived. Becomes live the day a third currency is admitted; fix it in the same change that lifts the CHECK, not before.
 ---
 
 ## Decisions taken — kept because they record *why*, not *what*

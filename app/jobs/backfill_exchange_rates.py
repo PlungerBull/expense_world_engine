@@ -1,6 +1,6 @@
 """Historical backfill for the exchange_rates table.
 
-Run manually (TODO.md "Backfill historical exchange rates"); the daily job
+Run manually — a one-off, never scheduled; the daily job
 `app.jobs.fetch_exchange_rates` only ever inserts today's rate going forward,
 so any date before the local deployment went live has no row at all.
 

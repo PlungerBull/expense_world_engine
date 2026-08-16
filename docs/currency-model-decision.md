@@ -12,7 +12,7 @@ by the transfer collapse); account balances keep their home value, which the
 same table had flagged as a "known inconsistency, deliberately left".
 
 **Amended 2026-08-10: the transfer feature was removed entirely** (owner decision;
-`sql/030`, entry in `client-breaking-changes.md`). The currency model itself is
+`sql/030`). The currency model itself is
 untouched — native storage, read-time conversion, null-and-flag all stand — but
 the transfer-specific sections below (`@Transfer` semantics, the transfer row
 examples, the `@FX` deferral) are deleted or reduced to tombstones. A move
@@ -384,8 +384,9 @@ Three 🔴 findings and one 🟡 close by deletion rather than repair.
 
 **Breaking for the CLI.** `exchange_rate` became output-gone and the write contract
 stopped accepting it. The full wire-change record is the 2026-08-05 read-time
-currency entry in [client-breaking-changes.md](client-breaking-changes.md) — that
-entry, not this section, is the authority on what the CLI must absorb. (This
+currency entry in the client-breaking-changes log (retired 2026-08-15; in git
+history) — that entry, not this section, is the authority on what the CLI had
+to absorb. (This
 section was written as the pre-landing worklist, enumerating the `--exchange-rate`
 options and import-path payloads to remove; the call-site table is in git history.)
 

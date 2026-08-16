@@ -12,9 +12,8 @@ The Brain. A Python (FastAPI) backend, backed by Postgres. It is the single sour
 |---|---|
 | `docs/engine-spec.md` | Every endpoint, every business logic rule, every validation. The rulebook. |
 | `docs/schema-reference.md` | Full database schema. |
-| `docs/open-bugs.md` | **Known defects, by severity.** A work queue, not a document — delete a row when it is fixed rather than annotating it done. Read before assuming something is broken by accident. |
+| `docs/open-bugs.md` | **The work queue** — known defects by severity, operational tasks, and engine changes awaiting client uptake. Delete a row when it closes rather than annotating it done. Read before assuming something is broken by accident. *(Absorbed `TODO.md` and `docs/client-breaking-changes.md`, 2026-08-15.)* |
 | `docs/design-philosophy.md` | UX philosophy and product vision. |
-| `docs/client-breaking-changes.md` | Engine changes that require work in a client repo. Append here whenever a change breaks the CLI/iOS/web contract. |
 | `docs/currency-model-decision.md` | How multi-currency works: native storage, conversion at read time. Read before touching exchange rates or home-currency conversion. |
 
 ## Who this is for
@@ -60,8 +59,9 @@ Corollaries:
   (per-model copies were the drift that left 10 models leaky until 2026-08-06,
   and the nested fragments were the leak's blind spot: Pydantic config does not
   propagate into nested models).
-- **Breaking a client is a documented cost, not a blocker.** Record it in
-  `docs/client-breaking-changes.md` and proceed.
+- **Breaking a client is a documented cost, not a blocker.** Record it as a
+  pending-client-work entry in `docs/open-bugs.md` (deleted once the client
+  catches up) and proceed.
 
 Do not weigh "this would be less work for the CLI" against engine correctness. It
 is not a factor.

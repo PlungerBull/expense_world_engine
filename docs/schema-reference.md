@@ -208,7 +208,7 @@ activity_log
   - created_at       timestamptz, NOT NULL, default now()
 ```
 
-`actor_type` was dropped in `sql/024` — with one user and no admin surface, every actor is the same person. Its removal is a recorded wire change (`docs/client-breaking-changes.md`, 2026-08-06).
+`actor_type` was dropped in `sql/024` — with one user and no admin surface, every actor is the same person. Its removal was a recorded, client-breaking wire change (2026-08-06).
 
 ---
 
@@ -265,9 +265,9 @@ expense_bank_accounts
                            — immutable after creation
   - is_person              boolean, NOT NULL, default false
                            — true for virtual accounts representing people (debt tracking).
-                             ⚠️ Currently unreachable: no endpoint can set it (the create
-                             INSERT omits the column and the schemas reject the field).
-                             Open product question — see TODO.md.
+                             Set only at creation, via POST /people (shipped 2026-08-14);
+                             the ordinary account routes serve person rows afterwards and
+                             reject the field.
   - color                  text, NOT NULL, default '#3b82f6'
                            CHECK accounts_color_is_hex: IS NOT NULL AND ~ '^#[0-9a-fA-F]{6}$' (sql/031)
   - is_archived            boolean, NOT NULL, default false
