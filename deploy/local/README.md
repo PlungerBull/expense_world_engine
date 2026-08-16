@@ -223,11 +223,35 @@ a future refactor of the import order stops the run instead of quietly deleting
 real rows. Same pattern as the non-local-host guard in `app/config.py`. Keep the
 allowlist and `create-test-db.sh`'s `DB` name in sync.
 
-**Still shared:** the CLI repo's `tests/contract/` hits the live engine by
-design, so it writes real rows to the real ledger and leaves soft-deleted
-tombstones behind (visible under `--include-deleted`). Harmless against an empty
-ledger, litter once real data lands — see `expense_world_CLI/docs/cli-runtime.md`
-"Working against the live engine".
+**The CLI's contract suite uses this database too (since 2026-08-16).** It makes
+real writes and cleans up with soft deletes, so run against `expense_world` it
+buried tombstones in the ledger forever — and on 2026-08-16 a mis-scoped test
+gate ran it there and left four live junk accounts behind. It now points at
+`expense_world_test` through a **second, manually-started engine**, and the suite
+refuses to start against the real ledger.
+
+Two commands, after `create-test-db.sh`:
+
+```
+deploy/local/seed-test-user.sh          # practice user + PAT + exchange_rates; prints the token once
+SUPABASE_DB_URL=postgresql:///expense_world_test \
+  .venv/bin/python -m uvicorn app.main:app --port 8001
+```
+
+`python -m uvicorn`, not the console script (see the TCC note above). Deliberately
+**not** a launchd agent — it should exist only while someone is verifying, and die
+with the terminal. Then, from the CLI repo:
+
+```
+PYTEST_LIVE=1 EXPENSE_PAT=<printed token> \
+  EXPENSE_ENGINE_URL=http://127.0.0.1:8001 pytest tests/contract
+```
+
+Note `seed-test-user.sh` truncates `exchange_rates` before copying: this suite's
+own synthetic USD→PEN seed row collides with the real data on
+`(base, target, rate_date)`, which aborts the whole `COPY` and silently leaves one
+row behind. Full ops guide: `expense_world_CLI/docs/cli-runtime.md` "Working
+against the live engine".
 
 ## launchd templates
 
