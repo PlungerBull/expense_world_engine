@@ -136,7 +136,6 @@ async def insert_transaction_row(
     date,
     account_id,
     category_id,
-    cleared: bool = False,
     inbox_id=None,
 ) -> asyncpg.Record:
     """The one INSERT INTO expense_transactions (create, batch, promote).
@@ -159,9 +158,9 @@ async def insert_transaction_row(
             INSERT INTO expense_transactions
                 (id, user_id, title, description, amount_cents,
                  transaction_type, date, account_id, category_id,
-                 cleared, inbox_id,
+                 inbox_id,
                  created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                     now(), now())
             RETURNING *
             """,
@@ -174,7 +173,6 @@ async def insert_transaction_row(
             date,
             account_id,
             category_id,
-            cleared,
             inbox_id,
         )
     except asyncpg.UniqueViolationError:
@@ -257,7 +255,6 @@ async def create_transaction(
         date=body.date,
         account_id=body.account_id,
         category_id=body.category_id,
-        cleared=body.cleared if body.cleared is not None else False,
     )
 
     response = transaction_from_row(row)
@@ -792,7 +789,6 @@ async def create_batch(
             date=item.date,
             account_id=item.account_id,
             category_id=item.category_id,
-            cleared=item.cleared if item.cleared is not None else False,
         )
 
         response = transaction_from_row(row)

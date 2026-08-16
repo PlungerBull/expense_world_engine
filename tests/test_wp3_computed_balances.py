@@ -421,8 +421,8 @@ async def test_the_query_count_does_not_grow_with_the_number_of_accounts(
                 await conn.execute(
                     """INSERT INTO expense_transactions
                         (id, user_id, title, amount_cents, transaction_type, date,
-                         account_id, category_id, cleared, created_at, updated_at)
-                       VALUES ($1, $2, 'n+1 probe', $3, 1, $4, $5, $6, false,
+                         account_id, category_id, created_at, updated_at)
+                       VALUES ($1, $2, 'n+1 probe', $3, 1, $4, $5, $6,
                                now(), now())""",
                     str(uuid.uuid4()), test_data.user_id, (i + 1) * 100,
                     datetime.fromisoformat(SEED_DATE.replace("Z", "+00:00")),

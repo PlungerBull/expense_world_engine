@@ -12,8 +12,9 @@
 > Amended 2026-08-14 for the inbox-hashtag migration (`sql/033` — no column changes; one CHECK
 > widened, one UNIQUE key gained a column), then 2026-08-15 for `sql/034`
 > (`expense_categories.is_system` dropped — a stored derivable; the wire field is now computed
-> from `system_key`).
-> **14 tables, 122 columns.**
+> from `system_key`), then 2026-08-16 for `sql/035` (`expense_transactions.cleared`
+> dropped — a flag no logic ever read; see that migration's header).
+> **14 tables, 121 columns.**
 
 ---
 
@@ -412,8 +413,6 @@ expense_transactions
   - date                      timestamptz, NOT NULL, default now()
   - account_id                UUID, NOT NULL, FK → expense_bank_accounts
   - category_id               UUID, NOT NULL, FK → expense_categories
-  - cleared                   boolean, NOT NULL, default false
-                              — true when confirmed on a bank statement; drives reconciliation.
   - inbox_id                  UUID, nullable, FK → expense_transaction_inbox
                               — lineage back to the inbox item this was promoted from
   - reconciliation_id         UUID, nullable, FK → expense_reconciliations
@@ -423,7 +422,9 @@ expense_transactions
   - deleted_at                timestamptz, nullable
 ```
 
-Dropped by the deletion program: `transfer_direction` (`sql/020` — direction folded into `transaction_type`), `amount_home_cents` and `exchange_rate` (`sql/021` — conversion moved to read time), `parent_transaction_id` (`sql/024` — reserved for splits, never non-null; a splits migration re-adds it with the balance predicate), `transfer_transaction_id` (`sql/030` — the self-FK that paired transfer legs, removed with the transfer feature, 2026-08-10).
+Dropped by the deletion program: `transfer_direction` (`sql/020` — direction folded into `transaction_type`), `amount_home_cents` and `exchange_rate` (`sql/021` — conversion moved to read time), `parent_transaction_id` (`sql/024` — reserved for splits, never non-null; a splits migration re-adds it with the balance predicate), `transfer_transaction_id` (`sql/030` — the self-FK that paired transfer legs, removed with the transfer feature, 2026-08-10), `cleared` (`sql/035` — the statement-confirmation flag from `sql/003`'s stock ledger schema; the reconciliation feature was built without ever reading it, and this document's claim that it "drives reconciliation" was false for the column's whole life).
+
+**Reconciliation is the only statement-confirmation mechanism.** There is no per-row confirmed flag: a row is confirmed by being assigned to a reconciliation whose `difference_cents` adds up and whose `status` is completed. Should that ever need a per-row answer, it is computed at read time from reconciliation status — never stored back on the row (`sql/021`, `sql/022`, `sql/035`).
 
 **Indexes (`sql/022`) — load-bearing; the computed balance depends on the first:**
 

@@ -128,10 +128,10 @@ async def _ensure_test_data(conn, data: TestData):
         await conn.execute(
             """INSERT INTO expense_transactions
                 (id, user_id, title, amount_cents, transaction_type,
-                 date, account_id, category_id, cleared,
+                 date, account_id, category_id,
                  created_at, updated_at)
                VALUES ($1, $2, 'Test Tx', 5000, 1,
-                 now(), $3, $4, false, now(), now())""",
+                 now(), $3, $4, now(), now())""",
             data.transaction_id, data.user_id, data.account_id, data.category_id,
         )
         await conn.execute(

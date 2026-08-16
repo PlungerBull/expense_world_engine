@@ -73,7 +73,6 @@ async def list_transactions(
     reconciliation_id: Optional[UUID] = Query(None),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
-    cleared: Optional[bool] = Query(None),
     search: Optional[str] = Query(None),
     include_deleted: bool = Query(False),
     debit_as_negative: DebitAsNegative = False,
@@ -122,10 +121,6 @@ async def list_transactions(
         if date_to:
             params.append(date_to)
             conditions.append(f"t.date <= ${len(params)}")
-
-        if cleared is not None:
-            params.append(cleared)
-            conditions.append(f"t.cleared = ${len(params)}")
 
         if search:
             pattern = f"%{_escape_like(search)}%"

@@ -449,7 +449,7 @@ If any condition fails, returns `422` with **all** the failing fields, not just 
 **Other statuses:** `200` on success (promote is not a pure create — the inbox row already existed). `404` when the inbox row is missing, already promoted, or soft-deleted. `409 CONFLICT` when `id` already exists in the ledger.
 
 **On success (atomic):**
-1. Creates the `expense_transactions` row using the client-supplied `id`. `inbox_id` points back to this inbox item. Copies `transaction_type` from the inbox row. The row takes the draft's title, description, and date; `cleared` starts `false`.
+1. Creates the `expense_transactions` row using the client-supplied `id`. `inbox_id` points back to this inbox item. Copies `transaction_type` from the inbox row. The row takes the draft's title, description, and date.
 2. **Moves the draft's hashtags onto it** — the same set, re-written as ledger junction rows (`transaction_source = 1`) against the new id, and the draft's own rows (`= 2`) soft-deleted in step 4's cascade. One live set exists at every moment, never two. Tags are not part of the readiness check: an untagged draft promotes fine, and a hashtag deleted between drafting and promoting has already had its junction dropped, so only live tags can travel.
 3. Sets `status = 2` (promoted) on the inbox row.
 4. Sets `deleted_at` on the inbox row (soft delete) and closes its hashtag junction rows.
@@ -477,7 +477,6 @@ Returns all active ledger transactions. Supports filtering:
 - `?hashtag_id=` — filter by hashtag
 - `?reconciliation_id=` — filter to transactions assigned to one reconciliation batch. This is the standalone escape hatch referenced under `GET /reconciliations/{id}`, and unlike that endpoint's embedded window it supports the full filter surface below.
 - `?date_from=` / `?date_to=` — date range (ISO 8601)
-- `?cleared=true/false`
 - `?search=` — case-insensitive substring match across `title` and `description`; `%`, `_` and `\` in the term are matched literally, not as wildcards
 
 Standard `?include_deleted=true`, `?debit_as_negative=true`, and `?limit` / `?offset` also apply (see Base Conventions).
@@ -486,8 +485,8 @@ Standard `?include_deleted=true`, `?debit_as_negative=true`, and `?limit` / `?of
 Creates a transaction directly in the ledger, bypassing the inbox. Used by the CLI for fast entry when all required fields are known.
 
 **Required:** `id` (client-supplied UUID), `title`, `amount_cents`, `date`, `account_id`, `category_id` *(unconditionally required since 2026-08-10 — the requirement is enforced at the schema boundary, so a missing `category_id` 422s as a plain missing field, same as omitting `title`; the former conditional waiver existed only for transfers)*
-**Optional:** `description`, `cleared`, `hashtag_ids`
-**Forbidden:** any unknown field → `422 VALIDATION_ERROR` (`extra="forbid"`). This is what makes the removal of `exchange_rate` (`sql/021`) — and of `transfer` (2026-08-10) — visible to a caller still sending it — the engine no longer implements what the field asks for, and a caller who believes the value matters deserves to be told it does not.
+**Optional:** `description`, `hashtag_ids`
+**Forbidden:** any unknown field → `422 VALIDATION_ERROR` (`extra="forbid"`). This is what makes the removal of `exchange_rate` (`sql/021`), of `transfer` (2026-08-10) and of `cleared` (`sql/035`) visible to a caller still sending it — the engine no longer implements what the field asks for, and a caller who believes the value matters deserves to be told it does not.
 
 **System categories:** `category_id` must reference an active **user** category. A system category (`is_system = true` — `@Opening`) is engine-assigned only (see `docs/currency-model-decision.md`): naming one returns `422` with `fields: {"category_id": "Must not reference a system category."}`. The only path that files under `@Opening` is `POST /accounts/{id}/opening-balance`, which opts in internally (`create_transaction(allow_system_category=True)`).
 
@@ -501,7 +500,7 @@ Returns `409 CONFLICT` if `id` already exists. No rate lookup, no conversion, no
 ### `PUT /transactions/{id}`
 Partial update.
 
-**Updatable fields:** `title`, `amount_cents`, `date`, `account_id`, `category_id`, `description`, `cleared`, `hashtag_ids`, `reconciliation_id`. Every field is optional; omitted fields are left untouched. An empty body is a no-op that returns current state (no version bump, no activity entry). Unknown fields 422 (`extra="forbid"`). Explicit `null` is rejected with `422` `"Must not be null."` on every field **except** `reconciliation_id`, where `null` means unassign (see below) — clearing `description` or `cleared` via null is not supported.
+**Updatable fields:** `title`, `amount_cents`, `date`, `account_id`, `category_id`, `description`, `hashtag_ids`, `reconciliation_id`. Every field is optional; omitted fields are left untouched. An empty body is a no-op that returns current state (no version bump, no activity entry). Unknown fields 422 (`extra="forbid"`). Explicit `null` is rejected with `422` `"Must not be null."` on every field **except** `reconciliation_id`, where `null` means unassign (see below) — clearing `description` via null is not supported.
 
 The same value rules as `POST` apply: `amount_cents` must be non-zero, `title` non-empty after trim, `date` not in the future, `account_id` active and non-archived, `category_id` active **and not a system category** (moving an ordinary row *into* `@Opening` is the same `422` as on create; there is no internal caller here, so the rejection is unconditional), every `hashtag_ids` entry active.
 

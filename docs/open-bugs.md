@@ -16,6 +16,14 @@ Severity: 🔴 corrupts stored data, bypasses auth, or loses writes · 🟠 high
 
 - ⚪ **1.7-archived** `_fetch_target_currencies` excludes archived accounts, so archiving an account drops its currency from the daily fetch list. **Inert under `sql/015`** — USD is the base (never a target) and PEN is always on the list via `user_settings.main_currency`, so the only rate that exists is fetched regardless of what is archived. Becomes live the day a third currency is admitted; fix it in the same change that lifts the CHECK, not before.
 
+- ⚪ **query-params-open** Unknown **query** params are ignored engine-wide (FastAPI's default), while unknown **body** fields 422. So `GET /transactions?cleared=true` — or any other retired or misspelled filter — silently returns an *unfiltered* list, which is the "silently dropped input" failure the fail-closed rule exists to prevent, in the one place the rule was never applied. Surfaced by `sql/035`; the gap is older and wider than that column. Fixing it means validating the query string against each route's declared params app-wide (a dependency, like the idempotency fingerprint), which is a real change with its own blast radius — hence a queued decision, not a drive-by.
+
+---
+
+## Pending client uptake
+
+- ⚠️ **cleared-removed** (`sql/035`, 2026-08-16) — `expense_transactions.cleared` is deleted. **CLI + TUI.** The field is gone from every transaction response; sending it on `POST /transactions`, `POST /transactions/batch` or `PUT /transactions/{id}` is now `422` on the unknown field; `GET /transactions?cleared=` no longer filters (and, per `query-params-open` above, does not error either — it returns everything). Client surfaces to remove: the `--cleared/--no-cleared` options on `transactions list` / `transactions update` / `log`, and the TUI quick-log `cleared` field. Nothing replaces it — reconciliation is the only statement-confirmation mechanism, and it was never wired to this flag. Zero live rows had it set. Delete this entry when both clients are clean.
+
 ---
 
 ## Decisions taken — kept because they record *why*, not *what*

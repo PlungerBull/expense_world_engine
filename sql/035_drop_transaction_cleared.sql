@@ -1,0 +1,46 @@
+-- 035_drop_transaction_cleared.sql
+--
+-- Drop expense_transactions.cleared: a flag no logic ever read (2026-08-16).
+--
+-- Why: the column shipped in sql/003 as part of the standard
+-- bank-ledger schema, where `cleared` is the pre-step to reconciliation
+-- ("seen on the statement") and reconciling confirms a batch of cleared
+-- items against a statement balance. The reconciliation feature was then
+-- built without ever picking it up. schema-reference.md claimed it
+-- "drives reconciliation"; it drove nothing.
+--
+-- The full inventory before this migration:
+--   * written ONLY from the request body (POST /transactions,
+--     POST /transactions/batch, PUT /transactions/{id}), defaulting false;
+--     promote hardcoded false.
+--   * read ONLY by the `?cleared=true/false` list filter.
+--   * completing or reverting a reconciliation never touched it, and it
+--     was NOT in the completed-reconciliation locked-field set
+--     ({amount_cents, account_id, title, date}) — so it was editable on a
+--     row inside a completed batch, which a statement-confirmation flag
+--     must not be.
+-- No report, balance, dashboard panel or validation consulted it.
+--
+-- Why not wire it up instead: making "complete a reconciliation" stamp
+-- cleared = true would store a copy of "belongs to a completed
+-- reconciliation" — a derived value in a column, exactly what sql/021
+-- (home currency) and sql/022 (balances) deleted. If that meaning is
+-- ever wanted it is computed at read time from reconciliation status,
+-- not stored here.
+--
+-- Client impact (breaking, per CLAUDE.md "the engine comes first"):
+--   * `cleared` is gone from every transaction response body.
+--   * sending `cleared` on create/batch/update is now 422 on the unknown
+--     field (StrictModel, extra="forbid") — not silently dropped.
+--   * `GET /transactions?cleared=` no longer filters. Unknown QUERY
+--     params are ignored engine-wide (FastAPI's default; nothing here
+--     validates the query string), so a client still sending it gets an
+--     UNFILTERED list rather than an error. That gap is older and wider
+--     than this column — logged as a decision in docs/open-bugs.md.
+-- Logged as pending-client-work in docs/open-bugs.md.
+--
+-- The inbox is untouched: expense_transaction_inbox never had this
+-- column, and has no reconciliation_id either. A draft is not a ledger
+-- row, so neither concept applies to it.
+
+ALTER TABLE expense_transactions DROP COLUMN cleared;

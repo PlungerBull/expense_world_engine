@@ -10,10 +10,10 @@ from app.schemas import StrictModel, audit_fields, opt_id, owned_fields
 
 class TransactionCreateRequest(StrictModel):
     # Unknown fields 422 rather than being silently dropped. This is what makes
-    # the removal of `exchange_rate` (sql/021) — and of `transfer` (2026-08-10)
-    # — visible to a client still sending it: the engine no longer implements
-    # what the field asks for, and a caller who believes the value matters
-    # deserves to be told it does not.
+    # the removal of `exchange_rate` (sql/021), of `transfer` (2026-08-10) and
+    # of `cleared` (sql/035) visible to a client still sending it: the engine no
+    # longer implements what the field asks for, and a caller who believes the
+    # value matters deserves to be told it does not.
     id: UUID
     title: str
     amount_cents: int  # signed: negative=expense, positive=income
@@ -27,7 +27,6 @@ class TransactionCreateRequest(StrictModel):
     # at the schema boundary, same as omitting `title`.
     category_id: UUID
     description: Optional[str] = None
-    cleared: Optional[bool] = None
     hashtag_ids: Optional[list[UUID]] = None
 
 
@@ -38,7 +37,6 @@ class TransactionUpdateRequest(StrictModel):
     account_id: Optional[UUID] = None
     category_id: Optional[UUID] = None
     description: Optional[str] = None
-    cleared: Optional[bool] = None
     hashtag_ids: Optional[list[UUID]] = None
     reconciliation_id: Optional[UUID] = None
 
@@ -66,7 +64,6 @@ class TransactionResponse(BaseModel):
     date: datetime
     account_id: str
     category_id: str
-    cleared: bool
     inbox_id: Optional[str] = None
     reconciliation_id: Optional[str] = None
     created_at: datetime
@@ -131,7 +128,6 @@ def transaction_from_row(row, hashtag_ids: Optional[list[str]] = None) -> dict:
         date=row["date"],
         account_id=str(row["account_id"]),
         category_id=str(row["category_id"]),
-        cleared=row["cleared"],
         inbox_id=opt_id(row["inbox_id"]),
         reconciliation_id=opt_id(row["reconciliation_id"]),
         **audit_fields(row),

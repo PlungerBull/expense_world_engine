@@ -207,9 +207,9 @@ async def _seed_txn(conn, fx: Fixtures, user_id: str, category_id: str,
         """INSERT INTO expense_transactions
             (id, user_id, title, amount_cents, transaction_type,
              date, account_id, category_id,
-             cleared, created_at, updated_at)
+             created_at, updated_at)
            VALUES ($1, $2, 'parity', $3, $4,
-             $5, $6, $7, false, now(), now())""",
+             $5, $6, $7, now(), now())""",
         txn_id, user_id, amount_cents, txn_type,
         when, account_id, category_id,
     )
